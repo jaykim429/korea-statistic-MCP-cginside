@@ -81,6 +81,68 @@ REGION_BUSINESS = {
 }
 
 
+# Alias → canonical region name. Covers full administrative names
+# (서울특별시, 경기도, 충청북도), short forms (서울시), and romanized
+# variants users commonly type. Composite regions (수도권/비수도권) map
+# to a list because they expand into multiple administrative regions.
+REGION_ALIASES: dict[str, str] = {
+    # 서울
+    "서울특별시": "서울", "서울시": "서울", "seoul": "서울",
+    # 광역시
+    "부산광역시": "부산", "부산시": "부산", "busan": "부산",
+    "대구광역시": "대구", "대구시": "대구", "daegu": "대구",
+    "인천광역시": "인천", "인천시": "인천", "incheon": "인천",
+    "광주광역시": "광주", "광주시": "광주", "gwangju": "광주",
+    "대전광역시": "대전", "대전시": "대전", "daejeon": "대전",
+    "울산광역시": "울산", "울산시": "울산", "ulsan": "울산",
+    "세종특별자치시": "세종", "세종시": "세종", "sejong": "세종",
+    # 도
+    "경기도": "경기", "gyeonggi": "경기", "gyeonggi-do": "경기",
+    "강원도": "강원", "강원특별자치도": "강원", "gangwon": "강원",
+    "충청북도": "충북", "chungbuk": "충북", "chungcheongbuk-do": "충북",
+    "충청남도": "충남", "chungnam": "충남", "chungcheongnam-do": "충남",
+    "전라북도": "전북", "전북특별자치도": "전북", "jeonbuk": "전북",
+    "전라남도": "전남", "jeonnam": "전남", "jeollanam-do": "전남",
+    "경상북도": "경북", "gyeongbuk": "경북",
+    "경상남도": "경남", "gyeongnam": "경남",
+    "제주도": "제주", "제주특별자치도": "제주", "jeju": "제주",
+    # 전국
+    "대한민국": "전국", "한국": "전국", "korea": "전국", "south korea": "전국",
+}
+
+
+# Composite regions expand into a list of canonical regions. Used by
+# region-sum/share-ratio handlers that can iterate over the component
+# administrative regions.
+REGION_COMPOSITES: dict[str, list[str]] = {
+    "수도권": ["서울", "경기", "인천"],
+    "비수도권": [
+        "부산", "대구", "광주", "대전", "울산", "세종",
+        "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+    ],
+    "영남권": ["부산", "대구", "울산", "경북", "경남"],
+    "호남권": ["광주", "전북", "전남"],
+    "충청권": ["대전", "세종", "충북", "충남"],
+}
+
+
+def canonical_region(region: Optional[str]) -> Optional[str]:
+    """Normalize a region label to the canonical short form.
+
+    Returns None when the input is None/empty. Returns the input unchanged
+    if it is already canonical, or if it is a composite region (수도권 등)
+    or unknown (so existing 17-시도 enum errors still surface)."""
+    if not region:
+        return region
+    text = str(region).strip()
+    if not text:
+        return text
+    lowered = text.lower().replace(" ", "")
+    if text in REGION_DEMOGRAPHIC or text in REGION_COMPOSITES:
+        return text
+    return REGION_ALIASES.get(text) or REGION_ALIASES.get(lowered) or text
+
+
 # ============================================================================
 # Tier A — 검증된 정밀 매핑
 # ============================================================================

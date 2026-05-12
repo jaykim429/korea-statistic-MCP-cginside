@@ -160,6 +160,23 @@ CASES: list[dict[str, Any]] = [
     {"group": "mismatch_warning", "name": "comparison_targets_dropped",
      "query": "서울과 경기 인구 알려줘",
      "expect": {"answer_type": "tier_a_value", "warning_contains": "비교 대상"}},
+
+    # ── 12. Stage 5: region aliases (#8) ──────────────────────────────
+    # "서울특별시" / "서울시" 같은 행정 정식 명칭과 영문 표기가 17개 시도 enum에
+    # 동일하게 매핑돼야 한다.
+    {"group": "region_alias", "name": "seoul_full_admin_name",
+     "query": "서울특별시 인구 최신값",
+     "expect": {"answer_type": "tier_a_value", "region": "서울"}},
+    {"group": "region_alias", "name": "gyeonggi_do_form",
+     "query": "경기도 중소기업 사업체수",
+     "expect": {"answer_type": "tier_a_value", "region": "경기"}},
+
+    # ── 13. Stage 5: population mismatch (#7) ──────────────────────────
+    # "기업 수" 어휘로 물었는데 매핑은 "사업체 수"로 되는 silent substitution.
+    # 응답 자체는 나오되 모집단 차이 경고가 떠야 한다.
+    {"group": "population_mismatch", "name": "enterprise_count_warning",
+     "query": "중소기업 기업수 알려줘",
+     "expect": {"answer_type": "tier_a_value", "warning_contains": "모집단 다름"}},
 ]
 
 

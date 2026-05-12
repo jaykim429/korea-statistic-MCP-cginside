@@ -43,9 +43,26 @@ API_KEY_DEFAULT = os.environ.get("KOSIS_API_KEY", "")
 HTTP_TIMEOUT = 30.0
 
 ERROR_MAP = {
-    "10": "인증키 누락", "11": "인증키 만료", "20": "필수 변수 누락",
-    "21": "잘못된 변수", "30": "결과 없음", "31": "결과 초과 (4만셀)",
-    "40": "호출 제한", "41": "ROW 제한", "50": "서버 오류",
+    # Official KOSIS API error codes
+    "10": "인증키 누락",
+    "11": "인증키 만료",
+    "20": "필수 변수 누락",
+    "21": "잘못된 변수",
+    "30": "결과 없음",
+    "31": "결과 초과 (4만셀)",
+    "40": "호출 제한",
+    "41": "ROW 제한",
+    "50": "서버 오류",
+    # Common non-official codes observed in the wild
+    "E001": "내부 오류 (E001) — KOSIS 공식 코드가 아닌 래퍼/네트워크 레이어 실패. 재시도 후에도 반복되면 통계표 변경 또는 차단된 파라미터 의심",
+    "E002": "내부 오류 (E002) — 응답 파싱 실패 가능성",
+    "INVALID_PARAM": "잘못된 파라미터 — 요청 변수(통계표 ID, 분류값, 기간) 형식 또는 조합이 KOSIS 검증을 통과하지 못함",
+    "INVALID_KEY": "잘못된 인증키 — KOSIS_API_KEY 값을 다시 확인",
+    "MISSING_KEY": "인증키 미설정 — KOSIS_API_KEY 환경변수가 비어 있음",
+    "TIMEOUT": "요청 타임아웃 — 네트워크 또는 KOSIS 서버 응답 지연",
+    "NETWORK": "네트워크 오류 — DNS/연결/SSL 실패",
+    "-1": "일반 실패 — 구체적 사유가 응답에 포함되지 않음. KOSIS 일시 장애 또는 알 수 없는 클라이언트 오류",
+    "0": "성공이지만 데이터 없음 — 정상 호출이나 매칭 행이 0건",
 }
 
 STATUS_EXECUTED = "EXECUTED"
@@ -129,8 +146,10 @@ FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
 
 from kosis_curation import (
     QuickStatParam,
+    REGION_COMPOSITES,
     TIER_A_STATS,
     TOPICS,
+    canonical_region as _canonical_region,
     lookup as _curation_lookup,
     route_query as _route_query,
     routing_hints as _routing_hints,
@@ -1233,6 +1252,20 @@ class NaturalLanguageAnswerEngine:
                     f"질문에 명시된 연도 {years_in_query} 와 사용 시점 {used_str} 불일치 — "
                     "요청 기간을 만족하지 못했을 수 있음"
                 )
+
+        direct_key = str((result.get("route") or {}).get("direct_stat_key") or "")
+        q_compact = re.sub(r"\s+", "", query)
+        asks_enterprises = bool(re.search(r"기업\s*수", query)) and "사업체" not in q_compact
+        if asks_enterprises and "사업체수" in direct_key:
+            warnings.append(
+                "쿼리 어휘 '기업 수' → 매핑 통계 '사업체 수' (모집단 다름) — "
+                "법인 단위 기업체 수와 사업체 수는 통계 작성 기준이 다릅니다"
+            )
+        asks_establishments = "사업체수" in q_compact or "사업체 수" in query
+        if asks_establishments and "_기업수" in direct_key:
+            warnings.append(
+                "쿼리 어휘 '사업체 수' → 매핑 통계 '기업 수' (모집단 다름)"
+            )
         return warnings
 
     @classmethod
@@ -1507,6 +1540,7 @@ async def quick_stat(
     """
     key = _resolve_key(api_key)
     param = _lookup_quick(query)
+    canonical = _canonical_region(region) or region
 
     # === Tier A 히트: 즉시 호출 ===
     if param:
@@ -1534,20 +1568,22 @@ async def quick_stat(
 
         region_code = None
         if param.region_scheme:
-            region_code = param.region_scheme.get(region)
+            region_code = param.region_scheme.get(canonical)
             if not region_code:
                 return {
                     "오류": f'지역 "{region}" 이 통계에서 미지원',
+                    "정규화_지역": canonical if canonical != region else None,
                     "지원_지역": list(param.region_scheme.keys()),
                     "통계표": param.tbl_nm,
                 }
-        elif region != "전국":
+        elif canonical != "전국":
             return {
                 "오류": f'이 통계는 지역별 조회가 검증되지 않았습니다: "{region}"',
                 "지원_지역": ["전국"],
                 "통계표": param.tbl_nm,
                 "권고": "지역별 값으로 포장하지 않도록 차단했습니다. search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요.",
             }
+        region = canonical
 
         period_type = _default_period_type(param)
         start_period, end_period = _period_bounds(period, period_type)
@@ -1649,14 +1685,16 @@ async def quick_trend(
     param = _lookup_quick(query)
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
+    canonical = _canonical_region(region) or region
 
     region_code = None
     if param.region_scheme:
-        region_code = param.region_scheme.get(region)
+        region_code = param.region_scheme.get(canonical)
         if not region_code:
             return {"오류": f'지역 "{region}" 미지원', "지원_지역": list(param.region_scheme.keys())}
-    elif region != "전국":
+    elif canonical != "전국":
         return {"오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.', "지원_지역": ["전국"]}
+    region = canonical
 
     async with httpx.AsyncClient() as client:
         data = await _fetch_series(
@@ -2793,9 +2831,32 @@ async def check_stat_availability(query: str) -> dict:
 
 @mcp.tool()
 async def decode_error(error_code: str) -> dict:
-    """[🛠] KOSIS 에러 코드 한국어 설명."""
-    code = str(error_code).strip()
-    return {"코드": code, "의미": ERROR_MAP.get(code, "알 수 없음")}
+    """[🛠] KOSIS 에러 코드 한국어 설명. 공식 코드(10/20/30 등) 외에도
+    내부/네트워크 코드(E001, INVALID_PARAM, -1 등)를 인식한다."""
+    raw = "" if error_code is None else str(error_code)
+    code = raw.strip()
+    if not code:
+        return {
+            "코드": "",
+            "의미": "빈 코드 — 응답에 에러 코드 필드가 없거나 비어 있음",
+            "권고": "원본 응답의 다른 필드(`오류`, `결과`, HTTP 상태)를 확인",
+        }
+        # Try exact, then upper, then lowercase. KOSIS official codes
+        # are numeric so case-insensitive lookup is safe for non-numeric variants.
+    candidates = [code, code.upper(), code.lower()]
+    for cand in candidates:
+        if cand in ERROR_MAP:
+            return {
+                "코드": cand,
+                "의미": ERROR_MAP[cand],
+                "공식코드_여부": cand in {"10", "11", "20", "21", "30", "31", "40", "41", "50"},
+            }
+    return {
+        "코드": code,
+        "의미": "알 수 없음 — KOSIS 공식 코드(10/11/20/21/30/31/40/41/50)도, 알려진 내부 코드도 아님",
+        "지원_코드": sorted(ERROR_MAP.keys()),
+        "권고": "응답 본문 전체를 함께 확인하고, KOSIS 고객센터에 코드와 호출 파라미터를 첨부해 문의",
+    }
 
 
 # ============================================================================
