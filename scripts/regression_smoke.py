@@ -207,6 +207,20 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"success": True, "region": "전국", "period": "2023"},
     },
     {
+        # Round 6 Step 2c: 소상공인 변형 라이브 검증 (음식점업)
+        "name": "ksic_food_sosanggong_business_count",
+        "tool": quick_stat,
+        "args": ("숙박음식점업_소상공인_사업체수", "전국", "latest"),
+        "expect": {"success": True, "region": "전국", "period": "2023"},
+    },
+    {
+        # Round 6 Step 2c: 도소매업 소상공인 매출액
+        "name": "ksic_retail_sosanggong_sales",
+        "tool": quick_stat,
+        "args": ("도소매업_소상공인_매출액", "전국", "latest"),
+        "expect": {"success": True, "region": "전국", "period": "2023"},
+    },
+    {
         "name": "answer_top_5_sme_business_count",
         "tool": answer_query,
         "args": ("중소기업 사업체수가 가장 많은 5곳 알려줘",),

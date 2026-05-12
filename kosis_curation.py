@@ -664,30 +664,39 @@ _BR_METRICS: dict[str, tuple[str, str, str]] = {
     "매출액":   ("DT_BR_C001", "T001", "억원"),
 }
 
+# 기업규모 → (objL3 코드, 라벨 in 키 이름). KOSIS objL3:
+#   T002 = 중소기업, 16142T2524 = 소상공인, T003 = "중소기업 외" (=대기업)
+_BR_SCALES: list[tuple[str, str]] = [
+    ("중소기업", "T002"),
+    ("소상공인", "16142T2524"),
+]
+
 for _industry, _industry_code in _KSIC_SECTIONS:
-    for _metric, (_tbl, _itm, _unit) in _BR_METRICS.items():
-        _key = f"{_industry}_중소기업_{_metric}"
-        TIER_A_STATS[_key] = QuickStatParam(
-            org_id="142", tbl_id=_tbl,
-            tbl_nm=f"시도별·산업중분류별·기업규모별 {_metric}",
-            description=f"{_industry} 중소기업 {_metric}",
-            obj_l1=_industry_code,
-            obj_l2="15142C501",
-            obj_l3="T002",
-            item_id=_itm, unit=_unit,
-            region_scheme=REGION_BUSINESS,
-            region_obj="obj_l2",
-            supported_periods=("Y",),
-            verification_status="verified",
-            note=(
-                "동적 확장: KSIC objL1="
-                f"{_industry_code}, 기업규모=중소기업(T002). "
-                "explore_industry_axes.py 라이브 검증 (수록기간 2019~2023)."
-            ),
-        )
+    for _scale_label, _scale_code in _BR_SCALES:
+        for _metric, (_tbl, _itm, _unit) in _BR_METRICS.items():
+            _key = f"{_industry}_{_scale_label}_{_metric}"
+            TIER_A_STATS[_key] = QuickStatParam(
+                org_id="142", tbl_id=_tbl,
+                tbl_nm=f"시도별·산업중분류별·기업규모별 {_metric}",
+                description=f"{_industry} {_scale_label} {_metric}",
+                obj_l1=_industry_code,
+                obj_l2="15142C501",
+                obj_l3=_scale_code,
+                item_id=_itm, unit=_unit,
+                region_scheme=REGION_BUSINESS,
+                region_obj="obj_l2",
+                supported_periods=("Y",),
+                verification_status="verified",
+                note=(
+                    "동적 확장: KSIC objL1="
+                    f"{_industry_code}, 기업규모={_scale_label}({_scale_code}). "
+                    "explore_industry_axes.py 라이브 검증 (수록기간 2019~2023). "
+                    "일부 업종은 소상공인 분류 데이터가 빈 응답일 수 있음."
+                ),
+            )
 
 # 사용된 임시 변수 정리 (모듈 최상위 namespace 오염 방지)
-del _industry, _industry_code, _metric, _tbl, _itm, _unit, _key
+del _industry, _industry_code, _scale_label, _scale_code, _metric, _tbl, _itm, _unit, _key
 
 
 # ============================================================================
