@@ -256,6 +256,25 @@ def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Option
     return year, year
 
 
+def _extract_year_range(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract (start_year, end_year) from explicit comparison phrasing.
+
+    Recognizes patterns like "2019년 대비 2023년", "2019~2023", "2019년부터 2023년".
+    Returns (None, None) when fewer than two plausible 4-digit years are present.
+    Order follows text order so "2019 대비 2023" → start=2019, end=2023.
+    """
+    if not text:
+        return None, None
+    cur = datetime.now().year
+    years = [y for y in re.findall(r"(19\d{2}|20\d{2})", text) if int(y) <= cur + 1]
+    if len(years) < 2:
+        return None, None
+    start, end = years[0], years[1]
+    if start == end:
+        return None, None
+    return start, end
+
+
 def _default_period_type(param: QuickStatParam) -> str:
     periods = tuple(getattr(param, "supported_periods", ()) or ("Y",))
     if "Y" in periods:
@@ -661,12 +680,25 @@ class NaturalLanguageAnswerEngine:
 
         if self._is_growth_question(query, route_payload):
             period_count = self._growth_period_count(query)
-            comparison = await stat_time_compare(direct_key, region, None, None, period_count, self.api_key)
+            start_p, end_p = _extract_year_range(query)
+            if start_p and end_p:
+                span = max(int(end_p) - int(start_p) + 1, period_count)
+            else:
+                span = period_count
+            comparison = await stat_time_compare(direct_key, region, start_p, end_p, span, self.api_key)
             if comparison.get("상태") != "executed":
                 comparison["답변유형"] = "tier_a_growth_rate_failed"
                 comparison["route"] = route_payload["route"]
                 comparison["검증_주의"] = self._validation_notes(route_payload)
                 return comparison
+            notes = self._validation_notes(route_payload)
+            used = comparison.get("비교") or {}
+            used_start = (used.get("시작") or {}).get("시점")
+            used_end = (used.get("종료") or {}).get("시점")
+            if start_p and used_start and not str(used_start).startswith(start_p):
+                notes.append(f"요청 시작 시점 {start_p} → 사용 시점 {used_start}로 변경됨")
+            if end_p and used_end and not str(used_end).startswith(end_p):
+                notes.append(f"요청 종료 시점 {end_p} → 사용 시점 {used_end}로 변경됨")
             return {
                 "상태": "executed",
                 "코드": STATUS_EXECUTED,
@@ -675,10 +707,12 @@ class NaturalLanguageAnswerEngine:
                 "answer": comparison.get("answer"),
                 "표": comparison.get("표", []),
                 "비교": comparison.get("비교"),
+                "요청_시작": start_p,
+                "요청_종료": end_p,
                 "지역": region,
                 "통계표": (comparison.get("표") or [{}])[0].get("통계표"),
                 "추천_시각화": ["line_chart"],
-                "검증_주의": self._validation_notes(route_payload),
+                "검증_주의": notes,
                 "route": route_payload["route"],
                 "출처": comparison.get("출처", "통계청 KOSIS"),
             }

@@ -149,6 +149,28 @@ TESTS: list[dict[str, Any]] = [
         "args": ("주택매매가격지수", "전국", 5),
         "expect": {"success": True},
     },
+    {
+        "name": "answer_explicit_period_growth_2019_2023",
+        "tool": answer_query,
+        "args": ("2019년 대비 2023년 중소기업 매출액 증가율 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_growth_rate",
+            "comparison_start_prefix": "2019",
+            "comparison_end_prefix": "2023",
+        },
+    },
+    {
+        "name": "answer_explicit_period_growth_2020_2023",
+        "tool": answer_query,
+        "args": ("2020년 대비 2023년 중소기업 사업체수 증가율",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_growth_rate",
+            "comparison_start_prefix": "2020",
+            "comparison_end_prefix": "2023",
+        },
+    },
 ]
 
 
@@ -161,6 +183,7 @@ def first_table_region(result: dict[str, Any]) -> str | None:
 
 def summarize(result: dict[str, Any]) -> dict[str, Any]:
     table = result.get("표") or []
+    comparison = result.get("비교") or {}
     return {
         "error": result.get("오류"),
         "empty_result": result.get("결과") == "데이터 없음",
@@ -175,6 +198,9 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "data_count": result.get("데이터수"),
         "direct_key": (result.get("route") or {}).get("direct_stat_key"),
         "first_row": table[0] if table else None,
+        "comparison_start": (comparison.get("시작") or {}).get("시점"),
+        "comparison_end": (comparison.get("종료") or {}).get("시점"),
+        "growth_rate": comparison.get("변화율_퍼센트"),
     }
 
 
@@ -201,6 +227,14 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"region_count={summary['region_count']}")
     if "data_count" in expect and summary["data_count"] != expect["data_count"]:
         problems.append(f"data_count={summary['data_count']}")
+    if "comparison_start_prefix" in expect:
+        start = str(summary["comparison_start"] or "")
+        if not start.startswith(expect["comparison_start_prefix"]):
+            problems.append(f"comparison_start={summary['comparison_start']}")
+    if "comparison_end_prefix" in expect:
+        end = str(summary["comparison_end"] or "")
+        if not end.startswith(expect["comparison_end_prefix"]):
+            problems.append(f"comparison_end={summary['comparison_end']}")
     return problems
 
 
