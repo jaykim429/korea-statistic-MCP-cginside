@@ -18,6 +18,7 @@ KOSIS MCP — 조회 + 분석 + 시각화 통합 서버
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -29,6 +30,9 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 from scipy import stats as scipy_stats
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ============================================================================
 # 상수
@@ -399,6 +403,10 @@ class NaturalLanguageAnswerEngine:
         if direct_key:
             return direct_key
         q = self._norm(query)
+        if "중소기업" in q and any(term in q for term in ("매출", "매출액")):
+            return "중소기업_매출액"
+        if "대기업" in q and any(term in q for term in ("매출", "매출액")):
+            return "대기업_매출액"
         if "중소기업" in q and any(term in q for term in ("종사자", "고용")):
             return "중소기업_종사자수"
         if "중소기업" in q and any(term in q for term in ("사업체", "기업수", "업체수", "중소기업수")):
@@ -479,9 +487,16 @@ class NaturalLanguageAnswerEngine:
             "출처": "통계청 KOSIS",
         }
 
-    async def _answer_direct(self, query: str, region: str) -> dict[str, Any]:
-        route_payload = self._route_payload(query)
-        direct_key = route_payload["route"].get("direct_stat_key") or query
+    async def _answer_direct(
+        self,
+        query: str,
+        region: str,
+        direct_key: Optional[str] = None,
+        route_payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        route_payload = route_payload or self._route_payload(query)
+        direct_key = direct_key or self._infer_direct_stat_key(query, route_payload) or query
+        route_payload["route"]["direct_stat_key"] = direct_key
         q = self._norm(query)
 
         if any(term in q for term in ("추이", "최근", "시계열", "그래프", "선그래프", "분석")):
@@ -605,7 +620,7 @@ class NaturalLanguageAnswerEngine:
         if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
             route_payload["route"]["direct_stat_key"] = inferred_direct_key
         if route_payload["route"].get("direct_stat_key"):
-            return await self._answer_direct(query, region)
+            return await self._answer_direct(query, region, inferred_direct_key, route_payload)
         return await self._answer_search_fallback(query, route_payload)
 
 
