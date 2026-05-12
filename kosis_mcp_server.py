@@ -2329,6 +2329,18 @@ async def _quick_stat_core(
             result["⚠️ 정밀도_다운그레이드"] = precision_downgrade
         if half_year_advisory:
             result["⚠️ 상하반기"] = half_year_advisory
+        # Population-mismatch warning previously fired only through
+        # answer_query's _finalize_response. Direct quick_stat callers
+        # were getting silent label substitution — close that gap so
+        # the trail is consistent across both entry points.
+        q_compact = re.sub(r"\s+", "", str(query))
+        asks_enterprises = bool(re.search(r"기업\s*수", query)) and "사업체" not in q_compact
+        param_describes_sites = "사업체" in (param.description or "")
+        if asks_enterprises and param_describes_sites:
+            result["⚠️ 모집단_불일치"] = (
+                "쿼리 어휘 '기업 수' → 매핑 통계 '사업체 수' (모집단 다름) — "
+                "법인 단위 기업체 수와 사업체 수는 통계 작성 기준이 다릅니다"
+            )
         return result
 
     # === Tier B 라우팅: 추천 검색어로 폴백 ===
