@@ -554,6 +554,70 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         verification_status="verified",
         note="Verified via KOSIS API: industry=0, establishment=0 (2016 3,950,192)",
     ),
+
+    # ========================================================================
+    # 사회·안전·관광 (라운드 6 확장 — Dayoooun/korea-stats-mcp 비교 후 추가,
+    # 모두 explore_table로 ITM_ID/region_scheme 라이브 검증)
+    # ========================================================================
+    "노령화지수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL12501E",
+        tbl_nm="노령화지수(시도)",
+        description="노령화지수 (65세 이상 인구 / 0-14세 인구 × 100)",
+        obj_l1="00", item_id="T10", unit="지수",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="explore_table 검증 OK (2025 추정). 수록기간 1970~2052 (장래추계 포함)",
+    ),
+    "상용근로자_월평균임금": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL15006",
+        tbl_nm="월평균 임금 및 임금상승률(시도)",
+        description="상용근로자 월평균 임금",
+        obj_l1="00", item_id="T001", unit="원",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="explore_table 검증 OK. 시도별 상용근로자 월평균 임금",
+    ),
+    "임금상승률": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL15006",
+        tbl_nm="월평균 임금 및 임금상승률(시도)",
+        description="임금상승률 (전년 대비)",
+        obj_l1="00", item_id="T002", unit="%",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="explore_table 검증 OK. 시도별 임금상승률",
+    ),
+    "범죄율": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL3001",
+        tbl_nm="인구 천명당 범죄발생건수(시도)",
+        description="인구 천명당 범죄발생건수",
+        obj_l1="00", item_id="T10", unit="건",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="explore_table 검증 OK. 단위: 인구 천명당 건수",
+    ),
+    "범죄발생건수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL3001",
+        tbl_nm="인구 천명당 범죄발생건수(시도)",
+        description="범죄발생건수 (총)",
+        obj_l1="00", item_id="T001", unit="건",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="explore_table 검증 OK. 시도별 총 범죄발생건수",
+    ),
+    "외래관광객수": QuickStatParam(
+        org_id="314", tbl_id="DT_TRD_TGT_ENT_AGG_MONTH",
+        tbl_nm="외래객 입국-목적별/국적별",
+        description="외래객 입국 (계, 국적별 총계)",
+        obj_l1="13102314422A.1", item_id="13103314422T01", unit="명",
+        supported_periods=("M",),
+        verification_status="verified",
+        note="explore_table 검증 OK. 국적별=총계, 목적별=계. 시도 X. 월별",
+    ),
 }
 
 
