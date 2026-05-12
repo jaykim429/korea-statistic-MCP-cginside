@@ -251,10 +251,16 @@ async def _fetch_period_range(
     api_key: Optional[str] = None,
     detail: bool = False,
 ) -> list[dict]:
-    """Return PRD_SE / PRD_DE for a KOSIS table. detail=True asks for
-    every recorded timepoint (large response on monthly tables); detail=
-    False asks only for the summary row (cheap, what staleness checks
-    need)."""
+    """Return PRD_SE / STRT_PRD_DE / END_PRD_DE for a KOSIS table.
+
+    Many tables expose multiple cadences (month/quarter/year) and the
+    meta endpoint returns one row per cadence — use `_pick_finest_period`
+    on the result to select the freshest cadence row, since `[-1]` is
+    not guaranteed to be the most granular one.
+
+    detail=True asks for every recorded timepoint (large response on
+    monthly tables); detail=False asks only for the summary row (cheap,
+    what staleness checks need)."""
     key = _resolve_key(api_key)
     extra = {"detail": "Y"} if detail else None
     async with httpx.AsyncClient() as client:
@@ -268,6 +274,28 @@ async def _fetch_table_name(
     key = _resolve_key(api_key)
     async with httpx.AsyncClient() as client:
         return await _fetch_meta(client, key, org_id, tbl_id, "TBL")
+
+
+# KOSIS PRD meta returns one row per cadence — pick the finest one so
+# staleness checks reflect the most granular data available.
+# Korean: 월 > 분기 > 반기 > 년 / English aliases: M Q H Y.
+_PRD_FINENESS = {
+    "월": 0, "M": 0, "MM": 0,
+    "분기": 1, "Q": 1, "QQ": 1,
+    "반기": 2, "H": 2, "HF": 2,
+    "년": 3, "연": 3, "Y": 3, "A": 3,
+}
+
+
+def _pick_finest_period(period_rows: list[dict]) -> Optional[dict]:
+    """Return the PRD row with the finest cadence (월 > 분기 > 반기 >
+    년). Returns None for an empty / falsy list."""
+    if not period_rows:
+        return None
+    def rank(row: dict) -> int:
+        se = str(row.get("PRD_SE") or row.get("prdSe") or "").strip()
+        return _PRD_FINENESS.get(se, 99)
+    return sorted(period_rows, key=rank)[0]
 
 
 def _resolve_classification_term(
@@ -3736,12 +3764,24 @@ async def check_stat_availability(
         if not period_rows:
             result["⚠️ 라이브_수록기간"] = "KOSIS 메타 API가 수록 시점을 반환하지 않음"
             return result
-        latest = period_rows[-1]
-        live_period = str(latest.get("PRD_DE") or latest.get("prdDe") or "")
+        latest = _pick_finest_period(period_rows)
+        live_period = str(
+            latest.get("END_PRD_DE") or latest.get("endPrdDe")
+            or latest.get("PRD_DE") or latest.get("prdDe") or ""
+        )
         live_se = latest.get("PRD_SE") or latest.get("prdSe")
-        age = NaturalLanguageAnswerEngine._period_age_years(live_period)
+        start_period = (
+            latest.get("STRT_PRD_DE") or latest.get("strtPrdDe") or ""
+        )
+        # _period_age_years only parses YYYY[MM]; strip "2026 1/4" to
+        # "2026" so a quarterly-only table still reports an age.
+        parseable = re.match(r"(\d{4})(?:\.(\d{2}))?", live_period)
+        age = NaturalLanguageAnswerEngine._period_age_years(
+            "".join(filter(None, parseable.groups())) if parseable else live_period
+        )
         result["라이브_수록기간"] = {
             "주기": live_se,
+            "시작_수록시점": start_period,
             "최신_수록시점": live_period,
             "period_age_years": age,
         }
@@ -3840,18 +3880,26 @@ async def explore_table(
     period_summary = None
     used_period = None
     if isinstance(period_rows, list) and period_rows:
-        latest = period_rows[-1]
+        latest = _pick_finest_period(period_rows)
+        used_period = str(
+            latest.get("END_PRD_DE") or latest.get("endPrdDe")
+            or latest.get("PRD_DE") or latest.get("prdDe") or ""
+        )
         period_summary = {
             "수록주기": latest.get("PRD_SE") or latest.get("prdSe"),
-            "최신_수록시점": latest.get("PRD_DE") or latest.get("prdDe"),
-            "수록시점_개수": len(period_rows),
+            "시작_수록시점": (
+                latest.get("STRT_PRD_DE") or latest.get("strtPrdDe") or ""
+            ),
+            "최신_수록시점": used_period,
+            "수록주기_개수": len(period_rows),
         }
-        used_period = period_summary["최신_수록시점"]
 
-    period_age = (
-        NaturalLanguageAnswerEngine._period_age_years(used_period)
-        if used_period else None
-    )
+    period_age = None
+    if used_period:
+        parseable = re.match(r"(\d{4})(?:\.(\d{2}))?", used_period)
+        period_age = NaturalLanguageAnswerEngine._period_age_years(
+            "".join(filter(None, parseable.groups())) if parseable else used_period
+        )
 
     contact = None
     if isinstance(source_rows, list) and source_rows:
