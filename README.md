@@ -429,7 +429,21 @@ chart_line("고령인구", region="전국", years=5)
 
 `search_kosis` 응답은 `Tier_A_직접_매핑` 필드를 통해 같은 키워드에 검증된 Tier A 통계표가 있는지 표면화합니다 — KOSIS 검색 인덱스가 약하게 매칭된 통계표를 상위에 올리는 경우에도 정확한 매핑을 놓치지 않습니다.
 
-`STAT_CORRELATION`·`STAT_OUTLIER_DETECTION`·`STAT_FORECAST` 의도가 감지되면 `answer_query`는 `search_and_plan` 응답의 `추천_도구_호출` 필드에 `correlate_stats`/`detect_outliers`/`forecast_stat`의 호출 syntax를 명시합니다.
+`STAT_CORRELATION`·`STAT_OUTLIER_DETECTION`·`STAT_FORECAST` 의도가 감지되면 `answer_query`는 `search_and_plan` 응답의 `추천_도구_호출` 필드에 `correlate_stats`/`detect_outliers`/`forecast_stat`의 호출 syntax를 명시합니다. 두 Tier-A 지표가 명확히 추출되는 high-confidence 케이스(예: "실업률과 고용률 상관관계")는 0.5.0부터 `correlate_stats`로 자동 위임돼 `tier_a_auto_correlation`을 반환합니다.
+
+`생존율`·`폐업률`·`창업률` 같은 시간-코호트 기반 동태 지표 질의("음식점업 5년 살아남는 비율" 등)는 정태 비중(`tier_a_share_ratio`)으로 잘못 매핑되지 않고 `dynamic_ratio_advisory`로 분기되어 `indicator_dependency_map`의 산식 사양과 KOSIS 통계표 후보를 같이 반환합니다.
+
+응답 텍스트의 KOSIS 표준 단위(`천명`, `억원`, `십억원`, `천달러`)는 자동으로 사람이 읽기 좋은 형식이 병기됩니다 — 예: `5,688.7 천명 (약 569만 명)`, `33,012,545 억원 (약 3,301.25조원)`.
+
+`period` 표현은 0.5.0부터 다음을 추가로 인식합니다:
+
+- `올해 1분기` / `작년 4분기` / `이번 분기` / `지난 분기`
+- `올해 4월` / `지난달` / `이번달`
+- `상반기` / `하반기` — KOSIS 표준 주기에 없으므로 `⚠️ 상하반기` 안내 노출
+
+`search_and_plan` 응답은 슬롯에서 추출된 `industry`·`scale`·`target`을 검색어에 자동 보강합니다(`검색어_슬롯보강` 필드). 사용자가 "제조업 중소기업 비중"이라 물으면 검색 키워드에 "제조업"이 자동 포함돼 산업 특화 통계표가 상위에 오릅니다.
+
+다지역 합산·합성지역 핸들러(`_answer_composite_aggregate`, `_answer_region_sum`)는 0.5.0부터 모든 component를 **병렬 호출**하고 per-call 12초·전체 60초 예산을 적용합니다 — 단일 호출이 지연돼도 다른 in-flight 요청이 막히지 않습니다.
 
 차트 도구(`chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`, `chain_full_analysis`)는 SVG를 fenced ``` ```svg ``` ``` 블록에 담은 `TextContent`로 반환합니다 — MCP 표준이 `image/svg+xml` ImageContent를 받지 않아 발생하던 콘텐츠 포맷 오류를 회피.
 

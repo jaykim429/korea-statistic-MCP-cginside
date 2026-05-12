@@ -17,6 +17,7 @@ KOSIS MCP — 조회 + 분석 + 시각화 통합 서버
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -227,6 +228,24 @@ def _parse_year_token(text: str) -> Optional[str]:
     return None
 
 
+def _relative_year(compact_text: str) -> Optional[int]:
+    """Resolve 재작년/작년/올해/금년 references to an absolute year."""
+    if not compact_text:
+        return None
+    now = datetime.now().year
+    if "재작년" in compact_text:
+        return now - 2
+    if any(t in compact_text for t in ("작년", "지난해", "전년")):
+        return now - 1
+    if any(t in compact_text for t in ("올해", "금년", "이번해", "당해")):
+        return now
+    return None
+
+
+def _current_quarter() -> int:
+    return (datetime.now().month - 1) // 3 + 1
+
+
 def _parse_month_token(text: str) -> Optional[str]:
     if not text:
         return None
@@ -234,6 +253,22 @@ def _parse_month_token(text: str) -> Optional[str]:
     m = re.search(r"(19\d{2}|20\d{2})(?:[.\-/]|년)?(0?[1-9]|1[0-2])월?", compact)
     if m:
         return f"{m.group(1)}{int(m.group(2)):02d}"
+    # Relative-year + month: "올해 4월", "작년 12월"
+    rel_year = _relative_year(compact)
+    if rel_year is not None:
+        month_m = re.search(r"(0?[1-9]|1[0-2])월", compact)
+        if month_m:
+            return f"{rel_year}{int(month_m.group(1)):02d}"
+        if "이번달" in compact or "금월" in compact:
+            return f"{rel_year}{datetime.now().month:02d}"
+        if "지난달" in compact or "전월" in compact:
+            now = datetime.now()
+            month = now.month - 1
+            year = now.year
+            if month == 0:
+                month = 12
+                year -= 1
+            return f"{year}{month:02d}"
     return None
 
 
@@ -246,6 +281,41 @@ def _parse_quarter_token(text: str) -> Optional[str]:
         m = re.search(r"(19\d{2}|20\d{2})Q([1-4])", compact)
     if m:
         return f"{m.group(1)}{m.group(2)}"
+    # Relative-year + quarter: "올해 1분기", "작년 4분기"
+    rel_year = _relative_year(compact)
+    if rel_year is not None:
+        q_m = re.search(r"([1-4])분기|Q([1-4])", compact)
+        if q_m:
+            quarter = q_m.group(1) or q_m.group(2)
+            return f"{rel_year}{quarter}"
+        if "이번분기" in compact or "당분기" in compact:
+            return f"{rel_year}{_current_quarter()}"
+    # Bare 이번 분기 / 지난 분기 without explicit year defaults to now
+    if "이번분기" in compact or "당분기" in compact:
+        return f"{datetime.now().year}{_current_quarter()}"
+    if "지난분기" in compact or "전분기" in compact:
+        q = _current_quarter() - 1
+        year = datetime.now().year
+        if q == 0:
+            q = 4
+            year -= 1
+        return f"{year}{q}"
+    return None
+
+
+def _detect_half_year_request(text: str) -> Optional[str]:
+    """Return an advisory string when 상반기/하반기 keywords appear.
+
+    KOSIS does not publish 상반기/하반기 aggregates as first-class
+    periods, so we cannot honor them as a period code. Surface an
+    explicit message instead of silently dropping to year."""
+    if not text:
+        return None
+    compact = re.sub(r"\s+", "", str(text))
+    if "상반기" in compact:
+        return "상반기는 KOSIS 표준 주기에 없음 — 1분기·2분기를 따로 조회하거나 월별 누계 사용"
+    if "하반기" in compact:
+        return "하반기는 KOSIS 표준 주기에 없음 — 3분기·4분기를 따로 조회하거나 월별 누계 사용"
     return None
 
 
@@ -606,6 +676,11 @@ class NaturalLanguageAnswerEngine:
         return any(term in q for term in ("가장많", "가장적", "상위", "하위", "topn"))
 
     def _is_share_ratio_question(self, query: str, route_payload: dict[str, Any]) -> bool:
+        # Survival/closure rate is a time-based dynamic ratio, not a
+        # part/whole 구성비 — refuse to dispatch share_ratio for those
+        # verbal patterns (#27).
+        if self._is_dynamic_ratio_question(query):
+            return False
         slots = route_payload.get("slots") or {}
         calc = slots.get("calculation") if isinstance(slots, dict) else None
         if isinstance(calc, list) and "share_ratio" in calc:
@@ -614,6 +689,15 @@ class NaturalLanguageAnswerEngine:
             return True
         q = self._norm(query)
         return any(term in q for term in ("비중", "비율", "차지", "구성비"))
+
+    @classmethod
+    def _is_dynamic_ratio_question(cls, query: str) -> bool:
+        """Detect 'time-cohort ratio' verbal cues that the share_ratio
+        keyword scanner mistakes for 부분/전체 비중."""
+        q = re.sub(r"\s+", "", str(query))
+        return any(term in q for term in (
+            "살아남", "생존율", "잔존율", "폐업률", "창업률", "유지율",
+        ))
 
     @staticmethod
     def _is_aggregation_question(query: str) -> bool:
@@ -659,6 +743,9 @@ class NaturalLanguageAnswerEngine:
     def _expand_composite_to_components(cls, composite: str) -> list[str]:
         return list(REGION_COMPOSITES.get(composite, []))
 
+    _COMPOSITE_PER_CALL_TIMEOUT = 12.0
+    _COMPOSITE_TOTAL_BUDGET = 60.0
+
     async def _answer_composite_aggregate(
         self,
         query: str,
@@ -670,13 +757,50 @@ class NaturalLanguageAnswerEngine:
 
         operation="sum" returns tier_a_region_sum for the components.
         operation="share" computes (sum of components) / 전국 * 100.
-        Other ops fall back through the dispatcher."""
+
+        All component calls run in parallel with a per-call timeout
+        and an overall budget — sequential iteration of 14 regions
+        (비수도권) used to chain 14 × 30 s timeouts on a slow KOSIS
+        response, which presented to callers as a multi-minute hang
+        and starved every other in-flight request (#30)."""
         components = self._expand_composite_to_components(composite)
         if not components:
             return await self._answer_search_fallback(query)
+        components = components[:17]
         route_payload = self._route_payload(query)
         route_payload["route"]["direct_stat_key"] = direct_key
         period = self._period_argument(query, route_payload)
+
+        async def fetch_one(region: str) -> tuple[str, dict[str, Any]]:
+            try:
+                return region, await asyncio.wait_for(
+                    _quick_stat_core(direct_key, region, period, self.api_key),
+                    timeout=self._COMPOSITE_PER_CALL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return region, {"오류": "호출 타임아웃"}
+            except Exception as exc:  # network/protocol failures shouldn't poison the whole batch
+                return region, {"오류": f"{type(exc).__name__}: {exc}"}
+
+        try:
+            gathered = await asyncio.wait_for(
+                asyncio.gather(*(fetch_one(r) for r in components)),
+                timeout=self._COMPOSITE_TOTAL_BUDGET,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "상태": "failed",
+                "코드": STATUS_RUNTIME_ERROR,
+                "답변유형": "tier_a_composite_timeout",
+                "질문": query,
+                "answer": (
+                    f"{composite}({'+'.join(components)}) 합산이 전체 예산({self._COMPOSITE_TOTAL_BUDGET:.0f}초)을 "
+                    "초과해 중단했습니다. KOSIS 응답 지연 가능성 — 잠시 후 재시도하거나 시도별 단일 호출로 분리하세요."
+                ),
+                "구성_지역": components,
+                "route": route_payload["route"],
+                "출처": "통계청 KOSIS",
+            }
 
         rows: list[dict[str, Any]] = []
         subtotal = 0.0
@@ -684,9 +808,8 @@ class NaturalLanguageAnswerEngine:
         used_period = ""
         table = ""
         missing: list[str] = []
-        for region in components:
-            stat = await quick_stat(direct_key, region, period, self.api_key)
-            if "오류" in stat or "값" not in stat:
+        for region, stat in gathered:
+            if not isinstance(stat, dict) or "오류" in stat or "값" not in stat:
                 missing.append(region)
                 continue
             try:
@@ -1188,15 +1311,46 @@ class NaturalLanguageAnswerEngine:
         route_payload["route"]["direct_stat_key"] = direct_key
         period = self._period_argument(query, route_payload)
 
+        regions = regions[:17]
+
+        async def fetch_one(region: str) -> tuple[str, dict[str, Any]]:
+            try:
+                return region, await asyncio.wait_for(
+                    _quick_stat_core(direct_key, region, period, self.api_key),
+                    timeout=self._COMPOSITE_PER_CALL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return region, {"오류": "호출 타임아웃"}
+            except Exception as exc:
+                return region, {"오류": f"{type(exc).__name__}: {exc}"}
+
+        try:
+            gathered = await asyncio.wait_for(
+                asyncio.gather(*(fetch_one(r) for r in regions)),
+                timeout=self._COMPOSITE_TOTAL_BUDGET,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "상태": "failed",
+                "코드": STATUS_RUNTIME_ERROR,
+                "답변유형": "tier_a_region_sum_timeout",
+                "질문": query,
+                "answer": (
+                    f"{', '.join(regions)} 합산이 전체 예산({self._COMPOSITE_TOTAL_BUDGET:.0f}초)을 초과해 "
+                    "중단했습니다. KOSIS 응답 지연 가능성 — 잠시 후 재시도하거나 단일 호출로 분리하세요."
+                ),
+                "route": route_payload["route"],
+                "출처": "통계청 KOSIS",
+            }
+
         rows: list[dict[str, Any]] = []
         total = 0.0
         unit = ""
         used_period = ""
         table = ""
         missing: list[str] = []
-        for region in regions:
-            stat = await quick_stat(direct_key, region, period, self.api_key)
-            if "오류" in stat or "값" not in stat:
+        for region, stat in gathered:
+            if not isinstance(stat, dict) or "오류" in stat or "값" not in stat:
                 missing.append(region)
                 continue
             try:
@@ -1252,9 +1406,66 @@ class NaturalLanguageAnswerEngine:
             "출처": "통계청 KOSIS",
         }
 
+    async def _answer_dynamic_ratio_advisory(
+        self,
+        query: str,
+        route_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Route survival/closure/cohort-ratio queries to
+        indicator_dependency_map instead of misclassifying them as
+        share_ratio (#27).
+
+        'X 살아남는 비율' is a time-cohort survival rate. The keyword
+        scanner used to pick "비율" alone and dispatch share_ratio,
+        which produced single-point part/whole answers that did not
+        address the user's question. We surface the right formula
+        spec and search candidates so the caller can step into the
+        cohort-aware analysis."""
+        q = re.sub(r"\s+", "", str(query))
+        if any(t in q for t in ("폐업", "폐업률")):
+            indicator = "폐업률"
+        elif any(t in q for t in ("창업", "창업률")):
+            indicator = "창업률"
+        else:
+            indicator = "생존율"
+        formula_spec = await indicator_dependency_map(indicator)
+        search = await search_kosis(f"{indicator} {query}", 8, True, self.api_key)
+        return {
+            "상태": "needs_table_selection",
+            "코드": STATUS_NEEDS_TABLE_SELECTION,
+            "답변유형": "dynamic_ratio_advisory",
+            "질문": query,
+            "answer": (
+                f"이 질문은 '{indicator}'에 해당하는 동태 지표입니다. "
+                "정태 비중(share_ratio)이 아니라 시간-코호트 기반 산식이 필요합니다. "
+                "indicator_dependency_map의 산식과 search_kosis 후보 표를 함께 검토하세요."
+            ),
+            "지표": indicator,
+            "산식_사양": formula_spec,
+            "검색결과": search.get("결과", []),
+            "사용된_검색어": search.get("사용된_검색어", []),
+            "추천_도구_호출": [
+                f"indicator_dependency_map('{indicator}') — 산식·필요 통계·검증 포인트 확인",
+                f"search_kosis('{indicator} {query[:30]}') — KOSIS 통계표 후보 조회",
+            ],
+            "route": route_payload.get("route", {}),
+        }
+
     async def _answer_search_fallback(self, query: str, route_payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
-        search = await search_kosis(query, 8, True, self.api_key)
+        # Fold slot-parsed industry/scale into the search query so the
+        # KOSIS index ranks industry-specific tables higher (#28). The
+        # parser already extracts these into slots; previously they
+        # were thrown away at this layer.
+        slots = route_payload.get("slots") or {}
+        enrichment: list[str] = []
+        if isinstance(slots, dict):
+            for slot_key in ("industry", "scale", "target"):
+                value = slots.get(slot_key)
+                if isinstance(value, str) and value and value not in query:
+                    enrichment.append(value)
+        enriched_query = (query + " " + " ".join(enrichment)).strip() if enrichment else query
+        search = await search_kosis(enriched_query, 8, True, self.api_key)
         intents = route_payload.get("intents") or []
         tool_hints = self._tool_routing_hints(query, intents)
         next_steps = [
@@ -1282,9 +1493,91 @@ class NaturalLanguageAnswerEngine:
             "검증": route_payload["validation"],
             "검색결과": search.get("결과", []),
             "사용된_검색어": search.get("사용된_검색어", []),
+            "검색어_슬롯보강": enrichment or None,
             "추천_도구_호출": tool_hints,
             "다음단계": next_steps,
             "route": route_payload["route"],
+        }
+
+    def _extract_correlation_pair(self, query: str) -> tuple[Optional[str], Optional[str]]:
+        """Identify exactly two Tier-A stat keys mentioned in the query.
+
+        Returns (None, None) when fewer than two distinct, verified
+        keys are found — that ambiguous case stays on the safe
+        hint-only path instead of guessing which two stats to feed to
+        correlate_stats.
+
+        Longer descriptions are matched first so '고령인구' wins over
+        '인구', then the matched substring is removed so the second
+        scan does not re-count overlapping tokens."""
+        if not query:
+            return (None, None)
+        q_norm = self._norm(query)
+        remaining = q_norm
+        candidates: list[tuple[str, str]] = []
+        for key, param in TIER_A_STATS.items():
+            if param.verification_status not in {"verified", "needs_check"}:
+                continue
+            description = self._norm(param.description)
+            display_key = self._norm(key.replace("_", " "))
+            candidates.append((key, max(description, display_key, key=len)))
+        candidates.sort(key=lambda kv: -len(kv[1]))
+
+        found: list[str] = []
+        for key, marker in candidates:
+            if not marker:
+                continue
+            if marker in remaining and key not in found:
+                found.append(key)
+                remaining = remaining.replace(marker, " ", 1)
+                if len(found) >= 2:
+                    break
+        if len(found) < 2:
+            return (None, None)
+        return (found[0], found[1])
+
+    async def _answer_auto_correlate(
+        self,
+        query: str,
+        stat_x: str,
+        stat_y: str,
+        region: str,
+        route_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        years_match = re.search(r"최근\s*(\d+)\s*년", query)
+        years = int(years_match.group(1)) if years_match else 10
+        result = await correlate_stats(stat_x, stat_y, region, years, self.api_key)
+        if not isinstance(result, dict) or "오류" in result:
+            return await self._answer_search_fallback(query, route_payload)
+        notes = list(result.get("주의") or [])
+        notes.append("상관계수는 인과관계를 의미하지 않습니다.")
+        notes.append(f"자동 위임: answer_query → correlate_stats('{stat_x}', '{stat_y}', region='{region}', years={years})")
+        used_period = (
+            result.get("종료시점")
+            or result.get("end_period")
+            or result.get("기간_종료")
+            or str(datetime.now().year)
+        )
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_auto_correlation",
+            "질문": query,
+            "answer": result.get("answer") or result.get("해석") or (
+                f"{stat_x}과 {stat_y}의 최근 {years}년 상관관계 분석을 수행했습니다."
+            ),
+            "변수": [stat_x, stat_y],
+            "지역": region,
+            "기간": years,
+            "used_period": str(used_period),
+            "결과": result,
+            "추천_시각화": ["chart_correlation"],
+            "검증_주의": notes,
+            "route": {
+                **route_payload.get("route", {}),
+                "delegated_to": "correlate_stats",
+            },
+            "출처": "통계청 KOSIS",
         }
 
     def _tool_routing_hints(self, query: str, intents: list[str]) -> list[str]:
@@ -1338,7 +1631,17 @@ class NaturalLanguageAnswerEngine:
             return await self._answer_sme_smallbiz_counts(query, effective_region)
         if self._is_sme_employee_average_question(query):
             return await self._answer_sme_employee_average(query, effective_region)
+        if self._is_dynamic_ratio_question(query):
+            return await self._answer_dynamic_ratio_advisory(query, route_payload)
+
         if self._needs_advanced_analysis_plan(route_payload):
+            intents = route_payload.get("intents") or []
+            if "STAT_CORRELATION" in intents:
+                stat_x, stat_y = self._extract_correlation_pair(query)
+                if stat_x and stat_y:
+                    return await self._answer_auto_correlate(
+                        query, stat_x, stat_y, effective_region, route_payload,
+                    )
             return await self._answer_search_fallback(query, route_payload)
 
         composites = self._extract_composite_regions(query)
@@ -1516,7 +1819,9 @@ class NaturalLanguageAnswerEngine:
         - X은(는) → X은 or X는 by Korean batchim
         - YYYY.MM (raw monthly period) → YYYY년 M월
         - YYYY.QQ patterns left alone (quarter labels already humane)
-        - Collapses 년년 / 월월 artifacts the substitutions can leave."""
+        - Collapses 년년 / 월월 artifacts the substitutions can leave.
+        - Appends human-readable unit conversion in parentheses after
+          KOSIS canonical units (천명, 억원, 십억원, 백만달러)."""
         if not text:
             return text
         def fix_josa(m: re.Match) -> str:
@@ -1530,7 +1835,61 @@ class NaturalLanguageAnswerEngine:
         )
         text = re.sub(r"년년", "년", text)
         text = re.sub(r"월월", "월", text)
+        text = re.sub(
+            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|억원|십억원|천달러)(?!\s*\()",
+            cls._append_humanized_unit,
+            text,
+        )
         return text
+
+    @staticmethod
+    def _humanize_value(value: float, unit: str) -> Optional[str]:
+        """KOSIS canonical units → reader-friendly Korean expression.
+
+        Returns None when no humanization is warranted (e.g. a 천명
+        value below 10 thousand people just becomes more confusing in
+        a different form)."""
+        if unit == "천명":
+            people = value * 1000
+            if people >= 1e8:
+                return f"약 {people / 1e8:.2f}억 명"
+            if people >= 1e4:
+                return f"약 {round(people / 1e4):,}만 명"
+            return None
+        if unit == "억원":
+            if value >= 1e4:
+                jo = value / 1e4
+                return f"약 {jo:,.2f}조원"
+            return None
+        if unit == "십억원":
+            eok = value * 10
+            if eok >= 1e4:
+                return f"약 {eok / 1e4:,.2f}조원"
+            if eok >= 1:
+                return f"약 {eok:,.0f}억원"
+            return None
+        if unit == "천달러":
+            usd = value * 1000
+            if usd >= 1e12:
+                return f"약 {usd / 1e12:.2f}조 달러"
+            if usd >= 1e8:
+                return f"약 {usd / 1e8:,.0f}억 달러"
+            return None
+        return None
+
+    @classmethod
+    def _append_humanized_unit(cls, m: re.Match) -> str:
+        raw_value = m.group(1)
+        unit = m.group(2)
+        original = m.group(0)
+        try:
+            value = float(raw_value.replace(",", ""))
+        except ValueError:
+            return original
+        humanized = cls._humanize_value(value, unit)
+        if not humanized:
+            return original
+        return f"{original} ({humanized})"
 
     @classmethod
     def _finalize_response(
@@ -1898,6 +2257,7 @@ async def _quick_stat_core(
         period_type = _default_period_type(param)
         start_period, end_period = _period_bounds(period, period_type)
         precision_downgrade = _detect_precision_downgrade(period, period_type)
+        half_year_advisory = _detect_half_year_request(period)
         if period != "latest" and not start_period:
             return {
                 "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
@@ -1967,6 +2327,8 @@ async def _quick_stat_core(
             result["⚠️ 검증_상태"] = verification_warning
         if precision_downgrade:
             result["⚠️ 정밀도_다운그레이드"] = precision_downgrade
+        if half_year_advisory:
+            result["⚠️ 상하반기"] = half_year_advisory
         return result
 
     # === Tier B 라우팅: 추천 검색어로 폴백 ===

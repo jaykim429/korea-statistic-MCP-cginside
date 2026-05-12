@@ -230,14 +230,41 @@ CASES: list[dict[str, Any]] = [
      "query": "중소기업 사업체수가 가장 많은 곳 알려줘",
      "expect": {"answer_type": "tier_a_top_n", "table_len": 5}},
 
-    # ── 20. Stage 13: cross-tool routing for advanced intents (#19) ────
-    # STAT_CORRELATION 의도는 search_fallback로 빠지되 응답에 correlate_stats
-    # 호출 힌트가 포함되어야 한다.
-    {"group": "tool_routing", "name": "correlation_routes_to_correlate_stats",
-     "query": "인구와 GDP 상관관계 분석해줘",
+    # ── 20. Stage 20: hybrid auto-delegation (#19) ─────────────────────
+    # 두 Tier-A 통계가 명확히 추출되는 high-confidence 케이스는
+    # answer_query가 correlate_stats로 자동 위임한다. 추출 실패 시 힌트만.
+    {"group": "tool_routing", "name": "correlation_auto_delegated",
+     "query": "실업률과 고용률 상관관계 분석해줘",
+     "expect": {"answer_type": "tier_a_auto_correlation"}},
+    {"group": "tool_routing", "name": "correlation_hint_when_ambiguous",
+     "query": "여러 통계 상관관계 분석해줘",
      "expect": {"status": "needs_table_selection",
                 "answer_type": "search_and_plan",
                 "tool_hint_contains": "correlate_stats"}},
+
+    # ── 21. Stage 18: human-readable unit conversion (#14) ─────────────
+    # 단위 그대로 echo하던 답변 텍스트에 "약 N만 명" / "약 N조원" 병기
+    # 출력이 붙어야 한다.
+    {"group": "unit_humanize", "name": "self_employed_chunmyeong",
+     "query": "자영업자수",
+     "expect": {"answer_type": "tier_a_value",
+                "answer_contains": "만 명"}},
+    {"group": "unit_humanize", "name": "sme_sales_eokwon",
+     "query": "중소기업 매출액",
+     "expect": {"answer_type": "tier_a_value",
+                "answer_contains": "조원"}},
+
+    # ── 22. Stage 23: dynamic-ratio advisory (#27) ─────────────────────
+    # 생존율·폐업률·창업률 같은 시간-코호트 동태 지표는 share_ratio가 아니라
+    # indicator_dependency_map으로 분기되어야 한다.
+    {"group": "dynamic_ratio", "name": "survival_rate_advisory",
+     "query": "음식점업 5년간 살아남는 비율",
+     "expect": {"answer_type": "dynamic_ratio_advisory",
+                "status": "needs_table_selection"}},
+    {"group": "dynamic_ratio", "name": "closure_rate_advisory",
+     "query": "제조업 5년 폐업률 알려줘",
+     "expect": {"answer_type": "dynamic_ratio_advisory",
+                "status": "needs_table_selection"}},
 ]
 
 
@@ -267,6 +294,7 @@ def _summarize(result: dict[str, Any]) -> dict[str, Any]:
         "first_row_keys": sorted((table[0].keys()) if table and isinstance(table[0], dict) else []),
         "warnings": result.get("검증_주의") or [],
         "answer": result.get("answer"),
+        "tool_hints": result.get("추천_도구_호출") or [],
     }
 
 
@@ -339,6 +367,11 @@ def _check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         warnings_text = " | ".join(s.get("warnings") or [])
         if expect["warning_excludes"] in warnings_text:
             problems.append(f"warning_unexpected={expect['warning_excludes']!r}")
+
+    if "tool_hint_contains" in expect:
+        hints_text = " | ".join(s.get("tool_hints") or [])
+        if expect["tool_hint_contains"] not in hints_text:
+            problems.append(f"tool_hint_missing={expect['tool_hint_contains']!r}")
 
     if expected_status == "executed" and not s.get("used_period"):
         problems.append("stage3_missing_used_period")
