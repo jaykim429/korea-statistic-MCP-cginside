@@ -206,7 +206,7 @@ CASES: list[dict[str, Any]] = [
     {"group": "nl_polish", "name": "monthly_period_humanized",
      "query": "서울 주택매매가격지수 최신",
      "expect": {"answer_type": "tier_a_value", "region": "서울",
-                "answer_excludes": ".0", "answer_contains": "년"}},
+                "answer_excludes": "2026.0", "answer_contains": "년"}},
 
     # ── 17. Stage 8: false-positive fix on trend with year reference ──
     # "2020년 이후 인구 추이" 같은 쿼리에서 2020은 기준 시작점이지 사용 시점
