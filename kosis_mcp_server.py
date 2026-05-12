@@ -336,6 +336,7 @@ class AnswerStat:
     unit: str
     period: str
     table: str
+    region: str
     source: str = "통계청 KOSIS"
 
     def to_row(self) -> dict[str, Any]:
@@ -345,6 +346,7 @@ class AnswerStat:
             "원값": self.value,
             "단위": self.unit,
             "시점": self.period,
+            "지역": self.region,
             "통계표": self.table,
             "출처": self.source,
         }
@@ -377,6 +379,7 @@ class NaturalLanguageAnswerEngine:
             unit=result.get("단위", param.unit if param else ""),
             period=str(result.get("시점", "")),
             table=result.get("통계표", param.tbl_nm if param else ""),
+            region=region,
         )
 
     @staticmethod
@@ -434,6 +437,11 @@ class NaturalLanguageAnswerEngine:
             and any(term in q for term in ("매출", "매출액"))
             and any(term in q for term in ("비교", "비중", "차이", "전체매출"))
         )
+
+    @staticmethod
+    def _needs_advanced_analysis_plan(route_payload: dict[str, Any]) -> bool:
+        advanced = {"STAT_CORRELATION", "STAT_REGRESSION", "POLICY_EFFECT_ANALYSIS"}
+        return any(intent in advanced for intent in route_payload.get("intents", []))
 
     def _infer_direct_stat_key(self, query: str, route_payload: dict[str, Any]) -> Optional[str]:
         direct_key = route_payload["route"].get("direct_stat_key")
@@ -697,6 +705,8 @@ class NaturalLanguageAnswerEngine:
             return await self._answer_sme_smallbiz_counts(query, effective_region)
         if self._is_sme_employee_average_question(query):
             return await self._answer_sme_employee_average(query, effective_region)
+        if self._needs_advanced_analysis_plan(route_payload):
+            return await self._answer_search_fallback(query, route_payload)
         if inferred_direct_key and self._is_region_compare_question(query):
             return await self._answer_region_compare(query, inferred_direct_key)
         if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
@@ -1145,9 +1155,12 @@ async def quick_region_compare(
 
     code_field, name_field = _region_field_names(param)
     regions_by_code = {code: name for name, code in param.region_scheme.items()}
+    allowed_codes = set(regions_by_code)
     rows = []
     for row in data:
         code = row.get(code_field)
+        if code not in allowed_codes:
+            continue
         region_name = regions_by_code.get(code) or row.get(name_field)
         if not region_name or region_name == "전국":
             continue
