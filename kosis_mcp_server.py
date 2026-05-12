@@ -1096,11 +1096,17 @@ class NaturalLanguageAnswerEngine:
         }
 
     async def answer(self, query: str, region: str = "전국") -> dict[str, Any]:
-        result = await self._dispatch(query, region)
-        return self._finalize_response(result)
-
-    async def _dispatch(self, query: str, region: str) -> dict[str, Any]:
         route_payload = self._route_payload(query)
+        result = await self._dispatch(query, region, precomputed_route=route_payload)
+        return self._finalize_response(result, query=query, route_payload=route_payload)
+
+    async def _dispatch(
+        self,
+        query: str,
+        region: str,
+        precomputed_route: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        route_payload = precomputed_route or self._route_payload(query)
         effective_region = self._effective_region(route_payload, region)
         inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
         if self._is_sme_large_sales_question(query):
@@ -1173,25 +1179,92 @@ class NaturalLanguageAnswerEngine:
             return str(period)
         return None
 
+    _INTENT_FULFILLMENT: dict[str, frozenset[str]] = {
+        "STAT_RANKING": frozenset({
+            "tier_a_top_n", "tier_a_region_comparison", "tier_a_region_sum",
+        }),
+        "STAT_SHARE_RATIO": frozenset({
+            "tier_a_share_ratio", "tier_a_composite_comparison", "tier_a_composite",
+        }),
+    }
+
     @classmethod
-    def _finalize_response(cls, result: dict[str, Any]) -> dict[str, Any]:
+    def _intent_execution_warnings(
+        cls,
+        result: dict[str, Any],
+        query: str,
+        route_payload: Optional[dict[str, Any]],
+    ) -> list[str]:
+        if not route_payload:
+            return []
+        warnings: list[str] = []
+        answer_type = str(result.get("답변유형") or "")
+        intents = route_payload.get("intents") or []
+        slots = route_payload.get("slots") or {}
+
+        for intent_label, fulfilling_types in cls._INTENT_FULFILLMENT.items():
+            if intent_label in intents and answer_type not in fulfilling_types:
+                warnings.append(
+                    f"의도 {intent_label} 감지됐으나 응답 유형은 {answer_type or '미지정'} — "
+                    "단일값/요약에 그쳤을 수 있으니 시도별 비교나 비중 계산을 별도 요청 필요"
+                )
+
+        if cls._is_aggregation_question(query) and answer_type != "tier_a_region_sum":
+            warnings.append(
+                f"합계/합산 키워드 감지됐으나 응답 유형은 {answer_type or '미지정'} — "
+                "두 번째 지역을 인식하지 못해 단일 지역 값으로 폴백했을 수 있음"
+            )
+
+        comparison_targets = slots.get("comparison_target") if isinstance(slots, dict) else None
+        if isinstance(comparison_targets, list) and comparison_targets and answer_type in {
+            "tier_a_value", "tier_a_trend", "tier_a_growth_rate"
+        }:
+            warnings.append(
+                f"비교 대상 {comparison_targets} 이(가) 감지됐으나 응답은 단일 대상 — "
+                "비교/합산이 누락됐을 수 있음"
+            )
+
+        years_in_query = [y for y in re.findall(r"(19\d{2}|20\d{2})", query)]
+        used_period = result.get("used_period")
+        if years_in_query and used_period:
+            used_str = str(used_period)
+            if not any(used_str.startswith(y) for y in years_in_query):
+                warnings.append(
+                    f"질문에 명시된 연도 {years_in_query} 와 사용 시점 {used_str} 불일치 — "
+                    "요청 기간을 만족하지 못했을 수 있음"
+                )
+        return warnings
+
+    @classmethod
+    def _finalize_response(
+        cls,
+        result: dict[str, Any],
+        query: Optional[str] = None,
+        route_payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         if not isinstance(result, dict):
             return result
         if result.get("상태") != "executed":
             return result
         used = result.get("used_period") or cls._extract_used_period(result)
-        if not used:
-            return result
-        result["used_period"] = str(used)
-        age = cls._period_age_years(used)
-        if age is None:
-            return result
-        result["period_age_years"] = age
-        if age >= 1.0:
-            notes = list(result.get("검증_주의") or [])
-            warn = f"사용 시점 {used} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음"
-            if warn not in notes:
-                notes.append(warn)
+        notes = list(result.get("검증_주의") or [])
+        if used:
+            result["used_period"] = str(used)
+            age = cls._period_age_years(used)
+            if age is not None:
+                result["period_age_years"] = age
+                if age >= 1.0:
+                    warn = f"사용 시점 {used} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음"
+                    if warn not in notes:
+                        notes.append(warn)
+
+        if query is not None:
+            mismatch_warnings = cls._intent_execution_warnings(result, query, route_payload)
+            for w in mismatch_warnings:
+                if w not in notes:
+                    notes.append(w)
+
+        if notes:
             result["검증_주의"] = notes
         return result
 

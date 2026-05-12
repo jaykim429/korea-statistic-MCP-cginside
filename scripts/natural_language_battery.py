@@ -152,6 +152,14 @@ CASES: list[dict[str, Any]] = [
     {"group": "guardrail", "name": "vague_query",
      "query": "우리나라 잘 살아?",
      "expect": {}},
+
+    # ── 11. Stage 4 의도/실행 불일치 경고 ──────────────────────────────
+    # 두 지역을 언급했지만 합계/Top N/비중 키워드가 없어 단일값으로 폴백되는 케이스.
+    # 사용자가 "서울과 경기"라고 말한 의도가 응답에 반영되지 않을 때 경고 트레일이
+    # 떠야 한다 — 정직한 "조용한 오답" 방지 장치.
+    {"group": "mismatch_warning", "name": "comparison_targets_dropped",
+     "query": "서울과 경기 인구 알려줘",
+     "expect": {"answer_type": "tier_a_value", "warning_contains": "비교 대상"}},
 ]
 
 
@@ -232,6 +240,11 @@ def _check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [r for r in expect["sum_includes_regions"] if r not in regions]
         if missing:
             problems.append(f"missing_sum_regions={missing}")
+
+    if "warning_contains" in expect:
+        warnings_text = " | ".join(s.get("warnings") or [])
+        if expect["warning_contains"] not in warnings_text:
+            problems.append(f"warning_missing={expect['warning_contains']}")
 
     if expected_status == "executed" and not s.get("used_period"):
         problems.append("stage3_missing_used_period")
