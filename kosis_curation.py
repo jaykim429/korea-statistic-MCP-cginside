@@ -1951,6 +1951,11 @@ class NaturalLanguageRouter:
             slots.scale = "영세/소규모"
             slots.code_mapping_needed.append("scale")
 
+        month_match = re.search(r"(20\d{2}|19\d{2})\s*(?:[.\-/]\s*|년\s*)(0?[1-9]|1[0-2])\s*월?", q)
+        if not month_match:
+            compact_month_match = re.search(r"(20\d{2}|19\d{2})(0[1-9]|1[0-2])", q_norm)
+            if compact_month_match:
+                month_match = compact_month_match
         year_match = re.search(r"(20\d{2}|19\d{2})\s*년", q)
         recent_year_match = re.search(r"최근\s*(\d+)\s*년", q)
         recent_month_match = re.search(r"최근\s*(\d+)\s*개월", q)
@@ -1972,6 +1977,8 @@ class NaturalLanguageRouter:
             slots.time = {"type": "relative_period", "value": "코로나 이전", "default_end": "2019"}
         elif "2020년이후" in q_norm:
             slots.time = {"type": "relative_period", "value": "2020년 이후", "default_start": "2020"}
+        elif month_match:
+            slots.time = {"type": "month", "value": f"{month_match.group(1)}{int(month_match.group(2)):02d}"}
         elif year_match:
             slots.time = {"type": "year", "value": year_match.group(1)}
         elif any(term in q_norm for term in ("최근", "현재", "최신", "기준")):

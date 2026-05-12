@@ -376,9 +376,12 @@ $env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
 ```text
 answer_query("최근 기준 중소기업 수와 소상공인 사업체 수를 함께 보여줘")
 answer_query("중소기업 사업체수를 시도별로 비교해줘")
+answer_query("2020년 서울 중소기업 매출액 알려줘")
+answer_query("서울 집값 전월 대비 변화율 알려줘")
 answer_query("AI 관련 통계 찾아줘")
 answer_query("최근 5년간 실업률 추이 분석해줘")
 quick_region_compare("중소기업 사업체수")
+quick_stat("주택매매가격지수", region="서울", period="2026.03")
 stat_time_compare("실업률", years=5)
 indicator_dependency_map("폐업률")
 chart_line("고령인구", region="전국", years=5)
@@ -398,7 +401,20 @@ chart_line("고령인구", region="전국", years=5)
 - 비중, 폐업률, 창업률, 생존율은 분모와 작성기관 산식을 먼저 확인해야 합니다.
 - 상관·회귀·정책효과 분석은 인과관계를 자동으로 의미하지 않습니다.
 - “최신” 질문은 KOSIS 통계표의 최신 수록 시점을 기준으로 답합니다.
+- “2020년”, “2026년 3월”, “전년 대비”, “전월 대비”처럼 기간이 명시된 질문은 해당 기간 또는 기간 비교로 처리하며, 데이터가 없으면 최신값으로 대체하지 않습니다.
 - Tier A에 없는 질문은 단일값을 임의로 답하지 않고 검색 후보와 분석 계획을 반환합니다.
+
+## 검증 스크립트
+
+라이브 KOSIS API 회귀 검증:
+
+```powershell
+$env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
+$env:PYTHONIOENCODING="utf-8"
+python scripts\regression_smoke.py
+python scripts\comprehensive_api_matrix.py
+python scripts\temporal_edge_cases.py
+```
 
 ## 파일 구성
 
@@ -406,6 +422,7 @@ chart_line("고령인구", region="전국", years=5)
 - `kosis_http_server.py`: Streamable HTTP MCP 서버 엔트리포인트
 - `kosis_curation.py`: 자연어 라우터, Tier A/B 큐레이션, 개념 그래프
 - `kosis_charts_extra.py`: 추가 SVG 차트 헬퍼
+- `scripts/regression_smoke.py`, `scripts/comprehensive_api_matrix.py`, `scripts/temporal_edge_cases.py`: 라이브 API 회귀 검증 스크립트
 - `pyproject.toml`: `kosis-analysis-mcp` 실행 명령과 패키지 메타데이터
 - `package.json`, `bin/`, `scripts/`: npx/npm wrapper
 - `.claude-plugin/`, `.mcp.json`, `skills/`: Claude Code plugin 구성

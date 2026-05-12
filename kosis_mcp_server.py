@@ -200,13 +200,60 @@ def _parse_year_token(text: str) -> Optional[str]:
     m = re.match(r"^(\d{4})", text.strip())
     if m:
         return m.group(1)
+    if "재작년" in text:
+        return str(year_now - 2)
     if any(t in text for t in ("작년", "지난해", "전년")):
         return str(year_now - 1)
     if any(t in text for t in ("올해", "금년")):
         return str(year_now)
-    if "재작년" in text:
-        return str(year_now - 2)
     return None
+
+
+def _parse_month_token(text: str) -> Optional[str]:
+    if not text:
+        return None
+    compact = re.sub(r"\s+", "", str(text))
+    m = re.search(r"(19\d{2}|20\d{2})(?:[.\-/]|년)?(0?[1-9]|1[0-2])월?", compact)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}"
+    return None
+
+
+def _parse_quarter_token(text: str) -> Optional[str]:
+    if not text:
+        return None
+    compact = re.sub(r"\s+", "", str(text)).upper()
+    m = re.search(r"(19\d{2}|20\d{2})(?:년)?([1-4])분기", compact)
+    if not m:
+        m = re.search(r"(19\d{2}|20\d{2})Q([1-4])", compact)
+    if m:
+        return f"{m.group(1)}{m.group(2)}"
+    return None
+
+
+def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Optional[str]]:
+    """Convert natural period text into KOSIS start/end period codes."""
+    if not period or period == "latest":
+        return None, None
+
+    if period_type == "M":
+        month = _parse_month_token(period)
+        if month:
+            return month, month
+
+    if period_type == "Q":
+        quarter = _parse_quarter_token(period)
+        if quarter:
+            return quarter, quarter
+
+    year = _parse_year_token(period)
+    if not year:
+        return None, None
+    if period_type == "M":
+        return f"{year}01", f"{year}12"
+    if period_type == "Q":
+        return f"{year}1", f"{year}4"
+    return year, year
 
 
 def _default_period_type(param: QuickStatParam) -> str:
@@ -408,6 +455,34 @@ class NaturalLanguageAnswerEngine:
             notes.append("기업 수·사업체 수·자영업자 수는 모집단 기준이 다르므로 혼동 금지.")
         return notes
 
+    @staticmethod
+    def _period_argument(query: str, route_payload: dict[str, Any]) -> str:
+        slots = route_payload.get("slots", {})
+        time_slot = slots.get("time") if isinstance(slots, dict) else None
+        if _parse_month_token(query) or _parse_quarter_token(query):
+            return query
+        if isinstance(time_slot, dict):
+            if time_slot.get("type") in {"year", "month", "quarter"}:
+                return str(time_slot.get("value") or query)
+            if time_slot.get("type") == "latest":
+                return "latest"
+        if any(term in query for term in ("재작년", "작년", "지난해", "전년", "올해", "금년")):
+            return query
+        return "latest"
+
+    def _is_growth_question(self, query: str, route_payload: dict[str, Any]) -> bool:
+        if "STAT_GROWTH_RATE" in route_payload.get("intents", []):
+            return True
+        q = self._norm(query)
+        return any(term in q for term in ("전년대비", "전월대비", "증가율", "감소율", "변화율", "얼마나늘", "얼마나줄"))
+
+    @staticmethod
+    def _growth_period_count(query: str) -> int:
+        m = re.search(r"최근\s*(\d+)\s*(?:년|개월)", query)
+        if m:
+            return max(2, int(m.group(1)))
+        return 2
+
     def _is_sme_smallbiz_count_question(self, query: str) -> bool:
         q = self._norm(query)
         return (
@@ -584,6 +659,30 @@ class NaturalLanguageAnswerEngine:
         route_payload["route"]["direct_stat_key"] = direct_key
         q = self._norm(query)
 
+        if self._is_growth_question(query, route_payload):
+            period_count = self._growth_period_count(query)
+            comparison = await stat_time_compare(direct_key, region, None, None, period_count, self.api_key)
+            if comparison.get("상태") != "executed":
+                comparison["답변유형"] = "tier_a_growth_rate_failed"
+                comparison["route"] = route_payload["route"]
+                comparison["검증_주의"] = self._validation_notes(route_payload)
+                return comparison
+            return {
+                "상태": "executed",
+                "코드": STATUS_EXECUTED,
+                "답변유형": "tier_a_growth_rate",
+                "질문": query,
+                "answer": comparison.get("answer"),
+                "표": comparison.get("표", []),
+                "비교": comparison.get("비교"),
+                "지역": region,
+                "통계표": (comparison.get("표") or [{}])[0].get("통계표"),
+                "추천_시각화": ["line_chart"],
+                "검증_주의": self._validation_notes(route_payload),
+                "route": route_payload["route"],
+                "출처": comparison.get("출처", "통계청 KOSIS"),
+            }
+
         if any(term in q for term in ("추이", "최근", "시계열", "그래프", "선그래프", "분석")):
             years_match = re.search(r"최근\s*(\d+)\s*년", query)
             years = int(years_match.group(1)) if years_match else 5
@@ -614,9 +713,24 @@ class NaturalLanguageAnswerEngine:
                 result["분석"] = await analyze_trend(direct_key, region, max(years, 5), self.api_key)
             return result
 
-        stat = await quick_stat(direct_key, region, "latest", self.api_key)
+        period = self._period_argument(query, route_payload)
+        stat = await quick_stat(direct_key, region, period, self.api_key)
         if "오류" in stat:
             return await self._answer_search_fallback(query, route_payload)
+        if "값" not in stat:
+            return {
+                "상태": "failed",
+                "코드": STATUS_PERIOD_NOT_FOUND,
+                "답변유형": "tier_a_value_failed",
+                "질문": query,
+                "answer": "요청한 조건의 KOSIS 데이터가 없습니다. 최신값으로 대체하지 않고 중단했습니다.",
+                "상세": stat,
+                "지역": region,
+                "요청_기간": period,
+                "검증_주의": self._validation_notes(route_payload),
+                "route": route_payload["route"],
+                "출처": stat.get("출처", "통계청 KOSIS"),
+            }
         return {
             "상태": "executed",
             "코드": STATUS_EXECUTED,
@@ -996,14 +1110,21 @@ async def quick_stat(
                 "권고": "지역별 값으로 포장하지 않도록 차단했습니다. search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요.",
             }
 
-        year = _parse_year_token(period) if period != "latest" else None
+        period_type = _default_period_type(param)
+        start_period, end_period = _period_bounds(period, period_type)
+        if period != "latest" and not start_period:
+            return {
+                "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
+                "통계표": param.tbl_nm,
+                "지원_기간유형": period_type,
+            }
         async with httpx.AsyncClient() as client:
             try:
                 data = await _fetch_series(
                     client, key, param, region_code,
-                    period_type=_default_period_type(param),
-                    start_year=year, end_year=year,
-                    latest_n=1 if not year else None,
+                    period_type=period_type,
+                    start_year=start_period, end_year=end_period,
+                    latest_n=1 if not start_period else None,
                 )
             except RuntimeError as e:
                 return {"오류": str(e), "통계표": param.tbl_nm, "권고": verification_warning}
@@ -1011,8 +1132,9 @@ async def quick_stat(
         if not data:
             return {"결과": "데이터 없음", "통계표": param.tbl_nm, "권고": verification_warning}
 
+        data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
         row = data[-1]
-        period_label = _format_period_label(row.get("PRD_DE"), _default_period_type(param))
+        period_label = _format_period_label(row.get("PRD_DE"), period_type)
         result = {
             "answer": f"{period_label} {region}의 {param.description}은(는) "
                       f"{_format_number(row.get('DT'))} {param.unit}입니다.",
@@ -1137,7 +1259,14 @@ async def quick_region_compare(
             "권고": "search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요.",
         }
 
-    year = _parse_year_token(period) if period != "latest" else None
+    period_type = _default_period_type(param)
+    start_period, end_period = _period_bounds(period, period_type)
+    if period != "latest" and not start_period:
+        return {
+            "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
+            "통계표": param.tbl_nm,
+            "지원_기간유형": period_type,
+        }
     async with httpx.AsyncClient() as client:
         try:
             data = await _fetch_series(
@@ -1145,13 +1274,17 @@ async def quick_region_compare(
                 key,
                 param,
                 "ALL",
-                period_type=_default_period_type(param),
-                start_year=year,
-                end_year=year,
-                latest_n=1 if not year else None,
+                period_type=period_type,
+                start_year=start_period,
+                end_year=end_period,
+                latest_n=1 if not start_period else None,
             )
         except RuntimeError as e:
             return {"오류": str(e), "통계표": param.tbl_nm}
+
+    if data:
+        latest_period = max(str(row.get("PRD_DE") or "") for row in data)
+        data = [row for row in data if str(row.get("PRD_DE") or "") == latest_period]
 
     code_field, name_field = _region_field_names(param)
     regions_by_code = {code: name for name, code in param.region_scheme.items()}
