@@ -52,6 +52,7 @@ ERROR_MAP = {
     "31": "결과 초과 (4만셀)",
     "40": "호출 제한",
     "41": "ROW 제한",
+    "42": "사용자별 이용 제한 — KOSIS 관리자에게 문의 필요",
     "50": "서버 오류",
     # Common non-official codes observed in the wild
     "E001": "내부 오류 (E001) — KOSIS 공식 코드가 아닌 래퍼/네트워크 레이어 실패. 재시도 후에도 반복되면 통계표 변경 또는 차단된 파라미터 의심",
@@ -196,6 +197,108 @@ async def _kosis_call(client: httpx.AsyncClient, endpoint: str, params: dict) ->
             return []
         raise RuntimeError(f"[KOSIS {code}] {ERROR_MAP.get(code, '미상')}")
     return data if isinstance(data, list) else [data]
+
+
+async def _fetch_meta(
+    client: httpx.AsyncClient,
+    api_key: str,
+    org_id: str,
+    tbl_id: str,
+    meta_type: str,
+    extra_params: Optional[dict] = None,
+) -> list[dict]:
+    """Generic KOSIS `getMeta` call. meta_type values from the dev guide:
+
+    TBL   — table name (국문/영문)
+    ORG   — owning organization name
+    PRD   — recorded period summary (start / end / 주기)
+    ITM   — classification (objL*) and item (itmId) catalog with names
+            and units — the dynamic alternative to hard-coding industry
+            codes into TIER_A_STATS
+    CMMT  — annotations attached to the table
+    UNIT  — unit registry
+    SOURCE — survey contact information
+    WGT   — weighting metadata
+    NCD   — last-updated timestamp per period
+    """
+    params: dict[str, Any] = {
+        "method": "getMeta",
+        "type": meta_type,
+        "apiKey": api_key,
+        "orgId": org_id,
+        "tblId": tbl_id,
+        "format": "json",
+        "jsonVD": "Y",
+    }
+    if extra_params:
+        params.update(extra_params)
+    return await _kosis_call(client, "statisticsData.do", params)
+
+
+async def _fetch_classifications(
+    org_id: str, tbl_id: str, api_key: Optional[str] = None,
+) -> list[dict]:
+    """Return every (OBJ_ID, OBJ_NM, ITM_ID, ITM_NM, UNIT_NM) tuple for
+    a KOSIS table. Lets dispatchers map "제조업" → the right obj_l2
+    code without baking industry codes into curation."""
+    key = _resolve_key(api_key)
+    async with httpx.AsyncClient() as client:
+        return await _fetch_meta(client, key, org_id, tbl_id, "ITM")
+
+
+async def _fetch_period_range(
+    org_id: str, tbl_id: str,
+    api_key: Optional[str] = None,
+    detail: bool = False,
+) -> list[dict]:
+    """Return PRD_SE / PRD_DE for a KOSIS table. detail=True asks for
+    every recorded timepoint (large response on monthly tables); detail=
+    False asks only for the summary row (cheap, what staleness checks
+    need)."""
+    key = _resolve_key(api_key)
+    extra = {"detail": "Y"} if detail else None
+    async with httpx.AsyncClient() as client:
+        return await _fetch_meta(client, key, org_id, tbl_id, "PRD", extra)
+
+
+async def _fetch_table_name(
+    org_id: str, tbl_id: str, api_key: Optional[str] = None,
+) -> list[dict]:
+    """Return TBL_NM / TBL_NM_ENG for a KOSIS table."""
+    key = _resolve_key(api_key)
+    async with httpx.AsyncClient() as client:
+        return await _fetch_meta(client, key, org_id, tbl_id, "TBL")
+
+
+def _resolve_classification_term(
+    term: str,
+    classifications: list[dict],
+    obj_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Find the KOSIS classification entry whose ITM_NM matches `term`.
+
+    Returns the full row (including ITM_ID for use as objL*/itmId in
+    quick_stat) or None when no match is found. Pass obj_id to narrow
+    to a specific classification axis (e.g. an industry axis vs a region
+    axis on the same table). Matching is whitespace-stripped substring
+    so the caller does not need exact KOSIS phrasing."""
+    if not term:
+        return None
+    normalized = re.sub(r"\s+", "", term).lower()
+    candidates = classifications
+    if obj_id:
+        candidates = [c for c in classifications if str(c.get("OBJ_ID") or "") == str(obj_id)]
+    matches: list[dict] = []
+    for row in candidates:
+        nm = re.sub(r"\s+", "", str(row.get("ITM_NM") or "")).lower()
+        if not nm:
+            continue
+        if nm == normalized or normalized in nm:
+            matches.append(row)
+    if not matches:
+        return None
+    matches.sort(key=lambda r: len(str(r.get("ITM_NM") or "")))
+    return matches[0]
 
 
 def _format_number(v: Any) -> str:
@@ -3571,7 +3674,11 @@ async def curation_status(detail: bool = False) -> dict:
 
 
 @mcp.tool()
-async def check_stat_availability(query: str) -> dict:
+async def check_stat_availability(
+    query: str,
+    live_period_check: bool = False,
+    api_key: Optional[str] = None,
+) -> dict:
     """[🛠] 특정 통계가 즉시 호출 가능한지 미리 확인.
 
     챗봇이 "X 통계 알려줘" 요청을 받기 전에, X가 Tier A 매핑되고
@@ -3579,6 +3686,10 @@ async def check_stat_availability(query: str) -> dict:
 
     Args:
         query: 통계 키워드 ("인구", "소상공인", "출산율" 등)
+        live_period_check: True면 KOSIS 메타 API(getMeta&type=PRD)를
+            호출해 통계표의 실제 최신 수록 시점과 노화도를 함께 반환.
+            False면 curation 메모(스냅샷)만 반환. 추가 호출이 발생하므로
+            대량 호출 시에는 False 유지.
     """
     p = _curation_lookup(query)
     if not p:
@@ -3601,10 +3712,12 @@ async def check_stat_availability(query: str) -> dict:
         "unverified": "❓ 미검증 — 호출 시도 가능하나 결과 확인 필수",
     }
 
-    return {
+    result: dict[str, Any] = {
         "쿼리": query,
         "Tier_A_매핑": True,
         "통계표": p.tbl_nm,
+        "통계표ID": p.tbl_id,
+        "기관ID": p.org_id,
         "설명": p.description,
         "단위": p.unit,
         "검증_상태": p.verification_status,
@@ -3613,6 +3726,183 @@ async def check_stat_availability(query: str) -> dict:
         "지원_지역": list(p.region_scheme.keys()) if p.region_scheme else "지역 분류 없음 (전국만)",
         "주기": p.supported_periods,
     }
+
+    if live_period_check and p.verification_status != "broken":
+        try:
+            period_rows = await _fetch_period_range(p.org_id, p.tbl_id, api_key)
+        except Exception as exc:
+            result["⚠️ 라이브_수록기간_조회_실패"] = repr(exc)
+            return result
+        if not period_rows:
+            result["⚠️ 라이브_수록기간"] = "KOSIS 메타 API가 수록 시점을 반환하지 않음"
+            return result
+        latest = period_rows[-1]
+        live_period = str(latest.get("PRD_DE") or latest.get("prdDe") or "")
+        live_se = latest.get("PRD_SE") or latest.get("prdSe")
+        age = NaturalLanguageAnswerEngine._period_age_years(live_period)
+        result["라이브_수록기간"] = {
+            "주기": live_se,
+            "최신_수록시점": live_period,
+            "period_age_years": age,
+        }
+        # Compare with what the curation note claims, if it carries a snapshot
+        snapshot_match = re.search(r"\((\d{4}(?:\.\d{2})?)\s", p.note or "")
+        if snapshot_match:
+            snapshot_period = snapshot_match.group(1).replace(".", "")
+            if live_period and not str(live_period).startswith(snapshot_period[:4]):
+                result["⚠️ 메모_vs_KOSIS_drift"] = (
+                    f"curation 메모 스냅샷={snapshot_period} → KOSIS 실제 최신={live_period}. "
+                    "curation 메모 갱신이 필요할 수 있음."
+                )
+        if age is not None and age >= 1.0:
+            result["⚠️ 데이터_신선도"] = (
+                f"KOSIS 실제 최신 시점 {live_period} (약 {age:.1f}년 경과). "
+                "이 통계표가 갱신을 멈췄거나 갱신 주기가 깁니다."
+            )
+    return result
+
+
+@mcp.tool()
+async def explore_table(
+    org_id: str,
+    tbl_id: str,
+    industry_term: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🧭] Pull the metadata KOSIS publishes for a single statistical
+    table — classification axes, item codes, units, supported periods,
+    and the recorded period window — so callers can build a quick_stat
+    request without having to hard-code obj_l1/obj_l2/itm_id values.
+
+    The dev-guide endpoints behind this tool are statisticsData.do?
+    method=getMeta&type=TBL|ITM|PRD|SOURCE. Each call is cheap; we
+    fan them out in parallel and return a single response.
+
+    Args:
+        org_id: KOSIS 기관 ID (e.g. "101" for 통계청).
+        tbl_id: 통계표 ID (e.g. "DT_1IN1502").
+        industry_term: optional industry/category name. If supplied,
+            the response includes a resolved_industry block pointing at
+            the matching ITM_ID so the caller can pass it as objL2 to
+            quick_stat. Use this to bridge "제조업"/"음식점업" to KOSIS
+            internal codes dynamically rather than via TIER_A_STATS.
+
+    Returns: dict with table name, classification rows, period range,
+        contact info, and (optionally) the resolved industry row plus
+        a suggested quick_stat call template.
+    """
+    if not org_id or not tbl_id:
+        return {
+            "오류": "org_id와 tbl_id가 모두 필요합니다.",
+            "권고": "search_kosis 응답의 통계표ID·기관ID 필드를 사용",
+        }
+    key = _resolve_key(api_key)
+    async with httpx.AsyncClient() as client:
+        async def safe_fetch(meta_type: str, extra: Optional[dict] = None) -> Any:
+            try:
+                return await _fetch_meta(client, key, org_id, tbl_id, meta_type, extra)
+            except Exception as exc:
+                return {"오류": f"{meta_type} 조회 실패: {exc}"}
+
+        name_rows, item_rows, period_rows, source_rows = await asyncio.gather(
+            safe_fetch("TBL"),
+            safe_fetch("ITM"),
+            safe_fetch("PRD"),
+            safe_fetch("SOURCE"),
+        )
+
+    classifications: dict[str, dict[str, Any]] = {}
+    if isinstance(item_rows, list):
+        for row in item_rows:
+            obj_id = str(row.get("OBJ_ID") or "")
+            if not obj_id:
+                continue
+            axis = classifications.setdefault(obj_id, {
+                "OBJ_NM": row.get("OBJ_NM"),
+                "OBJ_NM_ENG": row.get("OBJ_NM_ENG"),
+                "items": [],
+            })
+            axis["items"].append({
+                "ITM_ID": row.get("ITM_ID"),
+                "ITM_NM": row.get("ITM_NM"),
+                "ITM_NM_ENG": row.get("ITM_NM_ENG"),
+                "UP_ITM_ID": row.get("UP_ITM_ID"),
+                "UNIT_NM": row.get("UNIT_NM"),
+            })
+
+    table_name = None
+    table_name_eng = None
+    if isinstance(name_rows, list) and name_rows:
+        first = name_rows[0]
+        table_name = first.get("TBL_NM") or first.get("tblNm")
+        table_name_eng = first.get("TBL_NM_ENG") or first.get("tblNmEng")
+
+    period_summary = None
+    used_period = None
+    if isinstance(period_rows, list) and period_rows:
+        latest = period_rows[-1]
+        period_summary = {
+            "수록주기": latest.get("PRD_SE") or latest.get("prdSe"),
+            "최신_수록시점": latest.get("PRD_DE") or latest.get("prdDe"),
+            "수록시점_개수": len(period_rows),
+        }
+        used_period = period_summary["최신_수록시점"]
+
+    period_age = (
+        NaturalLanguageAnswerEngine._period_age_years(used_period)
+        if used_period else None
+    )
+
+    contact = None
+    if isinstance(source_rows, list) and source_rows:
+        first = source_rows[0]
+        contact = {
+            "조사명": first.get("JOSA_NM") or first.get("josaNm"),
+            "담당부서": first.get("DEPT_NM") or first.get("deptNm"),
+            "전화": first.get("DEPT_PHONE") or first.get("deptPhone"),
+        }
+
+    result: dict[str, Any] = {
+        "통계표ID": tbl_id,
+        "기관ID": org_id,
+        "통계표명": table_name,
+        "통계표명_영문": table_name_eng,
+        "수록기간": period_summary,
+        "used_period": used_period,
+        "period_age_years": period_age,
+        "출처": contact,
+        "분류축": classifications,
+        "출처_KOSIS_API": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD/SOURCE",
+    }
+
+    if period_age is not None and period_age >= 1.0:
+        result["⚠️ 데이터_신선도"] = (
+            f"이 통계표의 최신 시점은 {used_period} (약 {period_age:.1f}년 경과)"
+        )
+
+    if industry_term:
+        match = _resolve_classification_term(industry_term, item_rows if isinstance(item_rows, list) else [])
+        if match is not None:
+            result["resolved_industry"] = {
+                "입력": industry_term,
+                "매칭_ITM_NM": match.get("ITM_NM"),
+                "ITM_ID": match.get("ITM_ID"),
+                "OBJ_ID": match.get("OBJ_ID"),
+                "단위": match.get("UNIT_NM"),
+                "권고_호출": (
+                    f"quick_stat은 obj_l2/obj_l3 직접 노출이 없으므로, KOSIS 직접 API "
+                    f"호출(statisticsData.do)에 objL?={match.get('OBJ_ID')}, "
+                    f"itmId={match.get('ITM_ID')}로 사용."
+                ),
+            }
+        else:
+            result["resolved_industry"] = {
+                "입력": industry_term,
+                "매칭_ITM_NM": None,
+                "안내": "분류축에서 일치하는 항목을 찾지 못했습니다. 분류축 리스트를 확인해 입력 표현을 조정하세요.",
+            }
+
+    return result
 
 
 @mcp.tool()
@@ -3635,7 +3925,7 @@ async def decode_error(error_code: str) -> dict:
             return {
                 "코드": cand,
                 "의미": ERROR_MAP[cand],
-                "공식코드_여부": cand in {"10", "11", "20", "21", "30", "31", "40", "41", "50"},
+                "공식코드_여부": cand in {"10", "11", "20", "21", "30", "31", "40", "41", "42", "50"},
             }
     return {
         "코드": code,

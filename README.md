@@ -445,6 +445,13 @@ chart_line("고령인구", region="전국", years=5)
 
 다지역 합산·합성지역 핸들러(`_answer_composite_aggregate`, `_answer_region_sum`)는 0.5.0부터 모든 component를 **병렬 호출**하고 per-call 12초·전체 60초 예산을 적용합니다 — 단일 호출이 지연돼도 다른 in-flight 요청이 막히지 않습니다.
 
+0.6.0부터 KOSIS `getMeta` 엔드포인트를 직접 활용하는 두 메타 도구가 추가되었습니다:
+
+- `explore_table(org_id, tbl_id, industry_term?)` — 통계표 한 개의 `TBL`/`ITM`/`PRD`/`SOURCE` 메타를 **병렬**로 가져와 분류축(objL1~3) 아이템 카탈로그, 수록기간, 작성기관 연락처를 단일 응답으로 반환합니다. `industry_term`을 넘기면 `ITM_NM` 매칭으로 `ITM_ID`를 동적으로 해결해 quick_stat·직접 KOSIS 호출에 산업 코드를 하드코딩하지 않아도 됩니다.
+- `check_stat_availability(query, live_period_check=True)` — Tier A curation 메모뿐 아니라 KOSIS 메타 API의 실제 최신 수록 시점을 같이 조회합니다. 메모 스냅샷과 라이브 수록 시점이 어긋나면 `⚠️ 메모_vs_KOSIS_drift`, 데이터가 1년 이상 정체돼 있으면 `⚠️ 데이터_신선도`를 자동 첨부합니다.
+
+`decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
+
 차트 도구(`chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`, `chain_full_analysis`)는 SVG를 fenced ``` ```svg ``` ``` 블록에 담은 `TextContent`로 반환합니다 — MCP 표준이 `image/svg+xml` ImageContent를 받지 않아 발생하던 콘텐츠 포맷 오류를 회피.
 
 `answer` 자연어 텍스트는 다음 후처리를 거칩니다:

@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kosis_mcp_server import answer_query, quick_region_compare, quick_stat, quick_trend
+from kosis_mcp_server import (
+    answer_query, check_stat_availability, explore_table,
+    quick_region_compare, quick_stat, quick_trend,
+)
 
 
 TestFn = Callable[..., Awaitable[dict[str, Any]]]
@@ -178,6 +181,18 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "explore_table_housing_price_index",
+        "tool": explore_table,
+        "args": ("408", "DT_30404_B012"),
+        "expect": {"explore_table_has_classifications": True},
+    },
+    {
+        "name": "check_stat_availability_live_period",
+        "tool": check_stat_availability,
+        "args": ("실업률", True),
+        "expect": {"check_stat_live_period_present": True},
+    },
+    {
         "name": "answer_top_5_sme_business_count",
         "tool": answer_query,
         "args": ("중소기업 사업체수가 가장 많은 5곳 알려줘",),
@@ -284,6 +299,14 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [r for r in expect["regions_in_sum"] if r not in regions]
         if missing:
             problems.append(f"missing_sum_regions={missing}")
+    if expect.get("explore_table_has_classifications"):
+        axes = (result or {}).get("분류축") or {}
+        if not isinstance(axes, dict) or not axes:
+            problems.append("explore_table_no_classifications")
+    if expect.get("check_stat_live_period_present"):
+        live = (result or {}).get("라이브_수록기간") or {}
+        if not isinstance(live, dict) or not live.get("최신_수록시점"):
+            problems.append("live_period_missing")
     if expect.get("status") == "executed" and summary["used_period"] in (None, ""):
         problems.append("missing_used_period")
     return problems
