@@ -1,7 +1,7 @@
 {
   "name": "kosis-analysis",
   "description": "Natural language KOSIS statistics MCP tools for lookup, analysis, validation, and charts.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "jaykim429"
   }

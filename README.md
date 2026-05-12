@@ -403,9 +403,10 @@ chart_line("고령인구", region="전국", years=5)
 
 - `tier_a_value`, `tier_a_trend`, `tier_a_growth_rate`: 단일값·시계열·증가율
 - `tier_a_region_comparison`: 17개 시도 비교
-- `tier_a_top_n`: "가장 많은 N곳", "상위 N개" 순위형 응답
+- `tier_a_top_n`: "가장 많은 N곳", "상위 N개", "5위까지" 등 순위형 응답
 - `tier_a_share_ratio`: 지역값 / 전국값 × 100 비중 계산
 - `tier_a_region_sum`: "X와 Y 합계" 다지역 합산
+- `tier_a_composite_share_ratio`: 수도권·영남권 등 합성 지역의 합산값 대비 전국 비중
 - `tier_a_composite`, `tier_a_composite_calculation`, `tier_a_composite_comparison`: 정밀 매핑된 복합 산식
 - `search_and_plan`: 후보 통계표 선택 필요 (Tier B 폴백)
 
@@ -413,7 +414,23 @@ chart_line("고령인구", region="전국", years=5)
 
 - `used_period`: 실제 사용된 KOSIS 시점 (예: `"2023"`, `"202603"`)
 - `period_age_years`: 현재 시점 대비 경과 연수 (실수)
-- `검증_주의`: 1년 이상 경과한 데이터, 의도와 응답 유형 불일치, 명시 연도 미준수, 다지역 의도 누락 등에 자동 경고 추가
+- `검증_주의`: 1년 이상 경과한 데이터, 의도와 응답 유형 불일치 (RANKING/SHARE_RATIO/GROWTH_RATE/TIME_SERIES/AVERAGE), 명시 연도 미준수, 다지역 의도 누락, "기업 수 ↔ 사업체 수" 모집단 silent 매핑 등에 자동 경고 추가
+
+`answer` 자연어 텍스트는 다음 후처리를 거칩니다:
+
+- `X은(는)` 플레이스홀더 → 한글 받침에 따라 `은` 또는 `는` 선택
+- `YYYY.MM` 월별 시점 raw 표기 → `YYYY년 M월` (1900~2099 연도 범위만 변환)
+
+지역명은 영문·행정 정식 명칭·단축형 모두 17개 시도 중 하나로 정규화됩니다:
+
+- `Seoul`, `서울특별시`, `서울시`, `seoul` → `서울`
+- `경기도`, `Gyeonggi`, `gyeonggi-do` → `경기`
+- `대한민국`, `한국`, `korea` → `전국`
+
+합성 지역(`수도권`, `비수도권`, `영남권`, `호남권`, `충청권`)은 구성 17개 시도로 자동 전개됩니다:
+
+- `수도권 사업체수` → 서울 + 경기 + 인천 합산 (`tier_a_region_sum`)
+- `수도권 사업체수 비중` → (서울+경기+인천) / 전국 × 100 (`tier_a_composite_share_ratio`)
 
 ## 통계 해석 주의
 

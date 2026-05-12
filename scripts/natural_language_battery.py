@@ -207,6 +207,28 @@ CASES: list[dict[str, Any]] = [
      "query": "서울 주택매매가격지수 최신",
      "expect": {"answer_type": "tier_a_value", "region": "서울",
                 "answer_excludes": ".0", "answer_contains": "년"}},
+
+    # ── 17. Stage 8: false-positive fix on trend with year reference ──
+    # "2020년 이후 인구 추이" 같은 쿼리에서 2020은 기준 시작점이지 사용 시점
+    # 불일치가 아님 — tier_a_trend 응답에는 year mismatch 경고 발동 안 되어야 함.
+    {"group": "fp_safety", "name": "trend_with_year_reference",
+     "query": "2020년 이후 인구 추이",
+     "expect": {"answer_type": "tier_a_trend",
+                "warning_excludes": "명시된 연도"}},
+
+    # ── 18. Stage 8/4: SHARE_RATIO intent + 전국 → mismatch warning ───
+    # "전국 중소기업 매출액 비중" — 분자 분모가 동일하므로 share_ratio 디스패치
+    # 자체는 차단되지만 의도는 SHARE_RATIO이므로 응답에 경고 트레일이 떠야 함.
+    {"group": "fp_safety", "name": "share_ratio_for_전국_warns",
+     "query": "전국 중소기업 매출액 비중",
+     "expect": {"warning_contains": "STAT_SHARE_RATIO"}},
+
+    # ── 19. Stage 6: top-N 폴백 N=5 ───────────────────────────────────
+    # 명시적 숫자 없이 "가장 많은 곳"이라고만 물어도 dispatcher가 N=5 기본값으로
+    # 폴백해 5개 row를 반환해야 한다.
+    {"group": "top_n_default", "name": "no_explicit_n",
+     "query": "중소기업 사업체수가 가장 많은 곳 알려줘",
+     "expect": {"answer_type": "tier_a_top_n", "table_len": 5}},
 ]
 
 
@@ -303,6 +325,11 @@ def _check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         answer_text = str(s.get("answer") or "")
         if expect["answer_contains"] not in answer_text:
             problems.append(f"answer_missing={expect['answer_contains']!r}")
+
+    if "warning_excludes" in expect:
+        warnings_text = " | ".join(s.get("warnings") or [])
+        if expect["warning_excludes"] in warnings_text:
+            problems.append(f"warning_unexpected={expect['warning_excludes']!r}")
 
     if expected_status == "executed" and not s.get("used_period"):
         problems.append("stage3_missing_used_period")
