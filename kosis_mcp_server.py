@@ -555,6 +555,9 @@ class NaturalLanguageAnswerEngine:
             r"적은(\d+)[곳개]",
             r"(\d+)개시도",
             r"(\d+)개지역",
+            r"(\d+)위까지",
+            r"1위부터(\d+)위",
+            r"순위(\d+)",
         ]
         for pat in patterns:
             m = re.search(pat, compact, re.IGNORECASE)
@@ -569,6 +572,8 @@ class NaturalLanguageAnswerEngine:
 
     def _is_top_n_question(self, query: str, route_payload: dict[str, Any]) -> bool:
         if "STAT_RANKING" in route_payload.get("intents", []):
+            return True
+        if self._extract_top_n(query) is not None:
             return True
         q = self._norm(query)
         return any(term in q for term in ("가장많", "가장적", "상위", "하위", "topn"))
@@ -604,6 +609,146 @@ class NaturalLanguageAnswerEngine:
             if region in q_compact and region != primary_region and region not in candidates:
                 candidates.append(region)
         return [r for r in candidates if r in known_regions]
+
+    @staticmethod
+    def _extract_composite_regions(query: str) -> list[str]:
+        """Return the list of composite-region labels (수도권, 비수도권, …)
+        that appear in the raw query. Longer labels win when one is a
+        substring of another (비수도권 contains 수도권) so the more
+        specific composite is selected."""
+        q_compact = re.sub(r"\s+", "", str(query))
+        candidates = sorted(
+            (name for name in REGION_COMPOSITES if name in q_compact),
+            key=len,
+            reverse=True,
+        )
+        deduped: list[str] = []
+        for name in candidates:
+            if not any(name != existing and name in existing for existing in deduped):
+                deduped.append(name)
+        return deduped
+
+    @classmethod
+    def _expand_composite_to_components(cls, composite: str) -> list[str]:
+        return list(REGION_COMPOSITES.get(composite, []))
+
+    async def _answer_composite_aggregate(
+        self,
+        query: str,
+        direct_key: str,
+        composite: str,
+        operation: str = "sum",
+    ) -> dict[str, Any]:
+        """Handle composite-region queries (수도권 사업체수, 영남권 비중 등).
+
+        operation="sum" returns tier_a_region_sum for the components.
+        operation="share" computes (sum of components) / 전국 * 100.
+        Other ops fall back through the dispatcher."""
+        components = self._expand_composite_to_components(composite)
+        if not components:
+            return await self._answer_search_fallback(query)
+        route_payload = self._route_payload(query)
+        route_payload["route"]["direct_stat_key"] = direct_key
+        period = self._period_argument(query, route_payload)
+
+        rows: list[dict[str, Any]] = []
+        subtotal = 0.0
+        unit = ""
+        used_period = ""
+        table = ""
+        missing: list[str] = []
+        for region in components:
+            stat = await quick_stat(direct_key, region, period, self.api_key)
+            if "오류" in stat or "값" not in stat:
+                missing.append(region)
+                continue
+            try:
+                value = self._to_float(stat["값"])
+            except (KeyError, ValueError):
+                missing.append(region)
+                continue
+            subtotal += value
+            unit = unit or stat.get("단위", "")
+            used_period = used_period or str(stat.get("시점", ""))
+            table = table or stat.get("통계표", "")
+            rows.append({
+                "지역": region,
+                "값": _format_number(value),
+                "원본값": value,
+                "단위": stat.get("단위", unit),
+                "시점": stat.get("시점", ""),
+                "통계표": stat.get("통계표"),
+            })
+
+        if not rows:
+            return await self._answer_search_fallback(query, route_payload)
+
+        notes = self._validation_notes(route_payload)
+        if missing:
+            notes.append(f"{composite} 합산에서 제외된 지역: {', '.join(missing)} (데이터 없음)")
+        distinct_periods = {row["시점"] for row in rows}
+        if len(distinct_periods) > 1:
+            notes.append(f"{composite} 구성 지역 간 시점 불일치: {sorted(distinct_periods)}")
+
+        base_payload: dict[str, Any] = {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "질문": query,
+            "표": rows,
+            "구성_지역": components,
+            "추천_시각화": ["bar_chart"],
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
+        if operation == "share":
+            whole = await quick_stat(direct_key, "전국", period, self.api_key)
+            if "오류" in whole or "값" not in whole:
+                return await self._answer_search_fallback(query, route_payload)
+            try:
+                whole_value = self._to_float(whole["값"])
+            except (KeyError, ValueError):
+                return await self._answer_search_fallback(query, route_payload)
+            if not whole_value:
+                return await self._answer_search_fallback(query, route_payload)
+            share = subtotal / whole_value * 100
+            whole_period = str(whole.get("시점", ""))
+            if used_period and whole_period and used_period != whole_period:
+                notes.append(f"분자 시점 {used_period} ↔ 분모 시점 {whole_period} 불일치")
+            return {
+                **base_payload,
+                "답변유형": "tier_a_composite_share_ratio",
+                "answer": (
+                    f"{used_period} 기준 {composite}({'+'.join(components)})의 "
+                    f"{direct_key.replace('_', ' ')}은 {_format_number(subtotal)}{unit}로, "
+                    f"전국({_format_number(whole_value)}{unit}) 대비 약 {share:.2f}%입니다."
+                ),
+                "계산": {
+                    "분자": _format_number(subtotal),
+                    "분모": _format_number(whole_value),
+                    "비중_퍼센트": round(share, 2),
+                    "산식": f"({' + '.join(components)}) / 전국 * 100",
+                    "동일시점_여부": used_period == whole_period,
+                },
+                "검증_주의": notes,
+            }
+
+        return {
+            **base_payload,
+            "답변유형": "tier_a_region_sum",
+            "answer": (
+                f"{used_period} 기준 {composite}({'+'.join(components)})의 "
+                f"{direct_key.replace('_', ' ')} 합계는 {_format_number(subtotal)}{unit}입니다."
+            ),
+            "계산": {
+                "합계": _format_number(subtotal),
+                "포함_지역": [r["지역"] for r in rows],
+                "제외_지역": missing,
+                "산식": " + ".join(r["지역"] for r in rows),
+                "합성지역": composite,
+            },
+            "검증_주의": notes,
+        }
 
     def _is_sme_large_sales_question(self, query: str) -> bool:
         q = self._norm(query)
@@ -1136,6 +1281,14 @@ class NaturalLanguageAnswerEngine:
             return await self._answer_sme_employee_average(query, effective_region)
         if self._needs_advanced_analysis_plan(route_payload):
             return await self._answer_search_fallback(query, route_payload)
+
+        composites = self._extract_composite_regions(query)
+        if inferred_direct_key and composites:
+            composite = composites[0]
+            operation = "share" if self._is_share_ratio_question(query, route_payload) else "sum"
+            return await self._answer_composite_aggregate(
+                query, inferred_direct_key, composite, operation=operation,
+            )
 
         if inferred_direct_key and self._is_aggregation_question(query):
             extras = self._extract_extra_regions(query, effective_region, route_payload)

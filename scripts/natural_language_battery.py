@@ -177,6 +177,24 @@ CASES: list[dict[str, Any]] = [
     {"group": "population_mismatch", "name": "enterprise_count_warning",
      "query": "중소기업 기업수 알려줘",
      "expect": {"answer_type": "tier_a_value", "warning_contains": "모집단 다름"}},
+
+    # ── 14. Stage 6: composite regions ─────────────────────────────────
+    # "수도권"·"비수도권"처럼 행정 단위가 아닌 합성 지역도 17개 시도로 전개해
+    # 합산 또는 비중 계산을 해야 한다.
+    {"group": "composite_region", "name": "sudokwon_sum",
+     "query": "수도권 중소기업 사업체수 합계",
+     "expect": {"answer_type": "tier_a_region_sum"}},
+    {"group": "composite_region", "name": "sudokwon_share",
+     "query": "수도권 중소기업 사업체수 비중",
+     "expect": {"answer_type": "tier_a_composite_share_ratio"}},
+    {"group": "composite_region", "name": "yeongnam_sum",
+     "query": "영남권 중소기업 매출액",
+     "expect": {"answer_type": "tier_a_region_sum"}},
+
+    # ── 15. Stage 6: extended top-N patterns ──────────────────────────
+    {"group": "top_n_extended", "name": "rank_5_until",
+     "query": "중소기업 사업체수 5위까지 알려줘",
+     "expect": {"answer_type": "tier_a_top_n", "table_len": 5}},
 ]
 
 
