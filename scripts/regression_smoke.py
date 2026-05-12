@@ -171,6 +171,36 @@ TESTS: list[dict[str, Any]] = [
             "comparison_end_prefix": "2023",
         },
     },
+    {
+        "name": "answer_top_5_sme_business_count",
+        "tool": answer_query,
+        "args": ("중소기업 사업체수가 가장 많은 5곳 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_top_n",
+            "table_len": 5,
+        },
+    },
+    {
+        "name": "answer_seoul_sme_sales_share",
+        "tool": answer_query,
+        "args": ("서울 중소기업 매출액이 전국에서 차지하는 비중",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_share_ratio",
+            "region": "서울",
+        },
+    },
+    {
+        "name": "answer_seoul_gyeonggi_sme_sum",
+        "tool": answer_query,
+        "args": ("서울과 경기 중소기업 사업체수 합계 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_region_sum",
+            "regions_in_sum": ["서울", "경기"],
+        },
+    },
 ]
 
 
@@ -184,6 +214,7 @@ def first_table_region(result: dict[str, Any]) -> str | None:
 def summarize(result: dict[str, Any]) -> dict[str, Any]:
     table = result.get("표") or []
     comparison = result.get("비교") or {}
+    calc = result.get("계산") or {}
     return {
         "error": result.get("오류"),
         "empty_result": result.get("결과") == "데이터 없음",
@@ -201,6 +232,9 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "comparison_start": (comparison.get("시작") or {}).get("시점"),
         "comparison_end": (comparison.get("종료") or {}).get("시점"),
         "growth_rate": comparison.get("변화율_퍼센트"),
+        "table_len": len(table),
+        "share_pct": calc.get("비중_퍼센트"),
+        "sum_regions": calc.get("포함_지역"),
     }
 
 
@@ -235,6 +269,13 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         end = str(summary["comparison_end"] or "")
         if not end.startswith(expect["comparison_end_prefix"]):
             problems.append(f"comparison_end={summary['comparison_end']}")
+    if "table_len" in expect and summary["table_len"] != expect["table_len"]:
+        problems.append(f"table_len={summary['table_len']}")
+    if "regions_in_sum" in expect:
+        regions = list(summary.get("sum_regions") or [])
+        missing = [r for r in expect["regions_in_sum"] if r not in regions]
+        if missing:
+            problems.append(f"missing_sum_regions={missing}")
     return problems
 
 

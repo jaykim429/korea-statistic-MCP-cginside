@@ -523,6 +523,69 @@ class NaturalLanguageAnswerEngine:
         q = self._norm(query)
         return any(term in q for term in ("시도별", "지역별", "광역시별", "17개시도", "지역순위"))
 
+    @staticmethod
+    def _extract_top_n(query: str) -> Optional[int]:
+        compact = re.sub(r"\s+", "", str(query))
+        patterns = [
+            r"top(\d+)",
+            r"상위(\d+)",
+            r"하위(\d+)",
+            r"가장많은(\d+)[곳개]",
+            r"가장적은(\d+)[곳개]",
+            r"많은(\d+)[곳개]",
+            r"적은(\d+)[곳개]",
+            r"(\d+)개시도",
+            r"(\d+)개지역",
+        ]
+        for pat in patterns:
+            m = re.search(pat, compact, re.IGNORECASE)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    if 1 <= n <= 17:
+                        return n
+                except ValueError:
+                    continue
+        return None
+
+    def _is_top_n_question(self, query: str, route_payload: dict[str, Any]) -> bool:
+        if "STAT_RANKING" in route_payload.get("intents", []):
+            return True
+        q = self._norm(query)
+        return any(term in q for term in ("가장많", "가장적", "상위", "하위", "topn"))
+
+    def _is_share_ratio_question(self, query: str, route_payload: dict[str, Any]) -> bool:
+        slots = route_payload.get("slots") or {}
+        calc = slots.get("calculation") if isinstance(slots, dict) else None
+        if isinstance(calc, list) and "share_ratio" in calc:
+            return True
+        if "STAT_SHARE_RATIO" in route_payload.get("intents", []):
+            return True
+        q = self._norm(query)
+        return any(term in q for term in ("비중", "비율", "차지", "구성비"))
+
+    @staticmethod
+    def _is_aggregation_question(query: str) -> bool:
+        q = re.sub(r"\s+", "", str(query))
+        return any(term in q for term in ("합계", "합산", "총합", "더하"))
+
+    @staticmethod
+    def _extract_extra_regions(query: str, primary_region: str, route_payload: dict[str, Any]) -> list[str]:
+        slots = route_payload.get("slots") or {}
+        candidates: list[str] = []
+        comp = slots.get("comparison_target") if isinstance(slots, dict) else None
+        if isinstance(comp, list):
+            candidates.extend(comp)
+        q_compact = re.sub(r"\s+", "", str(query))
+        known_regions = [
+            "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+            "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+        ]
+        for region in known_regions:
+            if region in q_compact and region != primary_region and region not in candidates:
+                candidates.append(region)
+        return [r for r in candidates if r in known_regions]
+
     def _is_sme_large_sales_question(self, query: str) -> bool:
         q = self._norm(query)
         return (
@@ -817,6 +880,195 @@ class NaturalLanguageAnswerEngine:
             "출처": "통계청 KOSIS",
         }
 
+    async def _answer_top_n(
+        self,
+        query: str,
+        direct_key: str,
+        top_n: int,
+    ) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        comparison = await quick_region_compare(direct_key, api_key=self.api_key)
+        if "오류" in comparison:
+            return await self._answer_search_fallback(query, route_payload)
+        route_payload["route"]["direct_stat_key"] = direct_key
+
+        rows = comparison.get("표", [])
+        q = self._norm(query)
+        descending = not any(term in q for term in ("가장적", "적은", "하위", "낮은"))
+        ordered = rows if descending else list(reversed(rows))
+        selected = ordered[:top_n]
+        unit = comparison.get("단위", "")
+        period = comparison.get("시점")
+        direction = "많은" if descending else "적은"
+        if selected:
+            leader = selected[0]
+            answer = (
+                f"{period} 기준 {comparison.get('통계명', direct_key)} 상위 {len(selected)}개 지역 중 "
+                f"가장 {direction} 지역은 {leader['지역']}({leader['값']}{unit})입니다."
+            )
+        else:
+            answer = "상위/하위 비교 데이터를 조회하지 못했습니다."
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_top_n",
+            "질문": query,
+            "answer": answer,
+            "표": selected,
+            "전체_지역수": len(rows),
+            "요청_top_n": top_n,
+            "정렬": "내림차순" if descending else "오름차순",
+            "추천_시각화": ["bar_chart"],
+            "검증_주의": route_payload["validation"].get("warnings", []),
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
+    async def _answer_share_ratio(
+        self,
+        query: str,
+        region: str,
+        direct_key: str,
+    ) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        route_payload["route"]["direct_stat_key"] = direct_key
+        period = self._period_argument(query, route_payload)
+
+        try:
+            part = await self._latest_stat(direct_key, region=region) if period == "latest" else None
+            whole = await self._latest_stat(direct_key, region="전국") if period == "latest" else None
+        except RuntimeError:
+            part = None
+            whole = None
+        if part is None or whole is None:
+            part_raw = await quick_stat(direct_key, region, period, self.api_key)
+            whole_raw = await quick_stat(direct_key, "전국", period, self.api_key)
+            if "오류" in part_raw or "오류" in whole_raw or "값" not in part_raw or "값" not in whole_raw:
+                return await self._answer_search_fallback(query, route_payload)
+            try:
+                part_value = self._to_float(part_raw["값"])
+                whole_value = self._to_float(whole_raw["값"])
+            except (KeyError, ValueError):
+                return await self._answer_search_fallback(query, route_payload)
+            part_period = str(part_raw.get("시점", ""))
+            whole_period = str(whole_raw.get("시점", ""))
+            unit = part_raw.get("단위", "")
+            table = part_raw.get("통계표")
+        else:
+            part_value = part.value
+            whole_value = whole.value
+            part_period = part.period
+            whole_period = whole.period
+            unit = part.unit
+            table = part.table
+
+        if not whole_value:
+            return await self._answer_search_fallback(query, route_payload)
+        share = part_value / whole_value * 100
+        notes = self._validation_notes(route_payload)
+        if part_period != whole_period:
+            notes.append(f"분자 시점 {part_period} ↔ 분모 시점 {whole_period} 불일치 — 동일 시점 확인 필요")
+
+        answer = (
+            f"{part_period} 기준 {region} {direct_key.replace('_', ' ')}은 "
+            f"{_format_number(part_value)}{unit}로, "
+            f"전국({_format_number(whole_value)}{unit}) 대비 약 {share:.2f}% 입니다."
+        )
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_share_ratio",
+            "질문": query,
+            "answer": answer,
+            "표": [
+                {"지표": direct_key, "분자": _format_number(part_value), "단위": unit, "시점": part_period, "지역": region, "통계표": table},
+                {"지표": direct_key, "분모": _format_number(whole_value), "단위": unit, "시점": whole_period, "지역": "전국", "통계표": table},
+            ],
+            "계산": {
+                "분자": _format_number(part_value),
+                "분모": _format_number(whole_value),
+                "비중_퍼센트": round(share, 2),
+                "산식": "지역값 / 전국값 * 100",
+                "동일시점_여부": part_period == whole_period,
+            },
+            "추천_시각화": ["bar_chart", "pie_chart"],
+            "검증_주의": notes,
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
+    async def _answer_region_sum(
+        self,
+        query: str,
+        direct_key: str,
+        regions: list[str],
+    ) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        route_payload["route"]["direct_stat_key"] = direct_key
+        period = self._period_argument(query, route_payload)
+
+        rows: list[dict[str, Any]] = []
+        total = 0.0
+        unit = ""
+        used_period = ""
+        table = ""
+        missing: list[str] = []
+        for region in regions:
+            stat = await quick_stat(direct_key, region, period, self.api_key)
+            if "오류" in stat or "값" not in stat:
+                missing.append(region)
+                continue
+            try:
+                value = self._to_float(stat["값"])
+            except (KeyError, ValueError):
+                missing.append(region)
+                continue
+            total += value
+            unit = unit or stat.get("단위", "")
+            used_period = used_period or str(stat.get("시점", ""))
+            table = table or stat.get("통계표", "")
+            rows.append({
+                "지역": region,
+                "값": _format_number(value),
+                "원본값": value,
+                "단위": stat.get("단위", unit),
+                "시점": stat.get("시점", ""),
+                "통계표": stat.get("통계표"),
+            })
+
+        if not rows:
+            return await self._answer_search_fallback(query, route_payload)
+
+        notes = self._validation_notes(route_payload)
+        if missing:
+            notes.append(f"합계에서 제외된 지역: {', '.join(missing)} (데이터 없음)")
+        distinct_periods = {row["시점"] for row in rows}
+        if len(distinct_periods) > 1:
+            notes.append(f"지역별 시점 불일치: {sorted(distinct_periods)}")
+
+        answer = (
+            f"{used_period} 기준 {', '.join(r['지역'] for r in rows)} {direct_key.replace('_', ' ')} 합계는 "
+            f"{_format_number(total)}{unit} 입니다."
+        )
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_region_sum",
+            "질문": query,
+            "answer": answer,
+            "표": rows,
+            "계산": {
+                "합계": _format_number(total),
+                "포함_지역": [r["지역"] for r in rows],
+                "제외_지역": missing,
+                "산식": " + ".join(r["지역"] for r in rows),
+            },
+            "추천_시각화": ["bar_chart"],
+            "검증_주의": notes,
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
     async def _answer_search_fallback(self, query: str, route_payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
         search = await search_kosis(query, 8, True, self.api_key)
@@ -855,8 +1107,28 @@ class NaturalLanguageAnswerEngine:
             return await self._answer_sme_employee_average(query, effective_region)
         if self._needs_advanced_analysis_plan(route_payload):
             return await self._answer_search_fallback(query, route_payload)
+
+        if inferred_direct_key and self._is_aggregation_question(query):
+            extras = self._extract_extra_regions(query, effective_region, route_payload)
+            regions = [effective_region] + [r for r in extras if r != effective_region]
+            if len(regions) >= 2:
+                return await self._answer_region_sum(query, inferred_direct_key, regions)
+
+        if inferred_direct_key and self._is_top_n_question(query, route_payload):
+            top_n = self._extract_top_n(query) or 5
+            return await self._answer_top_n(query, inferred_direct_key, top_n)
+
         if inferred_direct_key and self._is_region_compare_question(query):
             return await self._answer_region_compare(query, inferred_direct_key)
+
+        if (
+            inferred_direct_key
+            and self._is_share_ratio_question(query, route_payload)
+            and effective_region != "전국"
+            and not self._is_growth_question(query, route_payload)
+        ):
+            return await self._answer_share_ratio(query, effective_region, inferred_direct_key)
+
         if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
             route_payload["route"]["direct_stat_key"] = inferred_direct_key
         if route_payload["route"].get("direct_stat_key"):
