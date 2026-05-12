@@ -701,6 +701,8 @@ class NaturalLanguageAnswerEngine:
             "출처": "통계청 KOSIS",
         }
 
+        param = TIER_A_STATS.get(direct_key)
+        stat_label = param.description if param else direct_key.replace("_", " ")
         if operation == "share":
             whole = await quick_stat(direct_key, "전국", period, self.api_key)
             if "오류" in whole or "값" not in whole:
@@ -720,7 +722,7 @@ class NaturalLanguageAnswerEngine:
                 "답변유형": "tier_a_composite_share_ratio",
                 "answer": (
                     f"{used_period} 기준 {composite}({'+'.join(components)})의 "
-                    f"{direct_key.replace('_', ' ')}은 {_format_number(subtotal)}{unit}로, "
+                    f"{stat_label}은(는) {_format_number(subtotal)}{unit}로, "
                     f"전국({_format_number(whole_value)}{unit}) 대비 약 {share:.2f}%입니다."
                 ),
                 "계산": {
@@ -738,7 +740,7 @@ class NaturalLanguageAnswerEngine:
             "답변유형": "tier_a_region_sum",
             "answer": (
                 f"{used_period} 기준 {composite}({'+'.join(components)})의 "
-                f"{direct_key.replace('_', ' ')} 합계는 {_format_number(subtotal)}{unit}입니다."
+                f"{stat_label} 합계는 {_format_number(subtotal)}{unit}입니다."
             ),
             "계산": {
                 "합계": _format_number(subtotal),
@@ -1098,43 +1100,31 @@ class NaturalLanguageAnswerEngine:
         route_payload["route"]["direct_stat_key"] = direct_key
         period = self._period_argument(query, route_payload)
 
+        part = await quick_stat(direct_key, region, period, self.api_key)
+        whole = await quick_stat(direct_key, "전국", period, self.api_key)
+        if "오류" in part or "오류" in whole or "값" not in part or "값" not in whole:
+            return await self._answer_search_fallback(query, route_payload)
         try:
-            part = await self._latest_stat(direct_key, region=region) if period == "latest" else None
-            whole = await self._latest_stat(direct_key, region="전국") if period == "latest" else None
-        except RuntimeError:
-            part = None
-            whole = None
-        if part is None or whole is None:
-            part_raw = await quick_stat(direct_key, region, period, self.api_key)
-            whole_raw = await quick_stat(direct_key, "전국", period, self.api_key)
-            if "오류" in part_raw or "오류" in whole_raw or "값" not in part_raw or "값" not in whole_raw:
-                return await self._answer_search_fallback(query, route_payload)
-            try:
-                part_value = self._to_float(part_raw["값"])
-                whole_value = self._to_float(whole_raw["값"])
-            except (KeyError, ValueError):
-                return await self._answer_search_fallback(query, route_payload)
-            part_period = str(part_raw.get("시점", ""))
-            whole_period = str(whole_raw.get("시점", ""))
-            unit = part_raw.get("단위", "")
-            table = part_raw.get("통계표")
-        else:
-            part_value = part.value
-            whole_value = whole.value
-            part_period = part.period
-            whole_period = whole.period
-            unit = part.unit
-            table = part.table
-
+            part_value = self._to_float(part["값"])
+            whole_value = self._to_float(whole["값"])
+        except (KeyError, ValueError):
+            return await self._answer_search_fallback(query, route_payload)
         if not whole_value:
             return await self._answer_search_fallback(query, route_payload)
+
+        part_period = str(part.get("시점", ""))
+        whole_period = str(whole.get("시점", ""))
+        unit = part.get("단위", "")
+        table = part.get("통계표")
+        param = TIER_A_STATS.get(direct_key)
+        stat_label = param.description if param else direct_key.replace("_", " ")
         share = part_value / whole_value * 100
         notes = self._validation_notes(route_payload)
         if part_period != whole_period:
             notes.append(f"분자 시점 {part_period} ↔ 분모 시점 {whole_period} 불일치 — 동일 시점 확인 필요")
 
         answer = (
-            f"{part_period} 기준 {region} {direct_key.replace('_', ' ')}은 "
+            f"{part_period} 기준 {region} {stat_label}은(는) "
             f"{_format_number(part_value)}{unit}로, "
             f"전국({_format_number(whole_value)}{unit}) 대비 약 {share:.2f}% 입니다."
         )
@@ -1145,8 +1135,8 @@ class NaturalLanguageAnswerEngine:
             "질문": query,
             "answer": answer,
             "표": [
-                {"지표": direct_key, "분자": _format_number(part_value), "단위": unit, "시점": part_period, "지역": region, "통계표": table},
-                {"지표": direct_key, "분모": _format_number(whole_value), "단위": unit, "시점": whole_period, "지역": "전국", "통계표": table},
+                {"지표": stat_label, "분자": _format_number(part_value), "단위": unit, "시점": part_period, "지역": region, "통계표": table},
+                {"지표": stat_label, "분모": _format_number(whole_value), "단위": unit, "시점": whole_period, "지역": "전국", "통계표": table},
             ],
             "계산": {
                 "분자": _format_number(part_value),
@@ -1210,8 +1200,10 @@ class NaturalLanguageAnswerEngine:
         if len(distinct_periods) > 1:
             notes.append(f"지역별 시점 불일치: {sorted(distinct_periods)}")
 
+        param = TIER_A_STATS.get(direct_key)
+        stat_label = param.description if param else direct_key.replace("_", " ")
         answer = (
-            f"{used_period} 기준 {', '.join(r['지역'] for r in rows)} {direct_key.replace('_', ' ')} 합계는 "
+            f"{used_period} 기준 {', '.join(r['지역'] for r in rows)} {stat_label} 합계는 "
             f"{_format_number(total)}{unit} 입니다."
         )
         return {
@@ -1356,9 +1348,23 @@ class NaturalLanguageAnswerEngine:
             "tier_a_top_n", "tier_a_region_comparison", "tier_a_region_sum",
         }),
         "STAT_SHARE_RATIO": frozenset({
-            "tier_a_share_ratio", "tier_a_composite_comparison", "tier_a_composite",
+            "tier_a_share_ratio", "tier_a_composite_comparison",
+            "tier_a_composite", "tier_a_composite_share_ratio",
+        }),
+        "STAT_GROWTH_RATE": frozenset({
+            "tier_a_growth_rate", "tier_a_trend",
+        }),
+        "STAT_TIME_SERIES": frozenset({
+            "tier_a_trend", "tier_a_growth_rate",
+        }),
+        "STAT_AVERAGE": frozenset({
+            "tier_a_composite_calculation", "tier_a_composite",
         }),
     }
+
+    _YEAR_MISMATCH_ANSWER_TYPES: frozenset[str] = frozenset({
+        "tier_a_value", "tier_a_growth_rate", "tier_a_share_ratio",
+    })
 
     @classmethod
     def _intent_execution_warnings(
@@ -1398,7 +1404,11 @@ class NaturalLanguageAnswerEngine:
 
         years_in_query = [y for y in re.findall(r"(19\d{2}|20\d{2})", query)]
         used_period = result.get("used_period")
-        if years_in_query and used_period:
+        if (
+            years_in_query
+            and used_period
+            and answer_type in cls._YEAR_MISMATCH_ANSWER_TYPES
+        ):
             used_str = str(used_period)
             if not any(used_str.startswith(y) for y in years_in_query):
                 warnings.append(
