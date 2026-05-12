@@ -209,6 +209,24 @@ def _parse_year_token(text: str) -> Optional[str]:
     return None
 
 
+def _default_period_type(param: QuickStatParam) -> str:
+    periods = tuple(getattr(param, "supported_periods", ()) or ("Y",))
+    if "Y" in periods:
+        return "Y"
+    return periods[0]
+
+
+def _format_period_label(period: Any, period_type: str) -> str:
+    text = str(period or "")
+    if period_type == "M" and len(text) >= 6:
+        return f"{text[:4]}.{text[4:6]}"
+    if period_type == "Q" and len(text) >= 5:
+        return f"{text[:4]}년 {text[-1]}분기"
+    if len(text) >= 4:
+        return f"{text[:4]}년"
+    return text
+
+
 def _format_aggregated_dt(value: float) -> str:
     if value == int(value):
         return str(int(value))
@@ -408,6 +426,15 @@ class NaturalLanguageAnswerEngine:
         q = self._norm(query)
         return any(term in q for term in ("시도별", "지역별", "광역시별", "17개시도", "지역순위"))
 
+    def _is_sme_large_sales_question(self, query: str) -> bool:
+        q = self._norm(query)
+        return (
+            "중소기업" in q
+            and any(term in q for term in ("대기업", "중소기업외"))
+            and any(term in q for term in ("매출", "매출액"))
+            and any(term in q for term in ("비교", "비중", "차이", "전체매출"))
+        )
+
     def _infer_direct_stat_key(self, query: str, route_payload: dict[str, Any]) -> Optional[str]:
         direct_key = route_payload["route"].get("direct_stat_key")
         if direct_key:
@@ -497,6 +524,46 @@ class NaturalLanguageAnswerEngine:
             "출처": "통계청 KOSIS",
         }
 
+    async def _answer_sme_large_sales(self, query: str, region: str) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        sme = await self._latest_stat("중소기업_매출액", "중소기업 매출액", region)
+        large = await self._latest_stat("대기업_매출액", "대기업 매출액", region)
+        total = sme.value + large.value
+        diff = large.value - sme.value
+        sme_share = (sme.value / total * 100) if total else None
+        large_share = (large.value / total * 100) if total else None
+
+        answer = (
+            f"{sme.period}년 기준 {region} 중소기업 매출액은 {sme.formatted}{sme.unit}, "
+            f"대기업 매출액은 {large.formatted}{large.unit}입니다. "
+            f"두 값을 합산한 전체 기업 매출 대비 중소기업 비중은 약 {sme_share:.2f}%입니다."
+        )
+
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_composite_comparison",
+            "질문": query,
+            "answer": answer,
+            "표": [sme.to_row(), large.to_row()],
+            "계산": {
+                "전체_매출액_합산": _format_number(total),
+                "대기업-중소기업_차이": _format_number(diff),
+                "중소기업_비중": round(sme_share, 2) if sme_share is not None else None,
+                "대기업_비중": round(large_share, 2) if large_share is not None else None,
+                "동일시점_여부": self._same_period([sme, large]),
+                "산식": "중소기업 비중 = 중소기업 매출액 / (중소기업 매출액 + 대기업 매출액) * 100",
+            },
+            "해석": [
+                "KOSIS 원표의 대기업 축은 '중소기업 외' 코드입니다. 법령상 대기업만의 범위와 다를 수 있어 출처 기준을 함께 표시해야 합니다.",
+                "금액 단위는 억원이며, 지역·산업·기업규모 기준이 동일한 값끼리 비교했습니다.",
+            ],
+            "추천_시각화": ["bar_chart"],
+            "검증_주의": self._validation_notes(route_payload),
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
     async def _answer_direct(
         self,
         query: str,
@@ -527,6 +594,8 @@ class NaturalLanguageAnswerEngine:
                 "answer": answer,
                 "표": trend.get("시계열", []),
                 "단위": trend.get("단위"),
+                "지역": region,
+                "데이터수": len(trend.get("시계열", [])),
                 "통계표": trend.get("통계표"),
                 "추천_시각화": ["line_chart"],
                 "검증_주의": route_payload["validation"].get("warnings", []),
@@ -622,6 +691,8 @@ class NaturalLanguageAnswerEngine:
         route_payload = self._route_payload(query)
         effective_region = self._effective_region(route_payload, region)
         inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
+        if self._is_sme_large_sales_question(query):
+            return await self._answer_sme_large_sales(query, effective_region)
         if self._is_sme_smallbiz_count_question(query):
             return await self._answer_sme_smallbiz_counts(query, effective_region)
         if self._is_sme_employee_average_question(query):
@@ -920,6 +991,7 @@ async def quick_stat(
             try:
                 data = await _fetch_series(
                     client, key, param, region_code,
+                    period_type=_default_period_type(param),
                     start_year=year, end_year=year,
                     latest_n=1 if not year else None,
                 )
@@ -930,8 +1002,9 @@ async def quick_stat(
             return {"결과": "데이터 없음", "통계표": param.tbl_nm, "권고": verification_warning}
 
         row = data[-1]
+        period_label = _format_period_label(row.get("PRD_DE"), _default_period_type(param))
         result = {
-            "answer": f"{row.get('PRD_DE','')[:4]}년 {region}의 {param.description}은(는) "
+            "answer": f"{period_label} {region}의 {param.description}은(는) "
                       f"{_format_number(row.get('DT'))} {param.unit}입니다.",
             "값": row.get("DT"), "단위": param.unit,
             "시점": row.get("PRD_DE"),
@@ -1015,7 +1088,14 @@ async def quick_trend(
         return {"오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.', "지원_지역": ["전국"]}
 
     async with httpx.AsyncClient() as client:
-        data = await _fetch_series(client, key, param, region_code, latest_n=years)
+        data = await _fetch_series(
+            client,
+            key,
+            param,
+            region_code,
+            period_type=_default_period_type(param),
+            latest_n=years,
+        )
 
     return {
         "통계명": param.description, "지역": region, "단위": param.unit,
@@ -1055,6 +1135,7 @@ async def quick_region_compare(
                 key,
                 param,
                 "ALL",
+                period_type=_default_period_type(param),
                 start_year=year,
                 end_year=year,
                 latest_n=1 if not year else None,
