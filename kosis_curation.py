@@ -70,6 +70,16 @@ REGION_HOUSING = {
 # 경제활동인구조사 (실업률·고용률) — DEMOGRAPHIC과 동일하나 별칭 유지
 REGION_LABOR = REGION_DEMOGRAPHIC
 
+# 중소기업기본통계 (142) — DT_BR_* 표의 지역별 분류는 objL2에 위치
+REGION_BUSINESS = {
+    "전국": "15142C501", "서울": "15142C502", "부산": "15142C503",
+    "대구": "15142C504", "인천": "15142C505", "광주": "15142C506",
+    "대전": "15142C507", "울산": "15142C508", "경기": "15142C509",
+    "강원": "15142C510", "충북": "15142C511", "충남": "15142C512",
+    "전북": "15142C513", "전남": "15142C514", "경북": "15142C515",
+    "경남": "15142C516", "제주": "15142C517", "세종": "15142C518",
+}
+
 
 # ============================================================================
 # Tier A — 검증된 정밀 매핑
@@ -89,6 +99,7 @@ class QuickStatParam:
     item_id: str
     unit: str
     region_scheme: Optional[dict] = None  # 지역명 → 코드
+    region_obj: Literal["obj_l1", "obj_l2", "obj_l3"] = "obj_l1"
     obj_l2: Optional[str] = None
     obj_l3: Optional[str] = None
     obj_l2_list: tuple[str, ...] = ()      # 여러 분류값을 합산해야 하는 계산형 통계
@@ -356,24 +367,29 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         tbl_nm="시도별·산업중분류별·기업규모별 기업수",
         description="중소기업 사업체수",
         obj_l1="IM", obj_l2="15142C501", obj_l3="T002", item_id="T001", unit="개",
+        region_scheme=REGION_BUSINESS,
+        region_obj="obj_l2",
         verification_status="verified",
-        note="Verified via KOSIS API: all industries, nationwide, SME (2023 8,298,915)",
+        note="Verified via KOSIS API: all industries, SME, nationwide and 17 regions (2023 nationwide 8,298,915)",
     ),
     "중소기업_종사자수": QuickStatParam(
         org_id="142", tbl_id="DT_BR_B001",
         tbl_nm="시도별·산업중분류별·기업규모별 종사자수",
         description="중소기업 종사자수",
         obj_l1="IM", obj_l2="15142C501", obj_l3="T002", item_id="T001", unit="명",
+        region_scheme=REGION_BUSINESS,
+        region_obj="obj_l2",
         verification_status="verified",
-        note="Verified via KOSIS API: all industries, nationwide, SME (2023 19,117,649)",
+        note="Verified via KOSIS API: all industries, SME, nationwide and 17 regions (2023 nationwide 19,117,649)",
     ),
     "소상공인_사업체수": QuickStatParam(
         org_id="142", tbl_id="DT_3ME0100",
         tbl_nm="시도/산업중분류별 주요지표",
         description="소상공인 사업체수",
         obj_l1="00", obj_l2="0", item_id="T01", unit="개",
+        region_scheme=REGION_DEMOGRAPHIC,
         verification_status="verified",
-        note="Verified via KOSIS API: nationwide, all industries (2023 5,960,788)",
+        note="Verified via KOSIS API: nationwide and 17 regions, all industries (2023 nationwide 5,960,788)",
     ),
     "자영업자수": QuickStatParam(
         org_id="101", tbl_id="DT_1DA7010S",

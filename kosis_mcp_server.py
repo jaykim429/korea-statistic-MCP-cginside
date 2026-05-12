@@ -213,20 +213,28 @@ def _format_aggregated_dt(value: float) -> str:
 
 async def _fetch_series(
     client: httpx.AsyncClient, key: str, param: QuickStatParam,
-    region_code: str, period_type: str = "Y",
+    region_code: Optional[str], period_type: str = "Y",
     start_year: Optional[str] = None, end_year: Optional[str] = None,
     latest_n: Optional[int] = None,
 ) -> list[dict]:
     p = {
         "method": "getList", "apiKey": key,
         "orgId": param.org_id, "tblId": param.tbl_id,
-        "objL1": region_code, "itmId": param.item_id,
+        "objL1": param.obj_l1, "itmId": param.item_id,
         "prdSe": period_type, "format": "json", "jsonVD": "Y",
     }
     if param.obj_l2:
         p["objL2"] = param.obj_l2
     if getattr(param, "obj_l3", None):
         p["objL3"] = param.obj_l3
+    if region_code:
+        region_obj = getattr(param, "region_obj", "obj_l1")
+        if region_obj == "obj_l1":
+            p["objL1"] = region_code
+        elif region_obj == "obj_l2":
+            p["objL2"] = region_code
+        elif region_obj == "obj_l3":
+            p["objL3"] = region_code
     if start_year and end_year:
         p["startPrdDe"] = start_year
         p["endPrdDe"] = end_year
@@ -286,6 +294,15 @@ def _values_from_series(series: list[dict]) -> tuple[list[str], list[float]]:
             continue
     pairs.sort(key=lambda p: p[0])
     return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
+    region_obj = getattr(param, "region_obj", "obj_l1")
+    if region_obj == "obj_l2":
+        return "C2", "C2_NM"
+    if region_obj == "obj_l3":
+        return "C3", "C3_NM"
+    return "C1", "C1_NM"
 
 
 @dataclass
@@ -372,6 +389,23 @@ class NaturalLanguageAnswerEngine:
             and any(term in q for term in ("종사자", "고용"))
             and any(term in q for term in ("사업체당", "기업당", "평균", "함께", "비교"))
         )
+
+    def _is_region_compare_question(self, query: str) -> bool:
+        q = self._norm(query)
+        return any(term in q for term in ("시도별", "지역별", "광역시별", "17개시도", "지역순위"))
+
+    def _infer_direct_stat_key(self, query: str, route_payload: dict[str, Any]) -> Optional[str]:
+        direct_key = route_payload["route"].get("direct_stat_key")
+        if direct_key:
+            return direct_key
+        q = self._norm(query)
+        if "중소기업" in q and any(term in q for term in ("종사자", "고용")):
+            return "중소기업_종사자수"
+        if "중소기업" in q and any(term in q for term in ("사업체", "기업수", "업체수", "중소기업수")):
+            return "중소기업_사업체수"
+        if "소상공인" in q and any(term in q for term in ("사업체", "업체수", "소상공인수")):
+            return "소상공인_사업체수"
+        return None
 
     async def _answer_sme_smallbiz_counts(self, query: str, region: str) -> dict[str, Any]:
         route_payload = self._route_payload(query)
@@ -500,6 +534,39 @@ class NaturalLanguageAnswerEngine:
             "출처": stat.get("출처", "통계청 KOSIS"),
         }
 
+    async def _answer_region_compare(self, query: str, direct_key: Optional[str] = None) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        direct_key = direct_key or self._infer_direct_stat_key(query, route_payload) or query
+        comparison = await quick_region_compare(direct_key, api_key=self.api_key)
+        if "오류" in comparison:
+            return await self._answer_search_fallback(query, route_payload)
+        route_payload["route"]["direct_stat_key"] = direct_key
+
+        rows = comparison.get("표", [])
+        top = rows[:3]
+        bottom = rows[-3:] if len(rows) >= 3 else rows
+        unit = comparison.get("단위", "")
+        answer = (
+            f"{comparison.get('시점')}년 기준 {comparison.get('통계명', direct_key)} 시도별 비교 결과, "
+            f"가장 많은 지역은 {top[0]['지역']}({top[0]['값']}{unit})입니다."
+            if top else
+            "시도별 비교 데이터를 조회했습니다."
+        )
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_region_comparison",
+            "질문": query,
+            "answer": answer,
+            "표": rows,
+            "상위": top,
+            "하위": bottom,
+            "추천_시각화": ["bar_chart"],
+            "검증_주의": route_payload["validation"].get("warnings", []),
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
     async def _answer_search_fallback(self, query: str, route_payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
         search = await search_kosis(query, 8, True, self.api_key)
@@ -528,10 +595,15 @@ class NaturalLanguageAnswerEngine:
 
     async def answer(self, query: str, region: str = "전국") -> dict[str, Any]:
         route_payload = self._route_payload(query)
+        inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
         if self._is_sme_smallbiz_count_question(query):
             return await self._answer_sme_smallbiz_counts(query, region)
         if self._is_sme_employee_average_question(query):
             return await self._answer_sme_employee_average(query, region)
+        if inferred_direct_key and self._is_region_compare_question(query):
+            return await self._answer_region_compare(query, inferred_direct_key)
+        if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
+            route_payload["route"]["direct_stat_key"] = inferred_direct_key
         if route_payload["route"].get("direct_stat_key"):
             return await self._answer_direct(query, region)
         return await self._answer_search_fallback(query, route_payload)
@@ -800,21 +872,28 @@ async def quick_stat(
                 f"(status: {param.verification_status}). 사유: {param.note or '미상'}"
             )
 
-        region_code = (param.region_scheme or {}).get(region) if param.region_scheme else None
-        if param.region_scheme and not region_code:
+        region_code = None
+        if param.region_scheme:
+            region_code = param.region_scheme.get(region)
+            if not region_code:
+                return {
+                    "오류": f'지역 "{region}" 이 통계에서 미지원',
+                    "지원_지역": list(param.region_scheme.keys()),
+                    "통계표": param.tbl_nm,
+                }
+        elif region != "전국":
             return {
-                "오류": f'지역 "{region}" 이 통계에서 미지원',
-                "지원_지역": list(param.region_scheme.keys()),
+                "오류": f'이 통계는 지역별 조회가 검증되지 않았습니다: "{region}"',
+                "지원_지역": ["전국"],
                 "통계표": param.tbl_nm,
+                "권고": "지역별 값으로 포장하지 않도록 차단했습니다. search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요.",
             }
-        # 지역 스킴 없으면 obj_l1 기본값 사용
-        effective_obj_l1 = region_code or param.obj_l1
 
         year = _parse_year_token(period) if period != "latest" else None
         async with httpx.AsyncClient() as client:
             try:
                 data = await _fetch_series(
-                    client, key, param, effective_obj_l1,
+                    client, key, param, region_code,
                     start_year=year, end_year=year,
                     latest_n=1 if not year else None,
                 )
@@ -901,9 +980,13 @@ async def quick_trend(
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
 
-    region_code = (param.region_scheme or {}).get(region)
-    if not region_code:
-        return {"오류": f'지역 "{region}" 미지원'}
+    region_code = None
+    if param.region_scheme:
+        region_code = param.region_scheme.get(region)
+        if not region_code:
+            return {"오류": f'지역 "{region}" 미지원', "지원_지역": list(param.region_scheme.keys())}
+    elif region != "전국":
+        return {"오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.', "지원_지역": ["전국"]}
 
     async with httpx.AsyncClient() as client:
         data = await _fetch_series(client, key, param, region_code, latest_n=years)
@@ -912,6 +995,79 @@ async def quick_trend(
         "통계명": param.description, "지역": region, "단위": param.unit,
         "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data],
         "데이터수": len(data), "통계표": param.tbl_nm,
+    }
+
+
+@mcp.tool()
+async def quick_region_compare(
+    query: str,
+    period: str = "latest",
+    sort: str = "desc",
+    api_key: Optional[str] = None,
+) -> dict:
+    """[⚡] 지역/시도별 값을 한 번에 비교.
+
+    지역 분류가 검증된 Tier A 통계만 지원합니다. 예:
+    "중소기업 사업체수", "소상공인 사업체수", "실업률".
+    """
+    key = _resolve_key(api_key)
+    param = _lookup_quick(query)
+    if not param:
+        return {"오류": f'"{query}" 사전 매핑 없음'}
+    if not param.region_scheme:
+        return {
+            "오류": f'"{query}"는 지역별 분류가 검증되지 않았습니다.',
+            "통계표": param.tbl_nm,
+            "권고": "search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요.",
+        }
+
+    year = _parse_year_token(period) if period != "latest" else None
+    async with httpx.AsyncClient() as client:
+        try:
+            data = await _fetch_series(
+                client,
+                key,
+                param,
+                "ALL",
+                start_year=year,
+                end_year=year,
+                latest_n=1 if not year else None,
+            )
+        except RuntimeError as e:
+            return {"오류": str(e), "통계표": param.tbl_nm}
+
+    code_field, name_field = _region_field_names(param)
+    regions_by_code = {code: name for name, code in param.region_scheme.items()}
+    rows = []
+    for row in data:
+        code = row.get(code_field)
+        region_name = regions_by_code.get(code) or row.get(name_field)
+        if not region_name or region_name == "전국":
+            continue
+        try:
+            value = float(str(row.get("DT")).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        rows.append({
+            "지역": region_name,
+            "값": _format_number(value),
+            "원값": value,
+            "단위": param.unit,
+            "시점": row.get("PRD_DE"),
+            "통계표": param.tbl_nm,
+        })
+
+    reverse = sort != "asc"
+    rows.sort(key=lambda r: r["원값"], reverse=reverse)
+    latest_period = rows[0]["시점"] if rows else None
+    return {
+        "통계명": param.description,
+        "시점": latest_period,
+        "단위": param.unit,
+        "정렬": "내림차순" if reverse else "오름차순",
+        "지역수": len(rows),
+        "표": rows,
+        "출처": "통계청 KOSIS",
     }
 
 

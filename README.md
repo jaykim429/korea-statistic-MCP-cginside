@@ -367,15 +367,18 @@ $env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
 2. 답변 payload 점검은 `verify_stat_claims`
 3. 산식·분모가 필요한 질문은 `indicator_dependency_map`
 4. 직접 통계 조회는 `quick_stat`, 시계열은 `quick_trend`
-5. 복합 분석은 `analyze_trend`, `stat_time_compare`, `correlate_stats`, `forecast_stat`, `detect_outliers`
-6. 차트는 `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`
+5. 시도별·지역별 비교는 `quick_region_compare`
+6. 복합 분석은 `analyze_trend`, `stat_time_compare`, `correlate_stats`, `forecast_stat`, `detect_outliers`
+7. 차트는 `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`
 
 ## 예시
 
 ```text
 answer_query("최근 기준 중소기업 수와 소상공인 사업체 수를 함께 보여줘")
+answer_query("중소기업 사업체수를 시도별로 비교해줘")
 answer_query("AI 관련 통계 찾아줘")
 answer_query("최근 5년간 실업률 추이 분석해줘")
+quick_region_compare("중소기업 사업체수")
 stat_time_compare("실업률", years=5)
 indicator_dependency_map("폐업률")
 chart_line("고령인구", region="전국", years=5)
