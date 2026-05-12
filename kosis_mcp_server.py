@@ -1421,6 +1421,40 @@ class NaturalLanguageAnswerEngine:
             )
         return warnings
 
+    @staticmethod
+    def _pick_josa_eun_neun(word: str) -> str:
+        """Return 은 or 는 based on final-syllable batchim. Falls back to
+        는 for non-Hangul tails (English, digits, parentheses, …)."""
+        if not word:
+            return "는"
+        last = word[-1]
+        codepoint = ord(last)
+        if 0xAC00 <= codepoint <= 0xD7A3:
+            return "은" if (codepoint - 0xAC00) % 28 != 0 else "는"
+        return "는"
+
+    @classmethod
+    def _polish_answer_text(cls, text: Optional[str]) -> Optional[str]:
+        """Smooth common surface-level fragments in answer strings:
+        - X은(는) → X은 or X는 by Korean batchim
+        - YYYY.MM (raw monthly period) → YYYY년 M월
+        - YYYY.QQ patterns left alone (quarter labels already humane)
+        - Collapses 년년 / 월월 artifacts the substitutions can leave."""
+        if not text:
+            return text
+        def fix_josa(m: re.Match) -> str:
+            word = m.group(1)
+            return f"{word}{cls._pick_josa_eun_neun(word)}"
+        text = re.sub(r"(\S+?)은\(는\)", fix_josa, text)
+        text = re.sub(
+            r"(?<!\d)(19\d{2}|20\d{2})\.(0[1-9]|1[0-2]|[1-9])(?!\d)",
+            lambda m: f"{m.group(1)}년 {int(m.group(2))}월",
+            text,
+        )
+        text = re.sub(r"년년", "년", text)
+        text = re.sub(r"월월", "월", text)
+        return text
+
     @classmethod
     def _finalize_response(
         cls,
@@ -1430,6 +1464,10 @@ class NaturalLanguageAnswerEngine:
     ) -> dict[str, Any]:
         if not isinstance(result, dict):
             return result
+
+        if isinstance(result.get("answer"), str):
+            result["answer"] = cls._polish_answer_text(result["answer"])
+
         if result.get("상태") != "executed":
             return result
         used = result.get("used_period") or cls._extract_used_period(result)

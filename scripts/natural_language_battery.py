@@ -195,6 +195,18 @@ CASES: list[dict[str, Any]] = [
     {"group": "top_n_extended", "name": "rank_5_until",
      "query": "중소기업 사업체수 5위까지 알려줘",
      "expect": {"answer_type": "tier_a_top_n", "table_len": 5}},
+
+    # ── 16. Stage 7: NL response polish ───────────────────────────────
+    # "은(는)" 일괄 표기와 "YYYY.MM" raw 시점이 자연스러운 한국어로 다듬어져야 함.
+    # 두 케이스 모두 answer 필드에 raw 표기가 남아 있으면 FAIL.
+    {"group": "nl_polish", "name": "no_eun_neun_placeholder",
+     "query": "서울 인구 최신값",
+     "expect": {"answer_type": "tier_a_value", "region": "서울",
+                "answer_excludes": "은(는)"}},
+    {"group": "nl_polish", "name": "monthly_period_humanized",
+     "query": "서울 주택매매가격지수 최신",
+     "expect": {"answer_type": "tier_a_value", "region": "서울",
+                "answer_excludes": ".0", "answer_contains": "년"}},
 ]
 
 
@@ -223,6 +235,7 @@ def _summarize(result: dict[str, Any]) -> dict[str, Any]:
         "sum_regions": calc.get("포함_지역"),
         "first_row_keys": sorted((table[0].keys()) if table and isinstance(table[0], dict) else []),
         "warnings": result.get("검증_주의") or [],
+        "answer": result.get("answer"),
     }
 
 
@@ -280,6 +293,16 @@ def _check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         warnings_text = " | ".join(s.get("warnings") or [])
         if expect["warning_contains"] not in warnings_text:
             problems.append(f"warning_missing={expect['warning_contains']}")
+
+    if "answer_excludes" in expect:
+        answer_text = str(s.get("answer") or "")
+        if expect["answer_excludes"] in answer_text:
+            problems.append(f"answer_contains_raw={expect['answer_excludes']!r}")
+
+    if "answer_contains" in expect:
+        answer_text = str(s.get("answer") or "")
+        if expect["answer_contains"] not in answer_text:
+            problems.append(f"answer_missing={expect['answer_contains']!r}")
 
     if expected_status == "executed" and not s.get("used_period"):
         problems.append("stage3_missing_used_period")
