@@ -80,6 +80,48 @@ REGION_BUSINESS = {
     "경남": "15142C516", "제주": "15142C517", "세종": "15142C518",
 }
 
+# 창업기업수(시도) DT_1YL20551E_1 — 자체 코드 체계
+REGION_STARTUP = {
+    "전국": "15142A200", "서울": "15142A211", "부산": "15142A221",
+    "대구": "15142A222", "인천": "15142A223", "광주": "15142A224",
+    "대전": "15142A225", "울산": "15142A226", "세종": "15142B236",
+    "경기": "15142A231", "강원": "15142A233", "충북": "15142A234",
+    "충남": "15142A235", "전북": "15142A236", "전남": "15142A237",
+    "경북": "15142A238", "경남": "15142A239", "제주": "15142A240",
+}
+
+# 국민기초생활보장 수급자수(시도) DT_1YL13801E — REGION_DEMOGRAPHIC과
+# 거의 동일하나 세종 코드만 27 (DEMOGRAPHIC은 29)
+REGION_WELFARE = {
+    "전국": "00", "서울": "11", "부산": "21", "대구": "22", "인천": "23",
+    "광주": "24", "대전": "25", "울산": "26", "세종": "27", "경기": "31",
+    "강원": "32", "충북": "33", "충남": "34", "전북": "35", "전남": "36",
+    "경북": "37", "경남": "38", "제주": "39",
+}
+
+# 신재생에너지 생산량(시도) DT_1YL202112E
+REGION_NEW_ENERGY = {
+    "전국": "1110100A00", "서울": "1110100A11", "부산": "1110100A21",
+    "대구": "1110100A22", "인천": "1110100A23", "광주": "1110100A24",
+    "대전": "1110100A25", "울산": "1110100A26", "세종": "1110100A27",
+    "경기": "1110100A31", "강원": "1110100A32", "충북": "1110100A33",
+    "충남": "1110100A34", "전북": "1110100A35", "전남": "1110100A36",
+    "경북": "1110100A37", "경남": "1110100A38", "제주": "1110100A39",
+}
+
+# 주택보급률(시도) DT_1YL13401E
+REGION_HOUSING_SUPPLY = {
+    "전국": "13102871096A.0001", "서울": "13102871096A.0004",
+    "부산": "13102871096A.0005", "대구": "13102871096A.0006",
+    "인천": "13102871096A.0007", "광주": "13102871096A.0008",
+    "대전": "13102871096A.0009", "울산": "13102871096A.0010",
+    "세종": "13102871096A.0012", "경기": "13102871096A.0011",
+    "강원": "13102871096A.0013", "충북": "13102871096A.0014",
+    "충남": "13102871096A.0015", "전북": "13102871096A.0016",
+    "전남": "13102871096A.0017", "경북": "13102871096A.0018",
+    "경남": "13102871096A.0019", "제주": "13102871096A.0020",
+}
+
 
 # Alias → canonical region name. Covers full administrative names
 # (서울특별시, 경기도, 충청북도), short forms (서울시), and romanized
@@ -710,12 +752,11 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         org_id="101", tbl_id="DT_1YL20171E",
         tbl_nm="아파트전세가격지수(시도/시/군/구)",
         description="아파트 전세가격지수",
-        obj_l1="00", obj_l2="a0", item_id="sales", unit="지수",
+        obj_l1="a0", item_id="sales", unit="지수",
         region_scheme=REGION_HOUSING,
-        region_obj="obj_l2",
         supported_periods=("M",),
         verification_status="verified",
-        note="explore 검증. 주택 전세지수와 별개 — 아파트 한정.",
+        note="explore 검증. region이 단일 분류축(obj_l1). 주택 전세지수와 별개.",
     ),
     "자동차등록대수": QuickStatParam(
         org_id="101", tbl_id="DT_1YL20731",
@@ -768,6 +809,273 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         supported_periods=("M",),
         verification_status="verified",
         note="전국 총계만 매핑. 시도별 192개 측정소는 후속 라운드.",
+    ),
+
+    # ========================================================================
+    # Round 6 Step 3 — 법안 분야별 통계 (21개 신규, 8개 통계표)
+    # search_legislative_domains + explore_legislative_winners 라이브 검증.
+    # ========================================================================
+
+    # 정무위 — 한국은행 가계대출 (DT_151Y005)
+    "가계대출_총잔액": QuickStatParam(
+        org_id="301", tbl_id="DT_151Y005",
+        tbl_nm="예금취급기관 가계대출(용도별 월)",
+        description="예금취급기관 가계대출 총잔액 (주택담보+기타)",
+        obj_l1="13102134699ACC_ITEM.1110000",
+        item_id="13103134699999", unit="십억원",
+        supported_periods=("M",),
+        verification_status="verified",
+        note="시도 분류 없음 — 전국 합계. 한국은행 통계.",
+    ),
+    "주택담보대출": QuickStatParam(
+        org_id="301", tbl_id="DT_151Y005",
+        tbl_nm="예금취급기관 가계대출(용도별 월)",
+        description="주택담보대출 잔액 (예금취급기관 전체)",
+        obj_l1="13102134699ACC_ITEM.11100A0",
+        item_id="13103134699999", unit="십억원",
+        supported_periods=("M",),
+        verification_status="verified",
+    ),
+    "기타대출": QuickStatParam(
+        org_id="301", tbl_id="DT_151Y005",
+        tbl_nm="예금취급기관 가계대출(용도별 월)",
+        description="기타대출 잔액 (주택담보 외, 예금취급기관)",
+        obj_l1="13102134699ACC_ITEM.11100B0",
+        item_id="13103134699999", unit="십억원",
+        supported_periods=("M",),
+        verification_status="verified",
+    ),
+
+    # 행안위 — 지방재정 (DT_1YL20921)
+    "재정자립도": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL20921",
+        tbl_nm="재정자립도(시도/시/군/구)",
+        description="지방재정자립도 (세입과목개편후)",
+        obj_l1="00", item_id="T20", unit="%",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="item=T20 (개편후 — 현재 표준). T10은 개편전.",
+    ),
+
+    # 행안위 — 화재 (DT_1YL8601)
+    "화재발생건수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL8601",
+        tbl_nm="화재발생건수(시도/시/군/구)",
+        description="화재 발생건수",
+        obj_l1="00", item_id="T10", unit="건",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+
+    # 교육위 — 교원·학생 (DT_1YL21171)
+    "교원1인당학생수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL21171",
+        tbl_nm="교원 1인당 학생수(시도/시/군/구)",
+        description="교원 1인당 학생수 (재적학생수 ÷ 교원수)",
+        obj_l1="00", item_id="T10", unit="명",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "재적학생수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL21171",
+        tbl_nm="교원 1인당 학생수(시도/시/군/구)",
+        description="재적학생수 (초중고)",
+        obj_l1="00", item_id="T001", unit="명",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "교원수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL21171",
+        tbl_nm="교원 1인당 학생수(시도/시/군/구)",
+        description="교원수 (초중고)",
+        obj_l1="00", item_id="T002", unit="명",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+
+    # 산자중기위 — 창업기업 (DT_1YL20551E_1)
+    "창업기업수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL20551E_1",
+        tbl_nm="창업기업수(시도)",
+        description="창업기업수 (법인+개인 전체)",
+        obj_l1="15142A200", item_id="16142T1", unit="개",
+        region_scheme=REGION_STARTUP,
+        supported_periods=("Y", "Q", "M"),
+        verification_status="verified",
+        note="중기부 창업기업동향 통계. 월별 누적.",
+    ),
+    "법인_창업기업수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL20551E_1",
+        tbl_nm="창업기업수(시도)",
+        description="법인 창업기업수",
+        obj_l1="15142A200", item_id="T001", unit="개",
+        region_scheme=REGION_STARTUP,
+        supported_periods=("Y", "Q", "M"),
+        verification_status="verified",
+    ),
+    "개인_창업기업수": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL20551E_1",
+        tbl_nm="창업기업수(시도)",
+        description="개인 창업기업수",
+        obj_l1="15142A200", item_id="T002", unit="개",
+        region_scheme=REGION_STARTUP,
+        supported_periods=("Y", "Q", "M"),
+        verification_status="verified",
+    ),
+
+    # 복지위 — 기초생활보장 (DT_1YL13801E)
+    "기초생활보장수급자": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL13801E",
+        tbl_nm="국민기초생활보장 수급자수(시도)",
+        description="국민기초생활보장 수급자수",
+        obj_l1="00", item_id="TT", unit="명",
+        region_scheme=REGION_WELFARE,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="REGION_WELFARE 사용 — 세종 코드만 27 (DEMOGRAPHIC은 29).",
+    ),
+
+    # 환노위 — 재활용 (DT_1YL21311)
+    "재활용률": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL21311",
+        tbl_nm="생활계폐기물 재활용률(시도/시/군/구)",
+        description="생활계폐기물 재활용률",
+        obj_l1="00", item_id="T10", unit="%",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "총재활용량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL21311",
+        tbl_nm="생활계폐기물 재활용률(시도/시/군/구)",
+        description="총 재활용량 (생활계폐기물)",
+        obj_l1="00", item_id="T001", unit="톤/일",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "생활폐기물발생량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL21311",
+        tbl_nm="생활계폐기물 재활용률(시도/시/군/구)",
+        description="생활계폐기물 총 발생량",
+        obj_l1="00", item_id="T002", unit="톤/일",
+        region_scheme=REGION_DEMOGRAPHIC,
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+
+    # 환노위 — 온실가스 (DT_106N_99_2800019, 전국만)
+    "1인당온실가스배출량": QuickStatParam(
+        org_id="106", tbl_id="DT_106N_99_2800019",
+        tbl_nm="국가 온실가스 배출량 주요 지표",
+        description="1인당 온실가스 배출량",
+        obj_l1="13102130540A.4100001",
+        item_id="13103130540T.1100001",
+        unit="t CO₂eq./명",
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="전국 합계만. 환경부 온실가스종합정보센터.",
+    ),
+    "GDP당온실가스배출량": QuickStatParam(
+        org_id="106", tbl_id="DT_106N_99_2800019",
+        tbl_nm="국가 온실가스 배출량 주요 지표",
+        description="GDP당 온실가스 배출량",
+        obj_l1="13102130540A.4100001",
+        item_id="13103130540T.1100003",
+        unit="t CO₂eq./10억원",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+
+    # 환노위 — 신재생에너지 (DT_1YL202112E)
+    # B1(재생에너지 전체)은 부모 분류라 실제 데이터 행이 없다.
+    # 에너지원별 단위도 섞여 있어 총계를 임의 합산하지 않고 세부 항목만 제공한다.
+    "태양열생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="태양열 에너지 생산량",
+        obj_l1="15337AA8A3", obj_l2="1110100A00", item_id="16337AAB0", unit="toe",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "태양광생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="태양광 에너지 생산량",
+        obj_l1="15337AA8A4", obj_l2="1110100A00", item_id="16337AAB0", unit="MWh",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "풍력생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="풍력 에너지 생산량",
+        obj_l1="15337AA8A6", obj_l2="1110100A00", item_id="16337AAB0", unit="MWh",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "수력생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="수력 에너지 생산량",
+        obj_l1="15337AA8A7", obj_l2="1110100A00", item_id="16337AAB0", unit="MWh",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "해양에너지생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="해양 에너지 생산량",
+        obj_l1="15337AA8C0", obj_l2="1110100A00", item_id="16337AAB0", unit="MWh",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "지열생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="지열 에너지 생산량",
+        obj_l1="15337AA8B0", obj_l2="1110100A00", item_id="16337AAB0", unit="toe",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+    "수열생산량": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL202112E",
+        tbl_nm="신재생에너지원별(고유단위) 생산량(시도)",
+        description="수열 에너지 생산량",
+        obj_l1="0001", obj_l2="1110100A00", item_id="16337AAB0", unit="toe",
+        region_scheme=REGION_NEW_ENERGY,
+        region_obj="obj_l2",
+        supported_periods=("Y",),
+        verification_status="verified",
+    ),
+
+    # 국토위 — 주택보급률 (DT_1YL13401E)
+    "주택보급률": QuickStatParam(
+        org_id="101", tbl_id="DT_1YL13401E",
+        tbl_nm="주택보급률(시도)",
+        description="주택보급률",
+        obj_l1="13102871096A.0001", item_id="13103871096T6", unit="%",
+        region_scheme=REGION_HOUSING_SUPPLY,
+        supported_periods=("Y",),
+        verification_status="verified",
+        note="REGION_HOUSING_SUPPLY 사용 (수도권/지방 합성지역도 코드 보유).",
     ),
 }
 
@@ -859,10 +1167,11 @@ SYNONYMS: dict[str, str] = {
     "총인구": "인구", "주민등록인구": "인구", "인구수": "인구",
     "전체인구": "인구",
     "출산율": "합계출산율", "출산률": "합계출산율",
-    "출생": "출생아수", "출생수": "출생아수", "조출생률": "출생아수",
-    "사망자": "사망자수", "사망률": "사망자수", "조사망률": "사망자수",
-    "혼인율": "혼인건수", "조혼인율": "혼인건수", "결혼": "혼인건수",
-    "이혼율": "이혼건수", "조이혼율": "이혼건수",
+    "출생": "출생아수", "출생수": "출생아수", "출생률": "조출생률",
+    "조출생률": "조출생률",
+    "사망자": "사망자수", "사망률": "조사망률", "조사망률": "조사망률",
+    "혼인율": "조혼인율", "조혼인율": "조혼인율", "결혼": "혼인건수",
+    "이혼율": "조이혼율", "조이혼율": "조이혼율",
     "평균수명": "기대수명", "기대여명": "기대수명",
     "노령인구": "고령인구", "65세이상": "고령인구",
 
