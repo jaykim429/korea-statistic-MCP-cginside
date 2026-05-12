@@ -17,7 +17,6 @@ KOSIS MCP — 조회 + 분석 + 시각화 통합 서버
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import re
@@ -28,7 +27,7 @@ from typing import Any, Optional
 import httpx
 import numpy as np
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ImageContent, TextContent
+from mcp.types import TextContent
 from scipy import stats as scipy_stats
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -284,17 +283,21 @@ def _detect_precision_downgrade(period: str, period_type: str) -> Optional[str]:
     a "2025Q1" request was answered with 2025 annual data."""
     if not period or period == "latest":
         return None
-    has_quarter = _parse_quarter_token(period) is not None
-    has_month = _parse_month_token(period) is not None
-    if has_month and period_type != "M":
-        return (
-            f"월 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
-            "연 단위로 응답 — 월 차이는 반영되지 않음"
-        )
+    text = str(period)
+    # Quarter takes precedence — "2025년 1분기" must not be misread as
+    # January via the month regex.
+    has_explicit_quarter = bool(re.search(r"(분기|Q[1-4])", text, re.IGNORECASE))
+    has_quarter = has_explicit_quarter or _parse_quarter_token(period) is not None
+    has_month = (not has_explicit_quarter) and _parse_month_token(period) is not None
     if has_quarter and period_type not in {"Q", "M"}:
         return (
             f"분기 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
             "연 단위로 응답 — 분기 차이는 반영되지 않음"
+        )
+    if has_month and period_type != "M":
+        return (
+            f"월 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
+            "연 단위로 응답 — 월 차이는 반영되지 않음"
         )
     return None
 
@@ -1252,6 +1255,18 @@ class NaturalLanguageAnswerEngine:
     async def _answer_search_fallback(self, query: str, route_payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
         search = await search_kosis(query, 8, True, self.api_key)
+        intents = route_payload.get("intents") or []
+        tool_hints = self._tool_routing_hints(query, intents)
+        next_steps = [
+            "후보 통계표의 기준시점, 단위, 분류코드, 분모를 확인합니다.",
+            "동일 기준으로 시계열·비교·비중·증가율 계산을 수행합니다.",
+            "표/그래프/해석/유의사항을 함께 응답합니다.",
+        ]
+        if tool_hints:
+            next_steps = [
+                "이 의도는 전용 도구로 바로 처리 가능 — 아래 추천_도구_호출 참고",
+                *next_steps,
+            ]
         return {
             "상태": "needs_table_selection",
             "코드": STATUS_NEEDS_TABLE_SELECTION,
@@ -1261,19 +1276,47 @@ class NaturalLanguageAnswerEngine:
                 "이 질문은 여러 통계표·분류코드·산식이 필요한 복합 질의입니다. "
                 "아래 후보 통계표 중 적합한 표를 선택한 뒤 실제 수치 계산을 진행해야 합니다."
             ),
-            "의도": route_payload["intents"],
+            "의도": intents,
             "슬롯": route_payload["slots"],
             "실행계획": route_payload["analysis_plan"],
             "검증": route_payload["validation"],
             "검색결과": search.get("결과", []),
             "사용된_검색어": search.get("사용된_검색어", []),
-            "다음단계": [
-                "후보 통계표의 기준시점, 단위, 분류코드, 분모를 확인합니다.",
-                "동일 기준으로 시계열·비교·비중·증가율 계산을 수행합니다.",
-                "표/그래프/해석/유의사항을 함께 응답합니다.",
-            ],
+            "추천_도구_호출": tool_hints,
+            "다음단계": next_steps,
             "route": route_payload["route"],
         }
+
+    def _tool_routing_hints(self, query: str, intents: list[str]) -> list[str]:
+        """Cross-tool routing — when the search fallback fires for an
+        intent that has a dedicated MCP tool, return concrete call
+        suggestions instead of just listing candidate tables."""
+        hints: list[str] = []
+        if "STAT_CORRELATION" in intents:
+            hints.append(
+                "correlate_stats(stat_x='<지표A>', stat_y='<지표B>', region='전국', years=10) — "
+                "Pearson/Spearman 자동 계산. 상관관계 의도는 이 도구가 정답이며, "
+                "answer_query는 후보 표 선택 단계에서 멈추는 안전 폴백입니다."
+            )
+        if "STAT_REGRESSION" in intents:
+            hints.append(
+                "correlate_stats 결과의 상관계수와 함께, stat_time_compare로 시점 변화를 보조 분석. "
+                "회귀계수 자체는 별도 분석(Python statsmodels 등) 필요."
+            )
+        if "STAT_OUTLIER_DETECTION" in intents:
+            hints.append(
+                "detect_outliers(query='<지표>', region='<지역>', years=12) — Z-score 기반 이상치 탐지."
+            )
+        if "STAT_FORECAST" in intents:
+            hints.append(
+                "forecast_stat(query='<지표>', region='<지역>', years=10, horizon=3) — 단순 외삽 예측."
+            )
+        if "POLICY_EFFECT_ANALYSIS" in intents:
+            hints.append(
+                "정책효과는 단일 호출로 답할 수 없음. correlate_stats + stat_time_compare로 "
+                "before/after 구간을 따로 비교하되 인과관계 단정은 금물."
+            )
+        return hints
 
     async def answer(self, query: str, region: str = "전국") -> dict[str, Any]:
         route_payload = self._route_payload(query)
@@ -1538,9 +1581,19 @@ def _svg_header(w: int = 640, h: int = 380) -> str:
     )
 
 
-def _svg_to_image(svg: str) -> ImageContent:
-    data = base64.b64encode(svg.encode("utf-8")).decode("ascii")
-    return ImageContent(type="image", mimeType="image/svg+xml", data=data)
+def _svg_to_image(svg: str) -> TextContent:
+    """Wrap an SVG payload in a MCP-compatible content block.
+
+    The MCP spec accepts ImageContent only for raster mime types
+    (image/png, image/jpeg, image/gif, image/webp). Claude Desktop and
+    Claude Code clients reject image/svg+xml outright, which used to
+    break every chart tool with a content-format error.
+
+    We now emit the SVG inside a fenced ```svg block as TextContent.
+    Web embeds that render markdown+SVG (claude.ai, browser MCP
+    clients) still show the chart; CLI clients see the markup as code,
+    which is far better than a hard failure."""
+    return TextContent(type="text", text=f"```svg\n{svg}\n```")
 
 
 def _chart_line_svg(
@@ -1890,14 +1943,26 @@ async def _quick_stat_core(
         data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
         row = data[-1]
         period_label = _format_period_label(row.get("PRD_DE"), period_type)
+        used_period = str(row.get("PRD_DE") or "")
+        age = NaturalLanguageAnswerEngine._period_age_years(used_period)
+        answer_text = NaturalLanguageAnswerEngine._polish_answer_text(
+            f"{period_label} {region}의 {param.description}은(는) "
+            f"{_format_number(row.get('DT'))} {param.unit}입니다."
+        )
         result = {
-            "answer": f"{period_label} {region}의 {param.description}은(는) "
-                      f"{_format_number(row.get('DT'))} {param.unit}입니다.",
+            "answer": answer_text,
             "값": row.get("DT"), "단위": param.unit,
             "시점": row.get("PRD_DE"),
+            "used_period": used_period,
+            "period_age_years": age,
             "지역": region, "통계표": param.tbl_nm,
             "출처": "통계청 KOSIS",
         }
+        if age is not None and age >= 1.0:
+            result["⚠️ 데이터_신선도"] = (
+                f"사용 시점 {used_period} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음. "
+                "check_stat_availability로 통계표의 수록기간을 확인하세요."
+            )
         if verification_warning:
             result["⚠️ 검증_상태"] = verification_warning
         if precision_downgrade:
@@ -3043,11 +3108,32 @@ async def search_kosis(
             seen.add(tid)
             unique.append(item)
 
+    # Surface any Tier A direct mapping that covers this query — search
+    # alone could miss the canonical table because KOSIS' search index
+    # ranks weakly-related tables higher than the verified one (#23).
+    tier_a_match = _lookup_quick(query)
+    tier_a_hint: Optional[dict[str, Any]] = None
+    if tier_a_match is not None:
+        tier_a_hint = {
+            "지표": tier_a_match.description,
+            "통계표": tier_a_match.tbl_nm,
+            "통계표ID": tier_a_match.tbl_id,
+            "기관ID": tier_a_match.org_id,
+            "단위": tier_a_match.unit,
+            "주기": list(tier_a_match.supported_periods),
+            "검증상태": tier_a_match.verification_status,
+            "권고_호출": (
+                f"quick_stat('{query}', region='전국', period='latest') 으로 바로 호출 가능. "
+                "search 결과를 다시 매핑할 필요 없음."
+            ),
+        }
+
     return {
         "입력": query,
         "라우팅_사용": used_routing,
         "사용된_검색어": keywords,
         "결과수": len(unique),
+        "Tier_A_직접_매핑": tier_a_hint,
         "결과": [
             {
                 "통계표명": r.get("TBL_NM"),

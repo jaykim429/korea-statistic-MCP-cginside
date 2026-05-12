@@ -229,6 +229,15 @@ CASES: list[dict[str, Any]] = [
     {"group": "top_n_default", "name": "no_explicit_n",
      "query": "중소기업 사업체수가 가장 많은 곳 알려줘",
      "expect": {"answer_type": "tier_a_top_n", "table_len": 5}},
+
+    # ── 20. Stage 13: cross-tool routing for advanced intents (#19) ────
+    # STAT_CORRELATION 의도는 search_fallback로 빠지되 응답에 correlate_stats
+    # 호출 힌트가 포함되어야 한다.
+    {"group": "tool_routing", "name": "correlation_routes_to_correlate_stats",
+     "query": "인구와 GDP 상관관계 분석해줘",
+     "expect": {"status": "needs_table_selection",
+                "answer_type": "search_and_plan",
+                "tool_hint_contains": "correlate_stats"}},
 ]
 
 
