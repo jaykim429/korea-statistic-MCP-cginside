@@ -275,6 +275,30 @@ def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Option
     return year, year
 
 
+def _detect_precision_downgrade(period: str, period_type: str) -> Optional[str]:
+    """Return a warning string when the requested period asks for finer
+    granularity (month/quarter) than the table supports.
+
+    Without this signal, _period_bounds silently falls back to the year
+    component of a quarter/month token, so the caller never learns that
+    a "2025Q1" request was answered with 2025 annual data."""
+    if not period or period == "latest":
+        return None
+    has_quarter = _parse_quarter_token(period) is not None
+    has_month = _parse_month_token(period) is not None
+    if has_month and period_type != "M":
+        return (
+            f"월 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
+            "연 단위로 응답 — 월 차이는 반영되지 않음"
+        )
+    if has_quarter and period_type not in {"Q", "M"}:
+        return (
+            f"분기 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
+            "연 단위로 응답 — 분기 차이는 반영되지 않음"
+        )
+    return None
+
+
 def _extract_year_range(text: str) -> tuple[Optional[str], Optional[str]]:
     """Extract (start_year, end_year) from explicit comparison phrasing.
 
@@ -1722,10 +1746,27 @@ mcp = FastMCP("kosis-analysis")
 
 # ---- L1: Quick Layer ----
 
+_QUICK_STAT_SUPPORTED_PARAMS = frozenset({"query", "region", "period", "api_key"})
+
+
+def _attach_ignored_params(result: Any, ignored: list[str], context: str) -> Any:
+    """Attach unsupported-parameter warning to a quick-stat-like response."""
+    if not ignored or not isinstance(result, dict):
+        return result
+    result["⚠️ 무시된_파라미터"] = ignored
+    result["⚠️ 무시된_파라미터_안내"] = (
+        f"{context} 함수는 정해진 파라미터(query/region/period 등)만 받습니다. "
+        "industry, scale, sector 등 추가 슬라이싱은 자연어 query에 키워드를 "
+        "포함하거나 search_kosis로 통계표 ID를 먼저 확인해야 합니다."
+    )
+    return result
+
+
 @mcp.tool()
 async def quick_stat(
     query: str, region: str = "전국", period: str = "latest",
     api_key: Optional[str] = None,
+    **unsupported: Any,
 ) -> dict:
     """[⚡] 자연어로 통계 단일값 즉시 조회.
 
@@ -1736,9 +1777,24 @@ async def quick_stat(
 
     Args:
         query: 통계 키워드 ("인구", "실업률", "중소기업 사업체수")
-        region: 17개 시도명 (기본 "전국")
-        period: "latest" 또는 "2023", "작년"
+        region: 17개 시도명 (기본 "전국"). 영문·풀네임도 자동 정규화
+                (Seoul, 서울특별시, 서울시 → 서울).
+        period: "latest" 또는 "2023", "2023.03", "작년", "올해"
+
+    지원하지 않는 파라미터(예: industry, scale, sector)는 응답의
+    `⚠️ 무시된_파라미터` 필드에 노출됩니다. 해당 슬라이싱은 자연어
+    `query`에 키워드를 포함하거나 search_kosis로 통계표를 직접
+    선택해야 합니다.
     """
+    ignored_params = sorted(k for k in unsupported if k not in _QUICK_STAT_SUPPORTED_PARAMS)
+    result = await _quick_stat_core(query, region, period, api_key)
+    return _attach_ignored_params(result, ignored_params, "quick_stat")
+
+
+async def _quick_stat_core(
+    query: str, region: str = "전국", period: str = "latest",
+    api_key: Optional[str] = None,
+) -> dict:
     key = _resolve_key(api_key)
     param = _lookup_quick(query)
     canonical = _canonical_region(region) or region
@@ -1788,6 +1844,7 @@ async def quick_stat(
 
         period_type = _default_period_type(param)
         start_period, end_period = _period_bounds(period, period_type)
+        precision_downgrade = _detect_precision_downgrade(period, period_type)
         if period != "latest" and not start_period:
             return {
                 "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
@@ -1806,7 +1863,29 @@ async def quick_stat(
                 return {"오류": str(e), "통계표": param.tbl_nm, "권고": verification_warning}
 
         if not data:
-            return {"결과": "데이터 없음", "통계표": param.tbl_nm, "권고": verification_warning}
+            relative_hint = None
+            normalized = re.sub(r"\s+", "", str(period or ""))
+            if any(term in normalized for term in ("작년", "지난해", "전년", "재작년", "올해", "금년")):
+                resolved_year = _parse_year_token(period)
+                if resolved_year:
+                    relative_hint = (
+                        f"'{period}' → {resolved_year}년으로 해석했지만 이 통계표의 수록 시점에 "
+                        f"포함되지 않음. 최신값을 원하면 period='latest'를 사용하세요."
+                    )
+            return {
+                "상태": "failed",
+                "코드": STATUS_PERIOD_NOT_FOUND,
+                "결과": "데이터 없음",
+                "answer": (
+                    f"요청한 기간 '{period}'의 {param.description} 데이터가 KOSIS 통계표에 없습니다. "
+                    "최신값으로 대체하지 않고 중단했습니다."
+                ),
+                "통계표": param.tbl_nm,
+                "요청_기간": period,
+                "해석된_기간": [start_period, end_period],
+                "권고": verification_warning,
+                "⚠️ 기간_해석": relative_hint,
+            }
 
         data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
         row = data[-1]
@@ -1821,6 +1900,8 @@ async def quick_stat(
         }
         if verification_warning:
             result["⚠️ 검증_상태"] = verification_warning
+        if precision_downgrade:
+            result["⚠️ 정밀도_다운그레이드"] = precision_downgrade
         return result
 
     # === Tier B 라우팅: 추천 검색어로 폴백 ===
@@ -1874,14 +1955,27 @@ async def quick_stat(
 async def quick_trend(
     query: str, region: str = "전국", years: int = 10,
     api_key: Optional[str] = None,
+    **unsupported: Any,
 ) -> dict:
     """[⚡] 시계열 데이터 조회 (분석/시각화 입력으로 사용).
 
     Args:
         query: 통계 키워드
-        region: 지역
+        region: 지역 (영문·풀네임 자동 정규화)
         years: 최근 N년 (기본 10)
+
+    지원하지 않는 파라미터는 quick_stat과 동일하게 응답의
+    `⚠️ 무시된_파라미터` 필드에 노출됩니다.
     """
+    ignored_params = sorted(k for k in unsupported if k not in {"query", "region", "years", "api_key"})
+    result = await _quick_trend_core(query, region, years, api_key)
+    return _attach_ignored_params(result, ignored_params, "quick_trend")
+
+
+async def _quick_trend_core(
+    query: str, region: str = "전국", years: int = 10,
+    api_key: Optional[str] = None,
+) -> dict:
     key = _resolve_key(api_key)
     param = _lookup_quick(query)
     if not param:
@@ -1920,12 +2014,22 @@ async def quick_region_compare(
     period: str = "latest",
     sort: str = "desc",
     api_key: Optional[str] = None,
+    **unsupported: Any,
 ) -> dict:
     """[⚡] 지역/시도별 값을 한 번에 비교.
 
     지역 분류가 검증된 Tier A 통계만 지원합니다. 예:
     "중소기업 사업체수", "소상공인 사업체수", "실업률".
     """
+    ignored_params = sorted(k for k in unsupported if k not in {"query", "period", "sort", "api_key"})
+    result = await _quick_region_compare_core(query, period, sort, api_key)
+    return _attach_ignored_params(result, ignored_params, "quick_region_compare")
+
+
+async def _quick_region_compare_core(
+    query: str, period: str = "latest", sort: str = "desc",
+    api_key: Optional[str] = None,
+) -> dict:
     key = _resolve_key(api_key)
     param = _lookup_quick(query)
     if not param:
