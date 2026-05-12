@@ -7,6 +7,9 @@ dist/
 dist-test/
 *.egg-info/
 *.whl
+node_modules/
+.npm-cache/
+npm-debug.log*
 
 # Local/generated verification artifacts
 answer_results_preview.md

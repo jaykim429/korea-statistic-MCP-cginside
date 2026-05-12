@@ -1,0 +1,33 @@
+{
+  "name": "kosis-analysis-mcp",
+  "version": "0.1.0",
+  "description": "Natural language KOSIS statistics MCP server wrapper",
+  "type": "module",
+  "bin": {
+    "kosis-analysis-mcp": "./bin/kosis-analysis-mcp.js"
+  },
+  "scripts": {
+    "start": "node ./bin/kosis-analysis-mcp.js",
+    "postinstall": "node ./scripts/npm-postinstall.js"
+  },
+  "keywords": [
+    "mcp",
+    "kosis",
+    "statistics",
+    "korea",
+    "claude"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "*.py",
+    "requirements.txt",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE"
+  ]
+}

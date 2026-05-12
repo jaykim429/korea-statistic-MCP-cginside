@@ -1,0 +1,13 @@
+{
+  "name": "kosis-analysis-marketplace",
+  "owner": {
+    "name": "jaykim429"
+  },
+  "plugins": [
+    {
+      "name": "kosis-analysis",
+      "source": "./",
+      "description": "KOSIS natural language statistics MCP server"
+    }
+  ]
+}

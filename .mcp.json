@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kosis-analysis": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/kosis-analysis-mcp.js"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

@@ -8,20 +8,23 @@ version = "0.1.0"
 description = "Natural language KOSIS statistics MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
 dependencies = [
   "mcp[cli]>=1.0.0",
   "httpx>=0.27.0",
   "numpy>=1.24.0",
   "scipy>=1.10.0",
+  "uvicorn[standard]>=0.30.0",
 ]
 
 [project.scripts]
 kosis-analysis-mcp = "kosis_mcp_server:main"
+kosis-analysis-mcp-http = "kosis_http_server:main"
 
 [tool.setuptools]
 py-modules = [
   "kosis_mcp_server",
+  "kosis_http_server",
   "kosis_curation",
   "kosis_charts_extra",
 ]
-
