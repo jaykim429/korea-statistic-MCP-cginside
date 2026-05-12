@@ -366,6 +366,16 @@ class NaturalLanguageAnswerEngine:
         return _route_query(query).to_agent_payload()
 
     @staticmethod
+    def _effective_region(route_payload: dict[str, Any], region: str) -> str:
+        """Use an explicit tool argument first, then a region parsed from the query."""
+        if region and region != "전국":
+            return region
+        slot_region = route_payload.get("slots", {}).get("region")
+        if isinstance(slot_region, str) and slot_region:
+            return slot_region
+        return region or "전국"
+
+    @staticmethod
     def _same_period(stats: list[AnswerStat]) -> bool:
         return len({s.period for s in stats}) == 1
 
@@ -610,17 +620,18 @@ class NaturalLanguageAnswerEngine:
 
     async def answer(self, query: str, region: str = "전국") -> dict[str, Any]:
         route_payload = self._route_payload(query)
+        effective_region = self._effective_region(route_payload, region)
         inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
         if self._is_sme_smallbiz_count_question(query):
-            return await self._answer_sme_smallbiz_counts(query, region)
+            return await self._answer_sme_smallbiz_counts(query, effective_region)
         if self._is_sme_employee_average_question(query):
-            return await self._answer_sme_employee_average(query, region)
+            return await self._answer_sme_employee_average(query, effective_region)
         if inferred_direct_key and self._is_region_compare_question(query):
             return await self._answer_region_compare(query, inferred_direct_key)
         if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
             route_payload["route"]["direct_stat_key"] = inferred_direct_key
         if route_payload["route"].get("direct_stat_key"):
-            return await self._answer_direct(query, region, inferred_direct_key, route_payload)
+            return await self._answer_direct(query, effective_region, inferred_direct_key, route_payload)
         return await self._answer_search_fallback(query, route_payload)
 
 
