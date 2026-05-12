@@ -416,6 +416,23 @@ chart_line("고령인구", region="전국", years=5)
 - `period_age_years`: 현재 시점 대비 경과 연수 (실수)
 - `검증_주의`: 1년 이상 경과한 데이터, 의도와 응답 유형 불일치 (RANKING/SHARE_RATIO/GROWTH_RATE/TIME_SERIES/AVERAGE), 명시 연도 미준수, 다지역 의도 누락, "기업 수 ↔ 사업체 수" 모집단 silent 매핑 등에 자동 경고 추가
 
+`quick_stat`·`quick_trend`·`quick_region_compare` 직접 호출도 0.4.0부터 동일하게 `used_period`/`period_age_years`/`⚠️ 데이터_신선도` 필드를 노출합니다. answer_query와 직접 호출의 메타 풍부도 비대칭을 해소했습니다.
+
+지원하지 않는 파라미터(`industry`, `scale`, `aggregation`, `group_by` 등 임의의 키)는 `⚠️ 무시된_파라미터` 필드에 노출되어 silent drop을 차단합니다.
+
+`period` 파라미터는 다음을 인식합니다:
+
+- 절대: `"2023"`, `"2023.04"`, `"2023년 4월"`, `"2025Q1"`, `"2025년 1분기"`
+- 상대: `"작년"`/`"지난해"`/`"전년"` → 현재년-1, `"올해"` → 현재년, `"재작년"` → 현재년-2
+
+요청한 분기·월 정밀도가 통계표의 작성 주기보다 세분화돼 있으면 응답에 `⚠️ 정밀도_다운그레이드`가 자동 첨부됩니다.
+
+`search_kosis` 응답은 `Tier_A_직접_매핑` 필드를 통해 같은 키워드에 검증된 Tier A 통계표가 있는지 표면화합니다 — KOSIS 검색 인덱스가 약하게 매칭된 통계표를 상위에 올리는 경우에도 정확한 매핑을 놓치지 않습니다.
+
+`STAT_CORRELATION`·`STAT_OUTLIER_DETECTION`·`STAT_FORECAST` 의도가 감지되면 `answer_query`는 `search_and_plan` 응답의 `추천_도구_호출` 필드에 `correlate_stats`/`detect_outliers`/`forecast_stat`의 호출 syntax를 명시합니다.
+
+차트 도구(`chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`, `chain_full_analysis`)는 SVG를 fenced ``` ```svg ``` ``` 블록에 담은 `TextContent`로 반환합니다 — MCP 표준이 `image/svg+xml` ImageContent를 받지 않아 발생하던 콘텐츠 포맷 오류를 회피.
+
 `answer` 자연어 텍스트는 다음 후처리를 거칩니다:
 
 - `X은(는)` 플레이스홀더 → 한글 받침에 따라 `은` 또는 `는` 선택

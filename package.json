@@ -1,6 +1,6 @@
 {
   "name": "kosis-analysis-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Natural language KOSIS statistics MCP server wrapper",
   "type": "module",
   "bin": {

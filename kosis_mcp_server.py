@@ -2066,11 +2066,22 @@ async def _quick_trend_core(
             latest_n=years,
         )
 
-    return {
+    series = [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data]
+    used_period = str(series[-1]["시점"]) if series else ""
+    age = NaturalLanguageAnswerEngine._period_age_years(used_period)
+    result = {
         "통계명": param.description, "지역": region, "단위": param.unit,
-        "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data],
+        "시계열": series,
         "데이터수": len(data), "통계표": param.tbl_nm,
+        "used_period": used_period,
+        "period_age_years": age,
     }
+    if age is not None and age >= 1.0:
+        result["⚠️ 데이터_신선도"] = (
+            f"시계열 최신 시점 {used_period} (약 {age:.1f}년 경과) — "
+            "최신 데이터가 아닐 수 있음"
+        )
+    return result
 
 
 @mcp.tool()
@@ -2160,15 +2171,25 @@ async def _quick_region_compare_core(
     reverse = sort != "asc"
     rows.sort(key=lambda r: r["원값"], reverse=reverse)
     latest_period = rows[0]["시점"] if rows else None
-    return {
+    used_period = str(latest_period or "")
+    age = NaturalLanguageAnswerEngine._period_age_years(used_period)
+    result = {
         "통계명": param.description,
         "시점": latest_period,
+        "used_period": used_period,
+        "period_age_years": age,
         "단위": param.unit,
         "정렬": "내림차순" if reverse else "오름차순",
         "지역수": len(rows),
         "표": rows,
         "출처": "통계청 KOSIS",
     }
+    if age is not None and age >= 1.0:
+        result["⚠️ 데이터_신선도"] = (
+            f"비교 기준 시점 {used_period} (약 {age:.1f}년 경과) — "
+            "최신 데이터가 아닐 수 있음"
+        )
+    return result
 
 
 @mcp.tool()
