@@ -1,10 +1,7 @@
 {
   "mcpServers": {
     "kosis-analysis": {
-      "command": "C:\\path\\to\\korea-statistic-MCP-cginside\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\path\\to\\korea-statistic-MCP-cginside\\kosis_mcp_server.py"
-      ],
+      "command": "kosis-analysis-mcp",
       "env": {
         "KOSIS_API_KEY": "YOUR_KOSIS_API_KEY"
       }

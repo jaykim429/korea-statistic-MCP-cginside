@@ -1952,5 +1952,10 @@ async def decode_error(error_code: str) -> dict:
 
 # ============================================================================
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point for `kosis-analysis-mcp`."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

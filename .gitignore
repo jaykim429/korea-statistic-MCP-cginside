@@ -2,6 +2,11 @@
 .venv/
 __pycache__/
 *.pyc
+build/
+dist/
+dist-test/
+*.egg-info/
+*.whl
 
 # Local/generated verification artifacts
 answer_results_preview.md
@@ -13,4 +18,3 @@ verification_applied_report.md
 # Temporary archives/backups
 files/
 files*.zip
-
