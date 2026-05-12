@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kosis-analysis": {
+      "command": "python",
+      "args": [
+        "C:\\Users\\admin1\\Documents\\MCP만들기\\kosis_mcp_server.py"
+      ],
+      "env": {
+        "KOSIS_API_KEY": "YOUR_KOSIS_API_KEY"
+      }
+    }
+  }
+}
+

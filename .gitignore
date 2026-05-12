@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Local/generated verification artifacts
+answer_results_preview.md
+answer_result_assets/
+tier_a_verification.json
+kosis_metadata_discovery.json
+verification_applied_report.md
+
+# Temporary archives/backups
+files/
+files*.zip
+
