@@ -95,7 +95,7 @@ PER_QUERY_TIMEOUT = 15.0
 async def _safe_search(query: str) -> dict:
     try:
         return await asyncio.wait_for(
-            search_kosis(query, max_results=5),
+            search_kosis(query, limit=5),
             timeout=PER_QUERY_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -105,22 +105,30 @@ async def _safe_search(query: str) -> dict:
 
 
 def _extract_candidates(result: dict) -> list[dict]:
-    """search_kosis 응답 구조에 따라 통계표 후보 리스트를 정규화."""
+    """search_kosis 응답: {"결과": [...]} — 통계표명/통계표ID/기관ID 포함."""
     if not isinstance(result, dict):
         return []
     if result.get("오류"):
         return [{"_error": result["오류"]}]
-    # 응답 키는 KOSIS MCP 구조에 따름. 통상 "검색결과", "tables", "results"
-    rows = result.get("검색결과") or result.get("tables") or result.get("results") or []
+    rows = result.get("결과") or []
+    tier_a = result.get("Tier_A_직접_매핑")
     out: list[dict] = []
+    if tier_a:
+        # Tier A 직접 매핑이 있으면 최상단에 표시 — 이미 큐레이션 보유
+        out.append({
+            "통계표ID":  tier_a.get("통계표ID"),
+            "기관ID":   tier_a.get("기관ID"),
+            "통계표명":  f"[Tier A 보유] {tier_a.get('통계표')}",
+            "수록기간":  None,
+        })
     for r in rows[:5]:
         if not isinstance(r, dict):
             continue
         out.append({
-            "통계표ID":  r.get("통계표ID") or r.get("tblId") or r.get("TBL_ID"),
-            "기관ID":   r.get("기관ID") or r.get("orgId") or r.get("ORG_ID"),
-            "통계표명":  r.get("통계표명") or r.get("tblNm") or r.get("TBL_NM"),
-            "수록기간":  r.get("수록기간") or r.get("PRD_DE"),
+            "통계표ID":  r.get("통계표ID"),
+            "기관ID":   r.get("기관ID"),
+            "통계표명":  r.get("통계표명"),
+            "수록기간":  r.get("수록기간"),
         })
     return out
 
