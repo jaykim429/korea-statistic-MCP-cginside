@@ -622,6 +622,75 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
 
 
 # ============================================================================
+# KSIC 산업 대분류 × 기업규모 × 지표 동적 확장
+# (Round 6 Step 2b — 중소기업/소상공인 영향 법률안 모니터링 디테일 보강)
+# ----------------------------------------------------------------------------
+# KOSIS DT_BR_A001/B001/C001 (시도별·산업중분류별·기업규모별 기업수/
+# 종사자수/매출액)은 동일한 분류 스키마를 공유 (objL1=KSIC 산업코드,
+# objL2=시도, objL3=기업규모). explore_industry_axes.py로 라이브 검증.
+# 18개 KSIC 섹션 × 3개 지표 = 54개 키워드를 dict literal 폭증 없이
+# 동적으로 채워 넣는다.
+# ============================================================================
+
+# (자연어 라벨, KOSIS objL1 산업코드). 'O.공공행정 및 국방' 섹션은
+# KOSIS가 중소기업 통계에서 노출하지 않아 18개로 마감.
+_KSIC_SECTIONS: list[tuple[str, str]] = [
+    ("농림어업",     "IM_A"),
+    ("광업",         "IM_B"),
+    ("제조업",       "IM_C"),
+    ("전기가스업",   "IM_D"),
+    ("수도하수업",   "IM_E"),
+    ("건설업",       "IM_F"),
+    ("도소매업",     "IM_G"),
+    ("운수창고업",   "IM_H"),
+    ("숙박음식점업", "IM_I"),
+    ("정보통신업",   "IM_J"),
+    ("금융보험업",   "IM_K"),
+    ("부동산업",     "IM_L"),
+    ("전문과학기술서비스업", "IM_M"),
+    ("사업지원서비스업", "IM_N"),
+    ("교육서비스업", "IM_P"),
+    ("보건복지업",   "IM_Q"),
+    ("예술스포츠업", "IM_R"),
+    ("협회수리개인서비스업", "IM_S"),
+]
+
+# 지표 라벨 → (tbl_id, KOSIS itm_id, 한국어 단위).
+# DT_BR_A001 = 기업수, B001 = 종사자수, C001 = 매출액 — explore_table
+# 통계표명으로 라이브 검증 후 매핑.
+_BR_METRICS: dict[str, tuple[str, str, str]] = {
+    "사업체수": ("DT_BR_A001", "T001", "개"),
+    "종사자수": ("DT_BR_B001", "T001", "명"),
+    "매출액":   ("DT_BR_C001", "T001", "억원"),
+}
+
+for _industry, _industry_code in _KSIC_SECTIONS:
+    for _metric, (_tbl, _itm, _unit) in _BR_METRICS.items():
+        _key = f"{_industry}_중소기업_{_metric}"
+        TIER_A_STATS[_key] = QuickStatParam(
+            org_id="142", tbl_id=_tbl,
+            tbl_nm=f"시도별·산업중분류별·기업규모별 {_metric}",
+            description=f"{_industry} 중소기업 {_metric}",
+            obj_l1=_industry_code,
+            obj_l2="15142C501",
+            obj_l3="T002",
+            item_id=_itm, unit=_unit,
+            region_scheme=REGION_BUSINESS,
+            region_obj="obj_l2",
+            supported_periods=("Y",),
+            verification_status="verified",
+            note=(
+                "동적 확장: KSIC objL1="
+                f"{_industry_code}, 기업규모=중소기업(T002). "
+                "explore_industry_axes.py 라이브 검증 (수록기간 2019~2023)."
+            ),
+        )
+
+# 사용된 임시 변수 정리 (모듈 최상위 namespace 오염 방지)
+del _industry, _industry_code, _metric, _tbl, _itm, _unit, _key
+
+
+# ============================================================================
 # 동의어 사전 — 자연어 → 정규 키
 # ============================================================================
 

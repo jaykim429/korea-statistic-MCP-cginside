@@ -193,6 +193,20 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"check_stat_live_period_present": True},
     },
     {
+        # Round 6 Step 2b: KSIC 동적 확장 라이브 검증 (제조업)
+        "name": "ksic_manufacturing_sme_sales",
+        "tool": quick_stat,
+        "args": ("제조업_중소기업_매출액", "전국", "latest"),
+        "expect": {"success": True, "region": "전국", "period": "2023"},
+    },
+    {
+        # Round 6 Step 2b: 음식점업도 라이브 동작하는지 (소상공인 우선 도메인)
+        "name": "ksic_food_sme_business_count",
+        "tool": quick_stat,
+        "args": ("숙박음식점업_중소기업_사업체수", "전국", "latest"),
+        "expect": {"success": True, "region": "전국", "period": "2023"},
+    },
+    {
         "name": "answer_top_5_sme_business_count",
         "tool": answer_query,
         "args": ("중소기업 사업체수가 가장 많은 5곳 알려줘",),
