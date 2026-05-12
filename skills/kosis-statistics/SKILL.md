@@ -21,6 +21,12 @@ policy/business interpretation.
 - Do not invent a single value when `answer_query` returns
   `NEEDS_TABLE_SELECTION`.
 - Preserve the result's 기준시점, 단위, 통계표, 출처, and 검증_주의 in the final answer.
+  Also surface `used_period` and `period_age_years` when present — they tell the
+  user which timepoint was actually consumed and how stale it is.
+- Treat `검증_주의` entries as load-bearing, not decoration. Entries that begin
+  with "요청 시작 시점 …", "사용 시점 … 경과", "의도 … 감지됐으나", or
+  "비교 대상 …" mean the answer did not fully satisfy the question; reflect
+  that uncertainty in the response instead of citing the number bare.
 - For correlation, regression, and policy-effect requests, state that
   correlation or before/after comparison does not prove causality.
 - For business counts, distinguish 기업 수, 사업체 수, and 자영업자 수.
