@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -235,6 +241,8 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "table_len": len(table),
         "share_pct": calc.get("비중_퍼센트"),
         "sum_regions": calc.get("포함_지역"),
+        "used_period": result.get("used_period"),
+        "period_age_years": result.get("period_age_years"),
     }
 
 
@@ -276,6 +284,8 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [r for r in expect["regions_in_sum"] if r not in regions]
         if missing:
             problems.append(f"missing_sum_regions={missing}")
+    if expect.get("status") == "executed" and summary["used_period"] in (None, ""):
+        problems.append("missing_used_period")
     return problems
 
 

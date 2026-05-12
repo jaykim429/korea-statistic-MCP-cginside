@@ -1096,6 +1096,10 @@ class NaturalLanguageAnswerEngine:
         }
 
     async def answer(self, query: str, region: str = "전국") -> dict[str, Any]:
+        result = await self._dispatch(query, region)
+        return self._finalize_response(result)
+
+    async def _dispatch(self, query: str, region: str) -> dict[str, Any]:
         route_payload = self._route_payload(query)
         effective_region = self._effective_region(route_payload, region)
         inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
@@ -1134,6 +1138,62 @@ class NaturalLanguageAnswerEngine:
         if route_payload["route"].get("direct_stat_key"):
             return await self._answer_direct(query, effective_region, inferred_direct_key, route_payload)
         return await self._answer_search_fallback(query, route_payload)
+
+    @staticmethod
+    def _period_age_years(period: str) -> Optional[float]:
+        if not period:
+            return None
+        text = str(period)
+        m = re.match(r"^(\d{4})(\d{2})?", text)
+        if not m:
+            return None
+        now = datetime.now()
+        year = int(m.group(1))
+        if m.group(2):
+            month = int(m.group(2))
+            age = (now.year - year) + (now.month - month) / 12.0
+        else:
+            age = float(now.year - year)
+        return round(age, 2)
+
+    @classmethod
+    def _extract_used_period(cls, result: dict[str, Any]) -> Optional[str]:
+        comparison = result.get("비교") or {}
+        end = (comparison.get("종료") or {}).get("시점")
+        if end:
+            return str(end)
+        rows = result.get("표") or []
+        for row in rows:
+            if isinstance(row, dict):
+                period = row.get("시점")
+                if period:
+                    return str(period)
+        period = result.get("시점")
+        if period:
+            return str(period)
+        return None
+
+    @classmethod
+    def _finalize_response(cls, result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return result
+        if result.get("상태") != "executed":
+            return result
+        used = result.get("used_period") or cls._extract_used_period(result)
+        if not used:
+            return result
+        result["used_period"] = str(used)
+        age = cls._period_age_years(used)
+        if age is None:
+            return result
+        result["period_age_years"] = age
+        if age >= 1.0:
+            notes = list(result.get("검증_주의") or [])
+            warn = f"사용 시점 {used} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음"
+            if warn not in notes:
+                notes.append(warn)
+            result["검증_주의"] = notes
+        return result
 
 
 # ============================================================================
