@@ -488,6 +488,8 @@ chart_line("고령인구", region="전국", years=5)
 
 Gemma 챗봇용 절차형 입구로 `plan_query(query)`가 추가되었습니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 즉 `answer_query`의 즉시 답변 경로에서 발생할 수 있는 silent failure를 줄이기 위한 계획 전용 도구입니다.
 
+Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)를 참고하세요. 기본 manifest에서는 `plan_query`, `explore_table`, `query_table`, `search_kosis`만 노출하고, `answer_query`·`quick_*`·`chart_*` 계열은 내부/전문가용으로 숨기는 구성을 권장합니다.
+
 `decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
 
 차트 도구(`chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`, `chain_full_analysis`)는 SVG를 fenced ``` ```svg ``` ``` 블록에 담은 `TextContent`로 반환합니다 — MCP 표준이 `image/svg+xml` ImageContent를 받지 않아 발생하던 콘텐츠 포맷 오류를 회피.
@@ -540,6 +542,7 @@ python scripts\natural_language_battery.py --summary-only
 - `kosis_http_server.py`: Streamable HTTP MCP 서버 엔트리포인트
 - `kosis_curation.py`: 자연어 라우터, Tier A/B 큐레이션, 개념 그래프
 - `kosis_charts_extra.py`: 추가 SVG 차트 헬퍼
+- `docs/chatbot_integration.md`: Gemma 챗봇용 통계 MCP 도구 manifest 및 일관성 규칙
 - `scripts/regression_smoke.py`, `scripts/eval_gemma_workflow.py`, `scripts/comprehensive_api_matrix.py`, `scripts/temporal_edge_cases.py`, `scripts/natural_language_battery.py`: 라이브 API/워크플로우 회귀 검증 스크립트
 - `pyproject.toml`: `kosis-analysis-mcp` 실행 명령과 패키지 메타데이터
 - `package.json`, `bin/`, `scripts/`: npx/npm wrapper
