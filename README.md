@@ -410,11 +410,17 @@ chart_line("고령인구", region="전국", years=5)
 
 - `status: "planned"`
 - `intent`: `single_value`, `trend`, `comparison`, `computed_indicator` 등
+- `analysis_mode`: `simple_lookup`, `analytical_single_metric`, `composite_analysis`, `needs_clarification`
 - `intended_dimensions`: 질문에서 감지한 `region`, `age`, `sex`, `time`, `industry` 등
-- `required_dimensions`: 후보 통계표가 반드시 가져야 할 분류축 의미
+- `table_required_dimensions`: 후보 통계표가 반드시 가져야 할 KOSIS 메타 축 의미 (`year`, `month`, `quarter` 같은 시간 단위는 축으로 넘기지 않고 `time_request.granularity`로 보존)
+- `semantic_dimensions`: LLM이 이해해야 할 의미 차원 (`regions`, `region_group`, `industry` 등)
 - `concepts`: 후속 `resolve_concepts`가 코드로 바꿀 자연어 개념
-- `suggested_workflow`: `select_table_for_query` → `resolve_concepts` → `query_table` → 필요 시 `compute_indicator`
+- `metrics`: 질문에서 요청된 지표 후보. availability는 `select_table_for_query`가 KOSIS 메타로 검증하기 전까지 `unknown`
+- `quarantined_metrics`: 라우터 오염 가능성이 있어 실행 계획에서 제외한 후보 (예: `GRDP` 질문에 섞인 `R&D 투자 규모`)
+- `analysis_tasks`: `trend`, `rank`, `per_capita`, `share_by_group`, `growth_rate`, `compare_metrics` 같은 후속 분석 의도
+- `evidence_workflow`: `select_table_for_query` → `resolve_concepts` → `query_table` → 필요 시 `compute_indicator`
 - `next_call`: Gemma가 그대로 따라갈 수 있는 다음 도구 호출 템플릿
+- `mcp_output_contract`: `final_answer_expected: false`, 실패/주의 마커, LLM guardrail을 기계적으로 노출
 
 `query_table` 응답은 raw extraction 전용입니다:
 
@@ -425,6 +431,14 @@ chart_line("고령인구", region="전국", years=5)
 - `rows[]`: KOSIS 원행을 기간·값·단위·분류 차원과 함께 반환
 
 잘못된 `OBJ_ID`나 `ITM_ID`가 들어오면 KOSIS 값을 호출하지 않고 `status: "unsupported"`, `validation_errors`, `suggested_codes`를 반환합니다.
+
+`plan_query`는 실패도 표면화합니다:
+
+- metric을 뽑지 못하면 `status: "needs_clarification"`과 `markers_present: ["needs_clarification", "missing_metrics"]`
+- 단순 lookup은 `analysis_mode: "simple_lookup"`과 빈 `analysis_tasks`
+- 단일 지표 추세/순위/산식은 `analysis_mode: "analytical_single_metric"`
+- 복수 지표·복수 task·다지역 비교는 `analysis_mode: "composite_analysis"`와 `evidence_bundle: true`
+- `월별`, `분기별`, `연도별` 같은 표현은 KOSIS 축이 아니라 시간 granularity로 보존됩니다.
 
 `answer_query` 응답 상태:
 
@@ -526,11 +540,21 @@ Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/
 ```powershell
 $env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
 python scripts\regression_smoke.py
+python scripts\eval_plan_query_pipeline.py
 python scripts\eval_gemma_workflow.py
 python scripts\comprehensive_api_matrix.py
 python scripts\temporal_edge_cases.py
 python scripts\natural_language_battery.py --summary-only
 ```
+
+`eval_plan_query_pipeline.py`는 Gemma용 `plan_query` 로컬 회귀 테스트입니다. 현재 31개 케이스가 포함되어 있으며 다음 패턴을 고정합니다:
+
+- metric 없음 / clarification 상태의 `mcp_output_contract.current_signals` false negative 차단
+- `year`, `month`, `quarter`가 KOSIS table axis로 흘러가지 않는지 확인
+- `simple_lookup` / `analytical_single_metric` / `composite_analysis` 모드와 `evidence_bundle` 일관성 확인
+- `PPI`, `GRDP`, `CPI` 같은 약어와 `치킨집 얼마나 있어?` 같은 일상어 개수 질의
+- `GRDP` ↔ `R&D 투자 규모` 라우터 오염 격리
+- top/bottom 순위, 기간 범위, 다지역 비교, 산식+순위 결합 회귀
 
 `eval_gemma_workflow.py`는 `plan_query` 중심의 Gemma 절차형 워크플로우 평가셋입니다. 다축 슬라이싱(2020년 서울 30대 여성), 1인당 GRDP, 광역시 고령화 비중, 영문 질의, CPI/GRDP 약어, 치킨집 폐업률 같은 seed case를 통해 필요한 차원·개념·후속 도구 순서가 유지되는지 확인합니다. `future_must_not_select_tables` 같은 필드는 다음 PR에서 `select_table_for_query`가 추가되면 거짓 양성 negative test로 승격할 수 있도록 남겨둔 기대값입니다.
 
