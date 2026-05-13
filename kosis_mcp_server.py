@@ -2807,7 +2807,7 @@ async def _quick_stat_core(
         if age is not None and age >= 1.0:
             result["⚠️ 데이터_신선도"] = (
                 f"사용 시점 {used_period} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음. "
-                "check_stat_availability로 통계표의 수록기간을 확인하세요."
+                f"수록기간 메타는 explore_table('{param.org_id}', '{param.tbl_id}')로 확인하세요."
             )
         if verification_warning:
             result["⚠️ 검증_상태"] = verification_warning

@@ -226,6 +226,17 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"error": True},
     },
     {
+        "name": "gdp_freshness_warning_uses_explore_table",
+        "tool": quick_stat,
+        "args": ("GDP", "전국", "latest"),
+        "expect": {
+            "success": True,
+            "period": "2023",
+            "freshness_contains": "explore_table",
+            "freshness_not_contains": "check_stat_availability",
+        },
+    },
+    {
         "name": "housing_price_monthly_stat",
         "tool": quick_stat,
         "args": ("주택매매가격지수", "전국", "latest"),
@@ -485,6 +496,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "dependency_key": result.get("dependency_key"),
         "target_group": result.get("대상군"),
         "matched_concepts": (result.get("route") or {}).get("matched_concepts") or [],
+        "freshness_warning": result.get("⚠️ 데이터_신선도"),
     }
 
 
@@ -547,6 +559,14 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         answer = str(summary.get("answer") or "")
         if expect["answer_not_contains"] in answer:
             problems.append(f"answer_unexpected={expect['answer_not_contains']!r}")
+    if "freshness_contains" in expect:
+        warning = str(summary.get("freshness_warning") or "")
+        if expect["freshness_contains"] not in warning:
+            problems.append(f"freshness_warning={warning!r}")
+    if "freshness_not_contains" in expect:
+        warning = str(summary.get("freshness_warning") or "")
+        if expect["freshness_not_contains"] in warning:
+            problems.append(f"freshness_warning_forbidden={warning!r}")
     if "share_pct" in expect:
         actual = summary.get("share_pct")
         if actual is None or abs(float(actual) - float(expect["share_pct"])) > 0.02:
