@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from kosis_mcp_server import (
     answer_query, check_stat_availability, explore_table, indicator_dependency_map,
-    quick_region_compare, quick_stat, quick_trend,
+    query_table, quick_region_compare, quick_stat, quick_trend,
 )
 
 
@@ -359,6 +359,28 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "query_table_raw_unemployment_rate",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["00"]}, ["2025", "2025"]),
+        "expect": {
+            "machine_status": "executed",
+            "verification_level": "explored_raw",
+            "aggregation": "none",
+            "period_type": "Y",
+            "row_count": 1,
+        },
+    },
+    {
+        "name": "query_table_invalid_item_rejected",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["BAD"], "A": ["00"]}, ["2025", "2025"]),
+        "expect": {
+            "machine_status": "unsupported",
+            "code": "UNVERIFIED_FORMULA",
+            "validation_errors_present": True,
+        },
+    },
+    {
         "name": "explore_table_industry_manufacturing_parent",
         "tool": explore_table,
         "args": ("142", "DT_BR_C001", "제조업"),
@@ -556,6 +578,11 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "matched_concepts": (result.get("route") or {}).get("matched_concepts") or [],
         "dropped_dimensions": result.get("dropped_dimensions") or result.get("누락_차원") or [],
         "freshness_warning": result.get("⚠️ 데이터_신선도"),
+        "verification_level": result.get("verification_level"),
+        "aggregation": result.get("aggregation"),
+        "row_count": result.get("row_count"),
+        "period_type": result.get("period_type"),
+        "validation_errors": result.get("validation_errors") or result.get("검증_오류") or [],
     }
 
 
@@ -582,6 +609,16 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"dependency_key={summary['dependency_key']}")
     if "target_group" in expect and summary["target_group"] != expect["target_group"]:
         problems.append(f"target_group={summary['target_group']}")
+    if "verification_level" in expect and summary["verification_level"] != expect["verification_level"]:
+        problems.append(f"verification_level={summary['verification_level']}")
+    if "aggregation" in expect and summary["aggregation"] != expect["aggregation"]:
+        problems.append(f"aggregation={summary['aggregation']}")
+    if "period_type" in expect and summary["period_type"] != expect["period_type"]:
+        problems.append(f"period_type={summary['period_type']}")
+    if "row_count" in expect and summary["row_count"] != expect["row_count"]:
+        problems.append(f"row_count={summary['row_count']}")
+    if expect.get("validation_errors_present") and not summary["validation_errors"]:
+        problems.append("validation_errors_missing")
     if "matched_concepts_contains" in expect:
         concepts = list(summary.get("matched_concepts") or [])
         if expect["matched_concepts_contains"] not in concepts:

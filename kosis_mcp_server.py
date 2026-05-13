@@ -307,6 +307,57 @@ def _pick_finest_period(period_rows: list[dict]) -> Optional[dict]:
     return sorted(period_rows, key=rank)[0]
 
 
+def _period_type(row: Optional[dict]) -> Optional[str]:
+    if not row:
+        return None
+    value = str(row.get("PRD_SE") or row.get("prdSe") or "").strip()
+    return value or None
+
+
+def _is_yearly_period_type(period_type: Optional[str]) -> bool:
+    return str(period_type or "").strip() in {"Y", "A", "\ub144", "year", "annual"}
+
+
+def _api_period_type(period_type: Optional[str]) -> Optional[str]:
+    value = str(period_type or "").strip()
+    aliases = {
+        "\uc6d4": "M",
+        "M": "M",
+        "MM": "M",
+        "\ubd84\uae30": "Q",
+        "Q": "Q",
+        "QQ": "Q",
+        "\ubc18\uae30": "H",
+        "H": "H",
+        "HF": "H",
+        "\ub144": "Y",
+        "\uc5f0": "Y",
+        "Y": "Y",
+        "A": "Y",
+    }
+    return aliases.get(value, value or None)
+
+
+def _period_range_looks_yearly(period_range: Optional[list[str]]) -> bool:
+    if not period_range:
+        return False
+    bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
+    return bool(bounds) and all(re.fullmatch(r"\d{4}", p) for p in bounds)
+
+
+def _pick_query_table_period_row(
+    period_rows: list[dict],
+    period_range: Optional[list[str]],
+) -> Optional[dict]:
+    if not period_rows:
+        return None
+    if _period_range_looks_yearly(period_range):
+        for row in period_rows:
+            if _is_yearly_period_type(_period_type(row)):
+                return row
+    return _pick_finest_period(period_rows)
+
+
 def _resolve_classification_term(
     term: str,
     classifications: list[dict],
@@ -375,6 +426,10 @@ def _resolve_classification_term(
         return None
     matches.sort(key=lambda pair: pair[0])
     return matches[0][1]
+
+
+def _kosis_view_url(org_id: str, tbl_id: str) -> str:
+    return f"https://kosis.kr/statHtml/statHtml.do?orgId={org_id}&tblId={tbl_id}"
 
 
 def _format_number(v: Any) -> str:
@@ -4587,6 +4642,388 @@ async def check_stat_availability(
                 "이 통계표가 갱신을 멈췄거나 갱신 주기가 깁니다."
             )
     return result
+
+
+def _build_axis_codebook(item_rows: list[dict]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    axes: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in item_rows:
+        obj_id = str(row.get("OBJ_ID") or "")
+        itm_id = str(row.get("ITM_ID") or "")
+        if not obj_id or not itm_id:
+            continue
+        if obj_id not in axes:
+            axes[obj_id] = {
+                "OBJ_NM": row.get("OBJ_NM"),
+                "OBJ_NM_ENG": row.get("OBJ_NM_ENG"),
+                "items": {},
+            }
+            order.append(obj_id)
+        axes[obj_id]["items"][itm_id] = {
+            "code": itm_id,
+            "label": row.get("ITM_NM"),
+            "label_en": row.get("ITM_NM_ENG"),
+            "unit": row.get("UNIT_NM"),
+            "parent": row.get("UP_ITM_ID"),
+        }
+    return axes, order
+
+
+def _suggest_axis_codes(axis: dict[str, Any], bad_code: str, limit: int = 8) -> list[dict[str, Any]]:
+    items = axis.get("items") or {}
+    bad_norm = _compact_text(bad_code)
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for code, meta in items.items():
+        label = str(meta.get("label") or "")
+        label_norm = _compact_text(label)
+        score = 3
+        if bad_code == code:
+            score = 0
+        elif bad_norm and (bad_norm in _compact_text(code) or bad_norm in label_norm):
+            score = 1
+        elif bad_norm and any(part and part in label_norm for part in re.split(r"[^0-9A-Za-z가-힣]+", bad_norm)):
+            score = 2
+        scored.append((score, code, meta))
+    scored.sort(key=lambda row: (row[0], len(str(row[2].get("label") or "")), row[1]))
+    return [
+        {"code": code, "label": meta.get("label"), "unit": meta.get("unit")}
+        for _, code, meta in scored[:limit]
+    ]
+
+
+def _validate_query_table_filters(
+    filters: dict[str, Any],
+    axes: dict[str, dict[str, Any]],
+    axis_order: list[str],
+) -> tuple[Optional[dict[str, list[str]]], list[dict[str, Any]], dict[str, list[str]]]:
+    if not isinstance(filters, dict):
+        return None, [{"오류": "filters는 {OBJ_ID: [ITM_ID, ...]} 형식의 객체여야 합니다."}], {}
+
+    normalized: dict[str, list[str]] = {}
+    errors: list[dict[str, Any]] = []
+    auto_defaults: dict[str, list[str]] = {}
+
+    for axis_id, raw_codes in filters.items():
+        axis = str(axis_id)
+        if axis not in axes:
+            errors.append({
+                "axis": axis,
+                "오류": "존재하지 않는 분류축",
+                "available_axes": [
+                    {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM")}
+                    for obj_id in axis_order
+                ],
+            })
+            continue
+        codes = raw_codes if isinstance(raw_codes, list) else [raw_codes]
+        clean_codes = [str(code) for code in codes if str(code or "").strip()]
+        if not clean_codes:
+            errors.append({"axis": axis, "오류": "비어 있는 필터 코드"})
+            continue
+        items = axes[axis]["items"]
+        for code in clean_codes:
+            if code not in items:
+                errors.append({
+                    "axis": axis,
+                    "code": code,
+                    "오류": "분류축에 없는 ITM_ID",
+                    "suggested_codes": _suggest_axis_codes(axes[axis], code),
+                })
+        normalized[axis] = clean_codes
+
+    item_axis = "ITEM" if "ITEM" in axes else None
+    if item_axis and item_axis not in normalized:
+        item_codes = list((axes[item_axis].get("items") or {}).keys())
+        if len(item_codes) == 1:
+            normalized[item_axis] = [item_codes[0]]
+            auto_defaults[item_axis] = [item_codes[0]]
+        else:
+            errors.append({
+                "axis": item_axis,
+                "오류": "ITEM 축은 명시해야 합니다.",
+                "suggested_codes": _suggest_axis_codes(axes[item_axis], ""),
+            })
+
+    for axis in axis_order:
+        if axis == "ITEM" or axis in normalized:
+            continue
+        axis_codes = list((axes[axis].get("items") or {}).keys())
+        if len(axis_codes) == 1:
+            normalized[axis] = [axis_codes[0]]
+            auto_defaults[axis] = [axis_codes[0]]
+        else:
+            errors.append({
+                "axis": axis,
+                "오류": "다중 값을 가진 분류축은 명시해야 합니다. 전체 조회가 필요하면 원하는 ITM_ID들을 모두 전달하세요.",
+                "suggested_codes": _suggest_axis_codes(axes[axis], ""),
+            })
+
+    if errors:
+        return None, errors, auto_defaults
+    return normalized, [], auto_defaults
+
+
+def _query_table_params(
+    org_id: str,
+    tbl_id: str,
+    filters: dict[str, list[str]],
+    axis_order: list[str],
+    period_range: Optional[list[str]],
+    period_type: Optional[str],
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "method": "getList",
+        "apiKey": None,
+        "orgId": org_id,
+        "tblId": tbl_id,
+        "format": "json",
+        "jsonVD": "Y",
+    }
+    if period_type:
+        params["prdSe"] = period_type
+    data_axis_index = 0
+    for axis in axis_order:
+        if axis != "ITEM":
+            data_axis_index += 1
+        codes = filters.get(axis)
+        if not codes:
+            continue
+        value = ",".join(codes)
+        if axis == "ITEM":
+            params["itmId"] = value
+        else:
+            params[f"objL{data_axis_index}"] = value
+    if period_range:
+        bounds = [str(p) for p in period_range if str(p or "").strip()]
+        if len(bounds) == 1:
+            params["startPrdDe"] = bounds[0]
+            params["endPrdDe"] = bounds[0]
+        elif len(bounds) >= 2:
+            params["startPrdDe"] = bounds[0]
+            params["endPrdDe"] = bounds[1]
+    return params
+
+
+def _normalize_query_table_rows(
+    rows: list[dict],
+    filters: dict[str, list[str]],
+    axes: dict[str, dict[str, Any]],
+    axis_order: list[str],
+) -> list[dict[str, Any]]:
+    normalized_rows: list[dict[str, Any]] = []
+    data_axis_index = 0
+    data_axis_map: dict[int, str] = {}
+    for axis in axis_order:
+        if axis == "ITEM":
+            continue
+        data_axis_index += 1
+        if filters.get(axis):
+            data_axis_map[data_axis_index] = axis
+
+    for row in rows:
+        dimensions: dict[str, Any] = {}
+        item_code = str(row.get("ITM_ID") or row.get("ITM_ID1") or "")
+        item_label = row.get("ITM_NM")
+        if "ITEM" in axes:
+            if item_code in axes["ITEM"]["items"]:
+                meta = axes["ITEM"]["items"][item_code]
+                item_label = item_label or meta.get("label")
+                dimensions["ITEM"] = {"code": item_code, "label": item_label, "unit": meta.get("unit")}
+            elif len(filters.get("ITEM", [])) == 1:
+                code = filters["ITEM"][0]
+                meta = axes["ITEM"]["items"].get(code, {})
+                dimensions["ITEM"] = {"code": code, "label": meta.get("label"), "unit": meta.get("unit")}
+
+        for idx, axis in data_axis_map.items():
+            code = str(row.get(f"C{idx}") or "")
+            label = row.get(f"C{idx}_NM")
+            if not code and len(filters.get(axis, [])) == 1:
+                code = filters[axis][0]
+            meta = (axes.get(axis, {}).get("items") or {}).get(code, {})
+            dimensions[axis] = {
+                "code": code,
+                "label": label or meta.get("label"),
+                "unit": meta.get("unit"),
+            }
+
+        normalized_rows.append({
+            "period": row.get("PRD_DE"),
+            "value": row.get("DT"),
+            "unit": row.get("UNIT_NM") or (dimensions.get("ITEM") or {}).get("unit"),
+            "dimensions": dimensions,
+            "raw": row,
+        })
+    return normalized_rows
+
+
+@mcp.tool()
+async def query_table(
+    org_id: str,
+    tbl_id: str,
+    filters: dict[str, Any],
+    period_range: Optional[list[str]] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🧪] 검증된 메타 코드로 KOSIS 표를 raw 조회한다.
+
+    filters는 explore_table이 반환한 OBJ_ID와 ITM_ID만 받는다. 여러 코드를
+    넘겨도 합산/평균을 하지 않고 KOSIS 원행을 개별 rows로 반환한다.
+    """
+    if not org_id or not tbl_id:
+        return {
+            "상태": "failed",
+            "status": "unsupported",
+            "error": "org_id and tbl_id are required.",
+            "오류": "org_id와 tbl_id가 필요합니다.",
+        }
+
+    key = _resolve_key(api_key)
+    fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    async with httpx.AsyncClient() as client:
+        try:
+            name_rows, item_rows, period_rows = await asyncio.gather(
+                _fetch_meta(client, key, org_id, tbl_id, "TBL"),
+                _fetch_meta(client, key, org_id, tbl_id, "ITM"),
+                _fetch_meta(client, key, org_id, tbl_id, "PRD"),
+            )
+        except Exception as exc:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": STATUS_STAT_NOT_FOUND,
+                "code": STATUS_STAT_NOT_FOUND,
+                "error": f"Metadata lookup failed: {exc}",
+                "오류": f"메타 조회 실패: {exc}",
+                "기관ID": org_id,
+                "통계표ID": tbl_id,
+                "org_id": org_id,
+                "tbl_id": tbl_id,
+            }
+
+        if not isinstance(item_rows, list) or not item_rows:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": STATUS_STAT_NOT_FOUND,
+                "code": STATUS_STAT_NOT_FOUND,
+                "error": "No classification metadata is available, so raw extraction cannot be verified.",
+                "오류": "분류축 메타가 없어 raw 호출을 검증할 수 없습니다.",
+                "기관ID": org_id,
+                "통계표ID": tbl_id,
+                "org_id": org_id,
+                "tbl_id": tbl_id,
+            }
+
+        axes, axis_order = _build_axis_codebook(item_rows)
+        normalized_filters, errors, auto_defaults = _validate_query_table_filters(filters, axes, axis_order)
+        metadata_source = {
+            "org_id": org_id,
+            "tbl_id": tbl_id,
+            "source": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD",
+            "fetched_at": fetched_at,
+            "metadata_tool": "explore_table",
+            "url": _kosis_view_url(org_id, tbl_id),
+        }
+        if errors or normalized_filters is None:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": STATUS_UNVERIFIED_FORMULA,
+                "code": STATUS_UNVERIFIED_FORMULA,
+                "error": "filters validation failed",
+                "오류": "filters 검증 실패",
+                "검증_오류": errors,
+                "validation_errors": errors,
+                "available_axes": [
+                    {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM")}
+                    for obj_id in axis_order
+                ],
+                "metadata_source": metadata_source,
+            }
+
+        selected_period = _pick_query_table_period_row(period_rows, period_range) if isinstance(period_rows, list) else None
+        period_type_label = _period_type(selected_period)
+        period_type = _api_period_type(period_type_label)
+        effective_period_range = period_range
+        auto_default_period_range: Optional[list[str]] = None
+        if not effective_period_range and selected_period and selected_period.get("END_PRD_DE"):
+            end_period = str(selected_period.get("END_PRD_DE"))
+            effective_period_range = [end_period, end_period]
+            auto_default_period_range = effective_period_range
+
+        params = _query_table_params(
+            org_id,
+            tbl_id,
+            normalized_filters,
+            axis_order,
+            effective_period_range,
+            period_type,
+        )
+        params["apiKey"] = key
+        try:
+            rows = await _kosis_call(client, "Param/statisticsParameterData.do", params)
+        except Exception as exc:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": STATUS_RUNTIME_ERROR,
+                "code": STATUS_RUNTIME_ERROR,
+                "error": f"KOSIS raw extraction failed: {exc}",
+                "오류": f"KOSIS raw 호출 실패: {exc}",
+                "filters_used": normalized_filters,
+                "aggregation": "none",
+                "metadata_source": metadata_source,
+            }
+
+    table_name = None
+    table_name_eng = None
+    if isinstance(name_rows, list) and name_rows:
+        table_name = name_rows[0].get("TBL_NM") or name_rows[0].get("tblNm")
+        table_name_eng = name_rows[0].get("TBL_NM_ENG") or name_rows[0].get("tblNmEng")
+    latest_period = selected_period
+    normalized_rows = _normalize_query_table_rows(rows, normalized_filters, axes, axis_order)
+    return {
+        "상태": "executed",
+        "status": "executed",
+        "verification_level": "explored_raw",
+        "confidence": "medium",
+        "aggregation": "none",
+        "기관ID": org_id,
+        "통계표ID": tbl_id,
+        "통계표명": table_name,
+        "통계표명_영문": table_name_eng,
+        "org_id": org_id,
+        "tbl_id": tbl_id,
+        "table_name": table_name,
+        "table_name_en": table_name_eng,
+        "filters_used": normalized_filters,
+        "auto_default_filters": auto_defaults,
+        "period_range": effective_period_range,
+        "period_type": period_type,
+        "period_type_label": period_type_label,
+        "auto_default_period_range": auto_default_period_range,
+        "rows": normalized_rows,
+        "row_count": len(normalized_rows),
+        "metadata_source": metadata_source,
+        "수록기간": {
+            "주기": latest_period.get("PRD_SE") if latest_period else None,
+            "시작_수록시점": latest_period.get("STRT_PRD_DE") if latest_period else None,
+            "최신_수록시점": latest_period.get("END_PRD_DE") if latest_period else None,
+        } if latest_period else None,
+        "period_metadata": {
+            "cadence": latest_period.get("PRD_SE") if latest_period else None,
+            "start_period": latest_period.get("STRT_PRD_DE") if latest_period else None,
+            "latest_period": latest_period.get("END_PRD_DE") if latest_period else None,
+        } if latest_period else None,
+        "주의": [
+            "query_table은 raw extraction 도구입니다. 합산·평균·비율·해석을 수행하지 않습니다.",
+            "confidence는 값의 품질이 아니라 코드 매핑과 호출 조건의 검증 수준입니다.",
+        ],
+        "warnings": [
+            "query_table is a raw extraction tool. It does not aggregate, average, calculate ratios, or interpret values.",
+            "confidence describes mapping and call-condition verification, not statistical data quality.",
+        ],
+    }
 
 
 @mcp.tool()
