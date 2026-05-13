@@ -100,6 +100,14 @@ FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
         "checks": ["기업체 기준과 사업체 기준 혼합 여부", "동일 기준시점", "동일 대상 범위"],
         "caution": "사업체 수와 기업 수는 집계 단위가 다르므로 평균 산식에 섞으면 안 됩니다.",
     },
+    "unemployment_rate": {
+        "canonical": "실업률",
+        "aliases": ["실업률", "청년 실업률", "고령층 실업률", "여성 실업률", "남성 실업률"],
+        "formula": "실업자 수 / 경제활동인구 * 100",
+        "required_stats": ["실업자 수", "경제활동인구"],
+        "checks": ["대상군(연령·성별) 일치", "경제활동인구 분모", "동일 기준시점"],
+        "caution": "청년·여성 등 부분군 실업률은 분자와 분모를 같은 대상군으로 제한해야 합니다.",
+    },
     "closure_rate": {
         "canonical": "폐업률",
         "aliases": ["폐업률", "폐업 비율", "망한 가게 비율"],
@@ -3952,10 +3960,18 @@ async def stat_time_compare(
 async def indicator_dependency_map(indicator: str) -> dict:
     """[🧭] 비중·증가율·폐업률 등 산식형 지표의 필요 통계와 검증 포인트 안내."""
     q = _compact_text(indicator)
+    subgroup_terms = [
+        ("청년", "청년"),
+        ("청소년", "청소년"),
+        ("고령", "고령층"),
+        ("노인", "고령층"),
+        ("여성", "여성"),
+        ("남성", "남성"),
+    ]
     for key, spec in FORMULA_DEPENDENCIES.items():
         aliases = [spec["canonical"], *spec.get("aliases", [])]
         if any(_compact_text(alias) in q or q in _compact_text(alias) for alias in aliases):
-            return {
+            result = {
                 "상태": "mapped",
                 "코드": STATUS_EXECUTED,
                 "입력": indicator,
@@ -3966,6 +3982,19 @@ async def indicator_dependency_map(indicator: str) -> dict:
                 "검증_포인트": spec["checks"],
                 "주의": spec["caution"],
             }
+            subgroup = next((label for term, label in subgroup_terms if term in indicator), None)
+            if subgroup and key == "unemployment_rate":
+                result["대상군"] = subgroup
+                result["부분군_적용"] = (
+                    f"{subgroup} 실업률은 같은 산식을 쓰되, 분자=실업자 수와 "
+                    f"분모=경제활동인구를 모두 {subgroup} 대상군으로 제한해야 합니다."
+                )
+                result["추천_검색어"] = [
+                    f"{subgroup} 실업률",
+                    f"{subgroup} 실업자",
+                    f"{subgroup} 경제활동인구",
+                ]
+            return result
 
     route_payload = _route_query(indicator).to_agent_payload()
     return {

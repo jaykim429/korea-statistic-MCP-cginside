@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from kosis_mcp_server import (
-    answer_query, check_stat_availability, explore_table,
+    answer_query, check_stat_availability, explore_table, indicator_dependency_map,
     quick_region_compare, quick_stat, quick_trend,
 )
 
@@ -312,6 +312,17 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"check_stat_live_period_present": True},
     },
     {
+        "name": "indicator_dependency_youth_unemployment",
+        "tool": indicator_dependency_map,
+        "args": ("청년 실업률",),
+        "expect": {
+            "status": "mapped",
+            "code": "EXECUTED",
+            "dependency_key": "unemployment_rate",
+            "target_group": "청년",
+        },
+    },
+    {
         # Round 6 Step 2b: KSIC 동적 확장 라이브 검증 (제조업)
         "name": "ksic_manufacturing_sme_sales",
         "tool": quick_stat,
@@ -438,6 +449,8 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "period_age_years": result.get("period_age_years"),
         "used_search_terms": result.get("사용된_검색어") or [],
         "slot_enrichment": result.get("검색어_슬롯보강"),
+        "dependency_key": result.get("dependency_key"),
+        "target_group": result.get("대상군"),
     }
 
 
@@ -458,6 +471,10 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"code={summary['code']}")
     if "direct_key" in expect and summary["direct_key"] != expect["direct_key"]:
         problems.append(f"direct_key={summary['direct_key']}")
+    if "dependency_key" in expect and summary["dependency_key"] != expect["dependency_key"]:
+        problems.append(f"dependency_key={summary['dependency_key']}")
+    if "target_group" in expect and summary["target_group"] != expect["target_group"]:
+        problems.append(f"target_group={summary['target_group']}")
     if "region" in expect and summary["region"] != expect["region"]:
         problems.append(f"region={summary['region']}")
     if "period" in expect and str(summary["period"]) != expect["period"]:
