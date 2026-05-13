@@ -387,6 +387,15 @@ def _format_number(v: Any) -> str:
         return str(v)
 
 
+def _format_display_number(v: Any, decimals: Optional[int] = None) -> str:
+    if decimals is None:
+        return _format_number(v)
+    try:
+        return f"{float(v):,.{decimals}f}"
+    except (ValueError, TypeError):
+        return str(v)
+
+
 def _compact_text(text: str) -> str:
     return re.sub(r"[\s_\-·/()]+", "", str(text)).lower()
 
@@ -2809,7 +2818,7 @@ async def _quick_stat_core(
         age = NaturalLanguageAnswerEngine._period_age_years(used_period)
         answer_text = NaturalLanguageAnswerEngine._polish_answer_text(
             f"{period_label} {region}의 {param.description}은(는) "
-            f"{_format_number(row.get('DT'))} {param.unit}입니다."
+            f"{_format_display_number(row.get('DT'), param.display_decimals)} {param.unit}입니다."
         )
         result = {
             "answer": answer_text,

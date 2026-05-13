@@ -116,6 +116,17 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "life_expectancy_display_rounding",
+        "tool": quick_stat,
+        "args": ("기대수명", "전국", "latest"),
+        "expect": {
+            "success": True,
+            "unit": "년",
+            "answer_contains": "83.7 년",
+            "answer_not_contains": "83.693 년",
+        },
+    },
+    {
         "name": "answer_busan_sme_sales_trend",
         "tool": answer_query,
         "args": ("부산 중소기업 매출액 최근 5년 추이 보여줘",),

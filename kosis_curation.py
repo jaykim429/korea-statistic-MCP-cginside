@@ -210,6 +210,7 @@ class QuickStatParam:
     obj_l2_list: tuple[str, ...] = ()      # 여러 분류값을 합산해야 하는 계산형 통계
     aggregation: Optional[Literal["sum"]] = None
     supported_periods: tuple = ("Y",)     # ('Y', 'Q', 'M') 등
+    display_decimals: Optional[int] = None # 답변 텍스트 표시용 소수 자릿수
     verification_status: VerificationStatus = "verified"
     note: str = ""                        # 메모/특이사항
 
@@ -287,6 +288,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         tbl_nm="생명표",
         description="기대수명 (0세 기대여명)",
         obj_l1="050", item_id="T6", unit="년",
+        display_decimals=1,
         verification_status="verified",
         note="검증 OK (2024년 83.69년)",
     ),
