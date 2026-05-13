@@ -308,25 +308,64 @@ def _resolve_classification_term(
     Returns the full row (including ITM_ID for use as objL*/itmId in
     quick_stat) or None when no match is found. Pass obj_id to narrow
     to a specific classification axis (e.g. an industry axis vs a region
-    axis on the same table). Matching is whitespace-stripped substring
-    so the caller does not need exact KOSIS phrasing."""
+    axis on the same table). Prefer exact normalized labels after removing
+    KOSIS code/range adornments (e.g. "C.제조업(10~34)" -> "제조업")
+    before falling back to substring matches."""
     if not term:
         return None
     normalized = re.sub(r"\s+", "", term).lower()
+
+    def normalize_label(value: Any) -> str:
+        return re.sub(r"\s+", "", str(value or "")).lower()
+
+    def canonical_label(value: Any) -> str:
+        label = normalize_label(value)
+        label = re.sub(r"^[a-z]\.", "", label)
+        label = re.sub(r"^\d+[.)]?", "", label)
+        label = re.sub(r"\([^)]*\)", "", label)
+        return label.strip()
+
+    def is_parent(row: dict) -> bool:
+        return not str(row.get("UP_ITM_ID") or "").strip()
+
+    def score(row: dict) -> Optional[tuple[int, int, int, str]]:
+        itm_id = normalize_label(row.get("ITM_ID"))
+        label = normalize_label(row.get("ITM_NM"))
+        canonical = canonical_label(row.get("ITM_NM"))
+        if not label and not itm_id:
+            return None
+
+        parent_bonus = 0 if is_parent(row) else 1
+        if itm_id == normalized:
+            rank = 0
+        elif canonical == normalized:
+            rank = 1
+        elif label == normalized:
+            rank = 2
+        elif canonical.startswith(normalized):
+            rank = 3
+        elif label.startswith(normalized):
+            rank = 4
+        elif normalized in canonical:
+            rank = 5
+        elif normalized in label:
+            rank = 6
+        else:
+            return None
+        return (rank, parent_bonus, len(canonical or label), label)
+
     candidates = classifications
     if obj_id:
         candidates = [c for c in classifications if str(c.get("OBJ_ID") or "") == str(obj_id)]
-    matches: list[dict] = []
+    matches: list[tuple[tuple[int, int, int, str], dict]] = []
     for row in candidates:
-        nm = re.sub(r"\s+", "", str(row.get("ITM_NM") or "")).lower()
-        if not nm:
-            continue
-        if nm == normalized or normalized in nm:
-            matches.append(row)
+        row_score = score(row)
+        if row_score is not None:
+            matches.append((row_score, row))
     if not matches:
         return None
-    matches.sort(key=lambda r: len(str(r.get("ITM_NM") or "")))
-    return matches[0]
+    matches.sort(key=lambda pair: pair[0])
+    return matches[0][1]
 
 
 def _format_number(v: Any) -> str:

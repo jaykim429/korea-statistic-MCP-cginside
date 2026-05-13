@@ -187,6 +187,18 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"explore_table_has_classifications": True},
     },
     {
+        "name": "explore_table_industry_manufacturing_parent",
+        "tool": explore_table,
+        "args": ("142", "DT_BR_C001", "제조업"),
+        "expect": {"resolved_industry_itm_id": "IM_C"},
+    },
+    {
+        "name": "explore_table_industry_beverage_child",
+        "tool": explore_table,
+        "args": ("142", "DT_BR_C001", "음료 제조업"),
+        "expect": {"resolved_industry_itm_id": "IM_C_11"},
+    },
+    {
         "name": "check_stat_availability_live_period",
         "tool": check_stat_availability,
         "args": ("실업률", True),
@@ -331,6 +343,10 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         axes = (result or {}).get("분류축") or {}
         if not isinstance(axes, dict) or not axes:
             problems.append("explore_table_no_classifications")
+    if "resolved_industry_itm_id" in expect:
+        resolved = (result or {}).get("resolved_industry") or {}
+        if resolved.get("ITM_ID") != expect["resolved_industry_itm_id"]:
+            problems.append(f"resolved_industry_itm_id={resolved.get('ITM_ID')}")
     if expect.get("check_stat_live_period_present"):
         live = (result or {}).get("라이브_수록기간") or {}
         if not isinstance(live, dict) or not live.get("최신_수록시점"):
