@@ -399,6 +399,26 @@ def _parse_year_token(text: str) -> Optional[str]:
     return None
 
 
+def _is_latest_period_text(text: Any) -> bool:
+    if text is None:
+        return True
+    compact = re.sub(r"\s+", "", str(text)).lower()
+    return compact in {
+        "",
+        "latest",
+        "최근",
+        "최신",
+        "가장최근",
+        "제일최근",
+        "최근값",
+        "최신값",
+        "최신치",
+        "최근시점",
+        "최신시점",
+        "현재",
+    }
+
+
 def _relative_year(compact_text: str) -> Optional[int]:
     """Resolve 재작년/작년/올해/금년 references to an absolute year."""
     if not compact_text:
@@ -502,7 +522,7 @@ def _detect_half_year_request(text: str) -> Optional[str]:
 
 def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Optional[str]]:
     """Convert natural period text into KOSIS start/end period codes."""
-    if not period or period == "latest":
+    if _is_latest_period_text(period):
         return None, None
 
     # Parse finer-grained tokens first even when the target table is annual.
@@ -2633,8 +2653,10 @@ async def _quick_stat_core(
         region = canonical
 
         period_type = _default_period_type(param)
-        range_start = _extract_open_start_year(period)
-        if period != "latest" and range_start:
+        effective_period = "latest" if _is_latest_period_text(period) else period
+        latest_alias = str(period) if str(period) != "latest" and effective_period == "latest" else None
+        range_start = _extract_open_start_year(effective_period)
+        if effective_period != "latest" and range_start:
             years_hint = max(1, datetime.now().year - int(range_start) + 1)
             return {
                 "상태": "failed",
@@ -2652,10 +2674,10 @@ async def _quick_stat_core(
                     f"answer_query('{range_start}년부터 {query} 추이')",
                 ],
             }
-        start_period, end_period = _period_bounds(period, period_type)
-        precision_downgrade = _detect_precision_downgrade(period, period_type)
-        half_year_advisory = _detect_half_year_request(period)
-        if period != "latest" and not start_period:
+        start_period, end_period = _period_bounds(effective_period, period_type)
+        precision_downgrade = _detect_precision_downgrade(effective_period, period_type)
+        half_year_advisory = _detect_half_year_request(effective_period)
+        if effective_period != "latest" and not start_period:
             return {
                 "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
                 "통계표": param.tbl_nm,
@@ -2727,6 +2749,8 @@ async def _quick_stat_core(
             result["⚠️ 정밀도_다운그레이드"] = precision_downgrade
         if half_year_advisory:
             result["⚠️ 상하반기"] = half_year_advisory
+        if latest_alias:
+            result["⚠️ 기간_해석"] = f"'{latest_alias}' → latest로 해석"
         # Population-mismatch warning previously fired only through
         # answer_query's _finalize_response. Direct quick_stat callers
         # were getting silent label substitution — close that gap so
@@ -2913,8 +2937,9 @@ async def _quick_region_compare_core(
         }
 
     period_type = _default_period_type(param)
-    start_period, end_period = _period_bounds(period, period_type)
-    if period != "latest" and not start_period:
+    effective_period = "latest" if _is_latest_period_text(period) else period
+    start_period, end_period = _period_bounds(effective_period, period_type)
+    if effective_period != "latest" and not start_period:
         return {
             "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
             "통계표": param.tbl_nm,

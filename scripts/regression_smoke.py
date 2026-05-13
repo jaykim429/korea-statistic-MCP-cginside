@@ -93,6 +93,18 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"success": True, "region": "전국", "period": "2023"},
     },
     {
+        "name": "quick_stat_recent_period_alias",
+        "tool": quick_stat,
+        "args": ("중소기업 매출액", "전국", "최근"),
+        "expect": {"success": True, "region": "전국", "period": "2023"},
+    },
+    {
+        "name": "quick_stat_most_recent_period_alias",
+        "tool": quick_stat,
+        "args": ("중소기업 매출액", "전국", "가장 최근"),
+        "expect": {"success": True, "region": "전국", "period": "2023"},
+    },
+    {
         "name": "answer_busan_sme_sales_trend",
         "tool": answer_query,
         "args": ("부산 중소기업 매출액 최근 5년 추이 보여줘",),
