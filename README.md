@@ -1,15 +1,17 @@
 # KOSIS Natural Language MCP Server
 
 KOSIS OpenAPI를 자연어 질의, 통계 조회, 분석, SVG 시각화로 연결하는 MCP 서버입니다.  
-챗봇에서는 우선 `answer_query`를 호출하면 됩니다. 정밀 매핑된 Tier A 통계는 바로 API 조회하고, AI/풍력/건설/소상공인 폐업률처럼 후보 선택이 필요한 복합 질의는 KOSIS 검색 후보와 분석 계획을 반환합니다.
+Gemma 같은 로컬 LLM 챗봇에서는 `plan_query`로 질문을 절차형 워크플로우로 분해한 뒤 `query_table` 같은 raw 도구로 조회하는 흐름을 권장합니다. 기존 `answer_query`는 검증된 Tier A 단순 질의를 빠르게 처리하는 호환 도구로 유지됩니다.
 
 ## 주요 기능
 
+- 절차형 계획: `plan_query`가 자연어 질문을 차원, 개념, 다음 도구 호출 템플릿으로 분해
+- Raw 조회: `query_table`이 `explore_table` 메타로 검증된 OBJ_ID/ITM_ID만 받아 KOSIS 원행을 반환
 - 자연어 라우팅: 동의어, 하위어, 상위어, 관점어 기반 검색어 생성
 - 직접 조회: 인구, 출산율, 실업률, 자영업자, 중소기업·소상공인 핵심 지표 등 Tier A
 - 분석: 추세, 변화율, 상관, 예측, 이상치, 기간 비교
 - 시각화: 라인, 막대, 산점도, 히트맵, 분포, 이중축, 대시보드 SVG
-- 검증 보조: 답변 payload 검증, 산식형 지표의 분모·필요 통계 안내
+- 검증 보조: raw 호출 메타 추적, 답변 payload 검증, 산식형 지표의 분모·필요 통계 안내
 
 ## 지원 현황
 
@@ -363,17 +365,30 @@ $env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
 
 ## 챗봇에서 권장 호출 순서
 
-1. 일반 자연어 질문은 `answer_query`
-2. 답변 payload 점검은 `verify_stat_claims`
-3. 산식·분모가 필요한 질문은 `indicator_dependency_map`
-4. 직접 통계 조회는 `quick_stat`, 시계열은 `quick_trend`
-5. 시도별·지역별 비교는 `quick_region_compare`
-6. 복합 분석은 `analyze_trend`, `stat_time_compare`, `correlate_stats`, `forecast_stat`, `detect_outliers`
-7. 차트는 `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`
+Gemma 4 26B처럼 로컬 LLM을 MCP 클라이언트로 쓸 때는 답을 한 번에 만들려는 라우터형 흐름보다, 실패하기 어려운 절차형 파이프라인을 권장합니다.
+
+1. `plan_query` — 질문을 의도, 필요 차원, 자연어 개념, 다음 도구 호출 템플릿으로 분해합니다. 이 도구는 표 선택·코드 매핑·값 조회·산술을 하지 않습니다.
+2. `select_table_for_query` — 계획된 다음 단계입니다. 필요한 분류축을 만족하는 통계표만 고르는 역할이며 후속 PR에서 추가될 예정입니다.
+3. `resolve_concepts` — 계획된 다음 단계입니다. "서울", "30대", "여성", "광역시" 같은 개념을 선택된 표의 코드로 바꾸는 역할이며 후속 PR에서 추가될 예정입니다.
+4. `query_table` — `explore_table` 메타로 검증된 `{OBJ_ID: [ITM_ID...]}` 필터를 받아 raw rows를 반환합니다. 합산·평균·비율·해석은 하지 않고 `aggregation: "none"`을 명시합니다.
+5. `compute_indicator` — 계획된 다음 단계입니다. `per_capita`, `share`, `ratio`, `growth_rate` 같은 허용된 산식 enum만 계산하는 역할이며 후속 PR에서 추가될 예정입니다.
+
+기존 고속 경로도 유지됩니다:
+
+- 단순 Tier A 조회는 `quick_stat`, 시계열은 `quick_trend`
+- 시도별·지역별 비교는 `quick_region_compare`
+- 기존 자연어 즉시 답변은 `answer_query`가 담당하지만, Gemma 챗봇 manifest에서는 deprecated/fallback으로 취급하는 것을 권장합니다.
+- 복합 분석은 `analyze_trend`, `stat_time_compare`, `correlate_stats`, `forecast_stat`, `detect_outliers`
+- 차트는 `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`
 
 ## 예시
 
 ```text
+plan_query("2020년 서울 30대 여성 인구")
+plan_query("서울 1인당 GRDP 알려줘")
+plan_query("광역시 중 고령화 비중이 가장 빠른 곳")
+query_table("101", "DT_1DA7004S", filters={"ITEM": ["T80"], "A": ["00"]}, period_range=["2025", "2025"])
+
 answer_query("최근 기준 중소기업 수와 소상공인 사업체 수를 함께 보여줘")
 answer_query("중소기업 사업체수를 시도별로 비교해줘")
 answer_query("2020년 서울 중소기업 매출액 알려줘")
@@ -390,6 +405,26 @@ stat_time_compare("실업률", years=5)
 indicator_dependency_map("폐업률")
 chart_line("고령인구", region="전국", years=5)
 ```
+
+`plan_query` 응답은 실제 값을 반환하지 않고 다음처럼 절차형 레일만 반환합니다:
+
+- `status: "planned"`
+- `intent`: `single_value`, `trend`, `comparison`, `computed_indicator` 등
+- `intended_dimensions`: 질문에서 감지한 `region`, `age`, `sex`, `time`, `industry` 등
+- `required_dimensions`: 후보 통계표가 반드시 가져야 할 분류축 의미
+- `concepts`: 후속 `resolve_concepts`가 코드로 바꿀 자연어 개념
+- `suggested_workflow`: `select_table_for_query` → `resolve_concepts` → `query_table` → 필요 시 `compute_indicator`
+- `next_call`: Gemma가 그대로 따라갈 수 있는 다음 도구 호출 템플릿
+
+`query_table` 응답은 raw extraction 전용입니다:
+
+- `verification_level: "explored_raw"`
+- `confidence`: 값의 품질이 아니라 코드 매핑과 호출 조건의 검증 수준
+- `aggregation: "none"`
+- `metadata_source`: 검증에 사용한 KOSIS 메타 엔드포인트, 조회 시각, 원본 URL
+- `rows[]`: KOSIS 원행을 기간·값·단위·분류 차원과 함께 반환
+
+잘못된 `OBJ_ID`나 `ITM_ID`가 들어오면 KOSIS 값을 호출하지 않고 `status: "unsupported"`, `validation_errors`, `suggested_codes`를 반환합니다.
 
 `answer_query` 응답 상태:
 
@@ -445,10 +480,13 @@ chart_line("고령인구", region="전국", years=5)
 
 다지역 합산·합성지역 핸들러(`_answer_composite_aggregate`, `_answer_region_sum`)는 0.5.0부터 모든 component를 **병렬 호출**하고 per-call 12초·전체 60초 예산을 적용합니다 — 단일 호출이 지연돼도 다른 in-flight 요청이 막히지 않습니다.
 
-0.6.0부터 KOSIS `getMeta` 엔드포인트를 직접 활용하는 두 메타 도구가 추가되었습니다:
+0.6.0부터 KOSIS `getMeta` 엔드포인트를 직접 활용하는 메타/원자료 도구가 추가되었습니다:
 
 - `explore_table(org_id, tbl_id, industry_term?)` — 통계표 한 개의 `TBL`/`ITM`/`PRD`/`SOURCE` 메타를 **병렬**로 가져와 분류축(objL1~3) 아이템 카탈로그, 수록기간, 작성기관 연락처를 단일 응답으로 반환합니다. `industry_term`을 넘기면 `ITM_NM` 매칭으로 `ITM_ID`를 동적으로 해결해 quick_stat·직접 KOSIS 호출에 산업 코드를 하드코딩하지 않아도 됩니다.
 - `check_stat_availability(query, live_period_check=True)` — Tier A curation 메모뿐 아니라 KOSIS 메타 API의 실제 최신 수록 시점을 같이 조회합니다. 메모 스냅샷과 라이브 수록 시점이 어긋나면 `⚠️ 메모_vs_KOSIS_drift`, 데이터가 1년 이상 정체돼 있으면 `⚠️ 데이터_신선도`를 자동 첨부합니다.
+- `query_table(org_id, tbl_id, filters, period_range?)` — `explore_table`로 검증 가능한 분류축 코드만 받아 KOSIS raw rows를 조회합니다. 여러 코드가 들어와도 서버는 합산하지 않고 개별 행을 반환하며, 잘못된 코드는 `suggested_codes`와 함께 거절합니다.
+
+Gemma 챗봇용 절차형 입구로 `plan_query(query)`가 추가되었습니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 즉 `answer_query`의 즉시 답변 경로에서 발생할 수 있는 silent failure를 줄이기 위한 계획 전용 도구입니다.
 
 `decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
 
@@ -486,10 +524,13 @@ chart_line("고령인구", region="전국", years=5)
 ```powershell
 $env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
 python scripts\regression_smoke.py
+python scripts\eval_gemma_workflow.py
 python scripts\comprehensive_api_matrix.py
 python scripts\temporal_edge_cases.py
 python scripts\natural_language_battery.py --summary-only
 ```
+
+`eval_gemma_workflow.py`는 `plan_query` 중심의 Gemma 절차형 워크플로우 평가셋입니다. 다축 슬라이싱(2020년 서울 30대 여성), 1인당 GRDP, 광역시 고령화 비중, 영문 질의, CPI/GRDP 약어, 치킨집 폐업률 같은 seed case를 통해 필요한 차원·개념·후속 도구 순서가 유지되는지 확인합니다. `future_must_not_select_tables` 같은 필드는 다음 PR에서 `select_table_for_query`가 추가되면 거짓 양성 negative test로 승격할 수 있도록 남겨둔 기대값입니다.
 
 `natural_language_battery.py`는 `answer_query`만 호출하는 자연어 배터리로, 10개 이상의 의도 카테고리(단일값·시계열·증가율·시도별·Top N·비중·합산·복합·검색폴백·가드레일·의도불일치)를 한 번에 검증합니다. `--group <name>` 또는 `--name <case>`로 필터링 가능합니다.
 
@@ -499,7 +540,7 @@ python scripts\natural_language_battery.py --summary-only
 - `kosis_http_server.py`: Streamable HTTP MCP 서버 엔트리포인트
 - `kosis_curation.py`: 자연어 라우터, Tier A/B 큐레이션, 개념 그래프
 - `kosis_charts_extra.py`: 추가 SVG 차트 헬퍼
-- `scripts/regression_smoke.py`, `scripts/comprehensive_api_matrix.py`, `scripts/temporal_edge_cases.py`, `scripts/natural_language_battery.py`: 라이브 API 회귀 검증 스크립트
+- `scripts/regression_smoke.py`, `scripts/eval_gemma_workflow.py`, `scripts/comprehensive_api_matrix.py`, `scripts/temporal_edge_cases.py`, `scripts/natural_language_battery.py`: 라이브 API/워크플로우 회귀 검증 스크립트
 - `pyproject.toml`: `kosis-analysis-mcp` 실행 명령과 패키지 메타데이터
 - `package.json`, `bin/`, `scripts/`: npx/npm wrapper
 - `.claude-plugin/`, `.mcp.json`, `skills/`: Claude Code plugin 구성
