@@ -146,6 +146,18 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "answer_self_employed_generic_business_population_mismatch",
+        "tool": answer_query,
+        "args": ("자영업자 수와 사업체수 차이 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_population_mixed_comparison",
+            "table_len": 2,
+            "answer_contains": "모집단",
+            "matched_concepts_contains": "자영업자",
+        },
+    },
+    {
         "name": "answer_ai_stats_search",
         "tool": answer_query,
         "args": ("AI 관련 통계 찾아줘",),
