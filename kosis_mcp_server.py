@@ -2297,11 +2297,25 @@ class NaturalLanguageAnswerEngine:
         "STAT_AVERAGE": frozenset({
             "tier_a_composite_calculation", "tier_a_composite",
         }),
+        "STAT_COMPARISON": frozenset({
+            "tier_a_region_comparison", "tier_a_composite_comparison",
+            "tier_a_composite_share_ratio", "tier_a_top_n",
+            "tier_a_top_n_share_ratio", "tier_a_region_sum",
+        }),
     }
 
     _YEAR_MISMATCH_ANSWER_TYPES: frozenset[str] = frozenset({
         "tier_a_value", "tier_a_growth_rate", "tier_a_share_ratio",
     })
+
+    _INTENT_DROPPED_DIMENSIONS: dict[str, tuple[str, ...]] = {
+        "STAT_RANKING": ("ranking",),
+        "STAT_SHARE_RATIO": ("share_ratio",),
+        "STAT_GROWTH_RATE": ("growth_rate",),
+        "STAT_TIME_SERIES": ("time_series",),
+        "STAT_AVERAGE": ("average",),
+        "STAT_COMPARISON": ("comparison",),
+    }
 
     @classmethod
     def _intent_execution_warnings(
@@ -2369,6 +2383,59 @@ class NaturalLanguageAnswerEngine:
                 "쿼리 어휘 '사업체 수' → 매핑 통계 '기업 수' (모집단 다름)"
             )
         return warnings
+
+    @classmethod
+    def _fulfillment_gap(
+        cls,
+        result: dict[str, Any],
+        query: str,
+        route_payload: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        if not route_payload:
+            return None
+        answer_type = str(result.get("답변유형") or "")
+        intents = route_payload.get("intents") or []
+        slots = route_payload.get("slots") or {}
+        q_compact = re.sub(r"\s+", "", query)
+
+        dropped: list[str] = []
+        reasons: list[str] = []
+        for intent_label, fulfilling_types in cls._INTENT_FULFILLMENT.items():
+            if intent_label not in intents or answer_type in fulfilling_types:
+                continue
+            for dim in cls._INTENT_DROPPED_DIMENSIONS.get(intent_label, ()):
+                dropped.append(dim)
+            reasons.append(f"{intent_label} 의도가 {answer_type or '미지정'} 응답으로 완전히 충족되지 않음")
+
+        comparison_targets = slots.get("comparison_target") if isinstance(slots, dict) else None
+        if comparison_targets and answer_type in {"tier_a_value", "tier_a_trend", "tier_a_growth_rate", "tier_a_composite"}:
+            dropped.append("comparison")
+            reasons.append(f"비교 대상 {comparison_targets} 이(가) 단일 응답으로 축소됨")
+
+        age_requested = (
+            bool(re.search(r"\d+\s*[-~]\s*\d+\s*세", query))
+            or any(term in q_compact for term in ("청년", "연령별", "연령", "나이"))
+        )
+        if age_requested and answer_type not in {"search_and_plan"}:
+            dropped.append("age")
+            reasons.append("연령/청년 조건을 만족하는 분류축 호출이 실행되지 않음")
+
+        if cls._is_aggregation_question(query) and answer_type not in {
+            "tier_a_region_sum", "tier_a_composite_share_ratio", "tier_a_top_n_share_ratio",
+        }:
+            dropped.append("aggregation")
+            reasons.append("합계/합산 의도가 단일값 또는 부분 집계로 축소됨")
+
+        dropped = list(dict.fromkeys(dropped))
+        if not dropped:
+            return None
+        return {
+            "이행_상태": "partial",
+            "status": "partial",
+            "누락_차원": dropped,
+            "dropped_dimensions": dropped,
+            "부분충족_사유": list(dict.fromkeys(reasons)),
+        }
 
     @staticmethod
     def _pick_josa_eun_neun(word: str) -> str:
@@ -2498,6 +2565,9 @@ class NaturalLanguageAnswerEngine:
             for w in mismatch_warnings:
                 if w not in notes:
                     notes.append(w)
+            gap = cls._fulfillment_gap(result, query, route_payload)
+            if gap:
+                result.update(gap)
 
         if notes:
             result["검증_주의"] = notes
