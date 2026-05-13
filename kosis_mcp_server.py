@@ -157,6 +157,7 @@ FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
 from kosis_curation import (
     QuickStatParam,
     REGION_COMPOSITES,
+    REGION_DEMOGRAPHIC,
     TIER_A_STATS,
     TOPICS,
     canonical_region as _canonical_region,
@@ -944,6 +945,358 @@ class AnswerPlanner:
             return AnswerPlan("direct", effective_region, direct_key)
 
         return AnswerPlan("search_fallback", effective_region)
+
+
+@dataclass(frozen=True)
+class WorkflowStep:
+    step: int
+    tool: str
+    purpose: str
+    args: dict[str, Any]
+    available_now: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "tool": self.tool,
+            "purpose": self.purpose,
+            "args": self.args,
+            "available_now": self.available_now,
+        }
+
+
+class QueryWorkflowPlanner:
+    """Plan a safe procedural workflow for a statistical question.
+
+    MUST NOT:
+    - choose a final KOSIS table ID; that belongs to select_table_for_query
+    - map natural concepts to ITM_ID/OBJ_ID codes; that belongs to resolve_concepts
+    - fetch actual statistical values; that belongs to query_table
+    - calculate ratios, sums, growth rates, or per-capita values; that belongs to compute_indicator
+
+    This class extracts intent, dimensions, and the next tool sequence only.
+    """
+
+    AVAILABLE_TOOLS = {"plan_query", "search_kosis", "explore_table", "query_table"}
+    EN_REGION_ALIASES = {
+        "seoul": "서울", "busan": "부산", "daegu": "대구", "incheon": "인천",
+        "gwangju": "광주", "daejeon": "대전", "ulsan": "울산", "sejong": "세종",
+        "gyeonggi": "경기", "gangwon": "강원", "chungbuk": "충북", "chungnam": "충남",
+        "jeonbuk": "전북", "jeonnam": "전남", "gyeongbuk": "경북", "gyeongnam": "경남",
+        "jeju": "제주", "korea": "전국", "national": "전국",
+    }
+    EN_INDICATOR_ALIASES = {
+        "unemployment rate": "실업률",
+        "employment rate": "고용률",
+        "population": "인구",
+        "cpi": "소비자물가지수",
+        "consumer price index": "소비자물가지수",
+        "grdp": "GRDP",
+        "gdp": "GDP",
+    }
+
+    def build(self, query: str) -> dict[str, Any]:
+        route_payload = NaturalLanguageAnswerEngine._route_payload(query)
+        dimensions = self._dimensions(query, route_payload)
+        calculations = self._calculations(query, route_payload)
+        intent = self._intent(route_payload, calculations)
+        concepts = self._concepts(dimensions, calculations)
+        required = self._required_dimensions(dimensions, calculations)
+        workflow = self._workflow(query, intent, required, concepts, dimensions, calculations)
+
+        confidence = "medium"
+        if dimensions.get("indicator") and required:
+            confidence = "high"
+        elif route_payload.get("route", {}).get("type") == "miss":
+            confidence = "low"
+
+        return {
+            "상태": "planned",
+            "status": "planned",
+            "answer": None,
+            "intent": intent,
+            "query": query,
+            "verification_level": "planning_only",
+            "confidence": confidence,
+            "intended_dimensions": dimensions,
+            "required_dimensions": required,
+            "concepts": concepts,
+            "calculations": calculations,
+            "suggested_workflow": [step.to_dict() for step in workflow],
+            "next_call": workflow[0].to_dict() if workflow else None,
+            "route": route_payload.get("route", {}),
+            "router_slots": route_payload.get("slots", {}),
+            "validation": route_payload.get("validation", {}),
+            "must_not": [
+                "통계표 ID 확정 금지",
+                "ITM_ID/OBJ_ID 코드 매핑 금지",
+                "실제 값 반환 금지",
+                "산술·산식 계산 금지",
+            ],
+            "notes": [
+                "plan_query는 절차형 레일만 생성합니다. 값 조회와 계산은 후속 도구가 담당합니다.",
+                "available_now=false인 도구는 후속 PR에서 추가될 예정인 파이프라인 단계입니다.",
+            ],
+        }
+
+    def _dimensions(self, query: str, route_payload: dict[str, Any]) -> dict[str, Any]:
+        q_norm = _compact_text(query)
+        q_lower = query.lower()
+        slots = route_payload.get("slots") or {}
+        dimensions: dict[str, Any] = {}
+
+        indicator = self._indicator(query, q_norm, q_lower, route_payload)
+        if indicator:
+            dimensions["indicator"] = indicator
+        if "폐업" in q_norm:
+            dimensions["event"] = "폐업"
+        if "창업" in q_norm:
+            dimensions["event"] = "창업"
+        if "생존" in q_norm:
+            dimensions["event"] = "생존"
+
+        region = slots.get("region") if isinstance(slots, dict) else None
+        if not region:
+            region = self._region(q_norm, q_lower)
+        if region:
+            dimensions["region"] = region
+
+        composite = self._composite_region(q_norm)
+        if composite:
+            dimensions["region_group"] = composite
+
+        age = self._age(query, q_norm)
+        if age:
+            dimensions["age"] = age
+
+        sex = self._sex(q_norm, q_lower)
+        if sex:
+            dimensions["sex"] = sex
+
+        time_value = slots.get("time") if isinstance(slots, dict) else None
+        time_value = time_value or self._time(query, q_norm)
+        if time_value:
+            dimensions["time"] = time_value
+
+        industry = slots.get("industry") if isinstance(slots, dict) else None
+        if industry:
+            dimensions["industry"] = industry
+        return dimensions
+
+    def _indicator(self, query: str, q_norm: str, q_lower: str, route_payload: dict[str, Any]) -> Optional[str]:
+        manual = [
+            ("고령화", "고령인구비중"),
+            ("고령인구", "65세이상인구"),
+            ("인구", "인구"),
+            ("출생", "출생"),
+            ("혼인", "혼인"),
+            ("치킨", "음식점업"),
+            ("폐업", "폐업"),
+        ]
+        for token, label in manual:
+            if _compact_text(token) in q_norm:
+                return label
+        direct_key = (route_payload.get("route") or {}).get("direct_stat_key")
+        if direct_key:
+            return str(direct_key)
+        slots = route_payload.get("slots") or {}
+        if isinstance(slots, dict) and slots.get("indicator"):
+            return str(slots["indicator"])
+        for alias, label in self.EN_INDICATOR_ALIASES.items():
+            if alias in q_lower:
+                return label
+        return None
+
+    def _region(self, q_norm: str, q_lower: str) -> Optional[str]:
+        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
+            if region != "전국" and _compact_text(region) in q_norm:
+                return region
+        if "전국" in q_norm:
+            return "전국"
+        for alias, region in self.EN_REGION_ALIASES.items():
+            if alias in q_lower:
+                return region
+        return None
+
+    @staticmethod
+    def _composite_region(q_norm: str) -> Optional[str]:
+        for name in sorted(REGION_COMPOSITES, key=len, reverse=True):
+            if _compact_text(name) in q_norm:
+                return name
+        if "광역시" in q_norm:
+            return "광역시"
+        return None
+
+    @staticmethod
+    def _age(query: str, q_norm: str) -> Optional[dict[str, Any]]:
+        decade = re.search(r"(\d{2})\s*대", query)
+        if decade:
+            n = int(decade.group(1))
+            return {"label": f"{n}대", "type": "decade", "range": [n, n + 9]}
+        explicit = re.search(r"(\d{1,3})\s*[-~]\s*(\d{1,3})\s*세", query)
+        if explicit:
+            return {"label": f"{explicit.group(1)}-{explicit.group(2)}세", "type": "range", "range": [int(explicit.group(1)), int(explicit.group(2))]}
+        if "청년" in q_norm:
+            return {"label": "청년", "type": "named_group", "range": [20, 34]}
+        if "고령" in q_norm or "65세이상" in q_norm:
+            return {"label": "65세 이상", "type": "lower_bound", "range": [65, None]}
+        return None
+
+    @staticmethod
+    def _sex(q_norm: str, q_lower: str) -> Optional[str]:
+        if any(term in q_norm for term in ("여성", "여자", "여자인구")) or re.search(r"\b(female|women|woman)\b", q_lower):
+            return "여성"
+        if any(term in q_norm for term in ("남성", "남자", "남자인구")) or re.search(r"\b(male|men|man)\b", q_lower):
+            return "남성"
+        return None
+
+    @staticmethod
+    def _time(query: str, q_norm: str) -> Optional[dict[str, Any]]:
+        years = re.findall(r"(19\d{2}|20\d{2})", query)
+        if len(years) >= 2 and any(term in q_norm for term in ("부터", "까지", "대비", "~")):
+            return {"type": "range", "start": years[0], "end": years[1]}
+        if years:
+            return {"type": "year", "value": years[0]}
+        if any(term in q_norm for term in ("최근", "최신", "현재")):
+            return {"type": "latest", "value": "latest"}
+        return None
+
+    @staticmethod
+    def _calculations(query: str, route_payload: dict[str, Any]) -> list[str]:
+        q_norm = _compact_text(query)
+        slots = route_payload.get("slots") or {}
+        calculations = list(slots.get("calculation") or []) if isinstance(slots, dict) else []
+        if any(term in q_norm for term in ("1인당", "인당")) or "percapita" in query.lower():
+            calculations.append("per_capita")
+        if any(term in q_norm for term in ("비중", "비율", "구성비", "차지")):
+            calculations.append("share")
+        if any(term in q_norm for term in ("폐업률", "창업률", "생존율")):
+            calculations.append("share")
+        if any(term in q_norm for term in ("증가율", "변화율", "감소율")):
+            calculations.append("growth_rate")
+        if any(term in q_norm for term in ("가장빠른", "빠른곳", "속도", "빨라")):
+            calculations.append("growth_rate")
+        if any(term in q_norm for term in ("추이", "시계열", "최근5년", "최근10년")):
+            calculations.append("time_series")
+        return list(dict.fromkeys(calculations))
+
+    @staticmethod
+    def _intent(route_payload: dict[str, Any], calculations: list[str]) -> str:
+        if "per_capita" in calculations or "share" in calculations:
+            return "computed_indicator"
+        if "time_series" in calculations:
+            return "trend"
+        if "growth_rate" in calculations:
+            return "growth_rate"
+        intents = route_payload.get("intents") or []
+        if "STAT_RANKING" in intents:
+            return "ranking"
+        if "STAT_COMPARISON" in intents:
+            return "comparison"
+        return "single_value"
+
+    @staticmethod
+    def _required_dimensions(dimensions: dict[str, Any], calculations: list[str]) -> list[str]:
+        required: list[str] = []
+        for key in ("region", "region_group", "age", "sex", "industry", "time"):
+            if dimensions.get(key):
+                required.append(key)
+        if any(op in calculations for op in ("time_series", "growth_rate")) and "time" not in required:
+            required.append("time")
+        return required
+
+    @staticmethod
+    def _concepts(dimensions: dict[str, Any], calculations: list[str]) -> list[str]:
+        concepts: list[str] = []
+        for key in ("indicator", "region", "region_group", "industry", "sex", "event"):
+            value = dimensions.get(key)
+            if isinstance(value, str):
+                concepts.append(value)
+        age = dimensions.get("age")
+        if isinstance(age, dict) and age.get("label"):
+            concepts.append(str(age["label"]))
+        time_value = dimensions.get("time")
+        if isinstance(time_value, dict):
+            concepts.extend(str(v) for k, v in time_value.items() if k in {"value", "start", "end"} and v)
+        concepts.extend(calculations)
+        return list(dict.fromkeys(concepts))
+
+    def _workflow(
+        self,
+        query: str,
+        intent: str,
+        required: list[str],
+        concepts: list[str],
+        dimensions: dict[str, Any],
+        calculations: list[str],
+    ) -> list[WorkflowStep]:
+        period_range = self._period_range(dimensions.get("time"))
+        steps = [
+            WorkflowStep(
+                1,
+                "select_table_for_query",
+                "질문 의도와 필요한 분류축을 만족하는 KOSIS 통계표를 고릅니다.",
+                {
+                    "query": query,
+                    "required_dimensions": required,
+                    "indicator": dimensions.get("indicator"),
+                    "reject_if_missing_dimensions": True,
+                },
+                "select_table_for_query" in self.AVAILABLE_TOOLS,
+            ),
+            WorkflowStep(
+                2,
+                "resolve_concepts",
+                "선택된 표의 메타데이터 안에서 자연어 개념을 OBJ_ID/ITM_ID 코드로 바꿉니다.",
+                {
+                    "org_id": "<selected.org_id>",
+                    "tbl_id": "<selected.tbl_id>",
+                    "concepts": concepts,
+                    "valid_only_for": "<selected.tbl_id>",
+                },
+                "resolve_concepts" in self.AVAILABLE_TOOLS,
+            ),
+            WorkflowStep(
+                3,
+                "query_table",
+                "검증된 코드로 KOSIS raw rows를 조회합니다. 합산과 계산은 하지 않습니다.",
+                {
+                    "org_id": "<selected.org_id>",
+                    "tbl_id": "<selected.tbl_id>",
+                    "filters": "<resolve_concepts.filters>",
+                    "period_range": period_range or "<resolve_concepts.period_range>",
+                    "aggregation": "none",
+                },
+                True,
+            ),
+        ]
+        compute_ops = [op for op in calculations if op in {"per_capita", "share", "growth_rate", "cagr", "yoy_diff", "yoy_pct"}]
+        age = dimensions.get("age")
+        if isinstance(age, dict) and age.get("type") in {"decade", "named_group", "lower_bound"}:
+            compute_ops.append("sum_additive_rows")
+        if compute_ops:
+            steps.append(WorkflowStep(
+                4,
+                "compute_indicator",
+                "허용된 산식 enum만 사용해 raw rows를 계산합니다.",
+                {
+                    "operation": compute_ops[0],
+                    "allowed_operations": ["per_capita", "share", "ratio", "growth_rate", "cagr", "yoy_diff", "yoy_pct", "sum_additive_rows"],
+                    "input_rows": "<query_table.rows>",
+                    "intent": intent,
+                },
+                "compute_indicator" in self.AVAILABLE_TOOLS,
+            ))
+        return steps
+
+    @staticmethod
+    def _period_range(time_value: Any) -> Optional[list[str]]:
+        if isinstance(time_value, dict):
+            if time_value.get("type") == "year" and time_value.get("value"):
+                return [str(time_value["value"]), str(time_value["value"])]
+            if time_value.get("type") == "range" and time_value.get("start") and time_value.get("end"):
+                return [str(time_value["start"]), str(time_value["end"])]
+        return None
 
 
 class NaturalLanguageAnswerEngine:
@@ -4092,15 +4445,36 @@ async def chain_full_analysis(
 
 
 @mcp.tool()
+async def plan_query(query: str) -> dict:
+    """[🧭] Gemma용 절차형 KOSIS 분석 계획을 만든다.
+
+    질문을 차원과 작업 단계로 분해합니다.
+
+    MUST NOT:
+    - 통계표 ID 확정 (select_table_for_query의 책임)
+    - 코드 매핑 (resolve_concepts의 책임)
+    - 실제 값 반환 (query_table의 책임)
+    - 산술/산식 (compute_indicator의 책임)
+
+    역할은 의도 추출과 워크플로우 제안까지만입니다.
+    """
+    planner = QueryWorkflowPlanner()
+    return planner.build(query)
+
+
+@mcp.tool()
 async def answer_query(
     query: str,
     region: str = "전국",
     api_key: Optional[str] = None,
 ) -> dict:
-    """[🤖] 자연어 질문을 실제 답변 또는 안전한 분석계획으로 생성.
+    """[🤖][Deprecated for Gemma chatbot manifests] 자연어 질문을 실제 답변 또는 안전한 분석계획으로 생성.
 
     검증된 Tier A 질문은 KOSIS API를 호출해 수치·표·계산·해석을 반환하고,
     복합/상위어 질문은 실제 KOSIS 검색 후보와 분석계획을 반환한다.
+    Gemma 기반 챗봇에서는 silent failure를 줄이기 위해 plan_query →
+    select_table_for_query → resolve_concepts → query_table → compute_indicator
+    절차형 파이프라인을 우선 사용한다.
     """
     key = _resolve_key(api_key)
     engine = NaturalLanguageAnswerEngine(key)

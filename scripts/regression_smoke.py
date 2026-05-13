@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from kosis_mcp_server import (
     answer_query, check_stat_availability, explore_table, indicator_dependency_map,
-    query_table, quick_region_compare, quick_stat, quick_trend,
+    plan_query, query_table, quick_region_compare, quick_stat, quick_trend,
 )
 
 
@@ -381,6 +381,41 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "plan_query_multidim_population",
+        "tool": plan_query,
+        "args": ("2020년 서울 30대 여성 인구",),
+        "expect": {
+            "machine_status": "planned",
+            "intent": "single_value",
+            "required_dimensions_contains": ["region", "age", "sex", "time"],
+            "concepts_contains": ["인구", "서울", "30대", "여성", "2020"],
+            "workflow_tools_contains": ["select_table_for_query", "resolve_concepts", "query_table"],
+        },
+    },
+    {
+        "name": "plan_query_grdp_per_capita",
+        "tool": plan_query,
+        "args": ("서울 1인당 GRDP 알려줘",),
+        "expect": {
+            "machine_status": "planned",
+            "intent": "computed_indicator",
+            "required_dimensions_contains": ["region"],
+            "concepts_contains": ["GRDP", "서울", "per_capita"],
+            "workflow_tools_contains": ["compute_indicator"],
+        },
+    },
+    {
+        "name": "plan_query_english_unemployment",
+        "tool": plan_query,
+        "args": ("unemployment rate in Seoul",),
+        "expect": {
+            "machine_status": "planned",
+            "intent": "single_value",
+            "required_dimensions_contains": ["region"],
+            "concepts_contains": ["실업률", "서울"],
+        },
+    },
+    {
         "name": "explore_table_industry_manufacturing_parent",
         "tool": explore_table,
         "args": ("142", "DT_BR_C001", "제조업"),
@@ -583,6 +618,10 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "row_count": result.get("row_count"),
         "period_type": result.get("period_type"),
         "validation_errors": result.get("validation_errors") or result.get("검증_오류") or [],
+        "intent": result.get("intent"),
+        "required_dimensions": result.get("required_dimensions") or [],
+        "concepts": result.get("concepts") or [],
+        "workflow_tools": [step.get("tool") for step in (result.get("suggested_workflow") or []) if isinstance(step, dict)],
     }
 
 
@@ -609,6 +648,23 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"dependency_key={summary['dependency_key']}")
     if "target_group" in expect and summary["target_group"] != expect["target_group"]:
         problems.append(f"target_group={summary['target_group']}")
+    if "intent" in expect and summary["intent"] != expect["intent"]:
+        problems.append(f"intent={summary['intent']}")
+    if "required_dimensions_contains" in expect:
+        required = set(summary.get("required_dimensions") or [])
+        missing = [dim for dim in expect["required_dimensions_contains"] if dim not in required]
+        if missing:
+            problems.append(f"required_dimensions={sorted(required)}")
+    if "concepts_contains" in expect:
+        concepts = set(summary.get("concepts") or [])
+        missing = [concept for concept in expect["concepts_contains"] if concept not in concepts]
+        if missing:
+            problems.append(f"concepts={sorted(concepts)}")
+    if "workflow_tools_contains" in expect:
+        tools = set(summary.get("workflow_tools") or [])
+        missing = [tool for tool in expect["workflow_tools_contains"] if tool not in tools]
+        if missing:
+            problems.append(f"workflow_tools={sorted(tools)}")
     if "verification_level" in expect and summary["verification_level"] != expect["verification_level"]:
         problems.append(f"verification_level={summary['verification_level']}")
     if "aggregation" in expect and summary["aggregation"] != expect["aggregation"]:
