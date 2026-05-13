@@ -551,8 +551,7 @@ def _extract_year_range(text: str) -> tuple[Optional[str], Optional[str]]:
     """
     if not text:
         return None, None
-    cur = datetime.now().year
-    years = [y for y in re.findall(r"(19\d{2}|20\d{2})", text) if int(y) <= cur + 1]
+    years = re.findall(r"(19\d{2}|20\d{2})", text)
     if len(years) < 2:
         return None, None
     start, end = years[0], years[1]
@@ -3524,7 +3523,72 @@ async def stat_time_compare(
     start_period/end_period를 생략하면 최근 N개 시계열의 첫 시점과 마지막
     시점을 비교한다.
     """
-    series_result = await quick_trend(query, region, years, api_key)
+    explicit_periods = bool(start_period and end_period)
+    if explicit_periods:
+        key = _resolve_key(api_key)
+        param = _lookup_quick(query)
+        if not param:
+            return {
+                "상태": "failed",
+                "코드": STATUS_STAT_NOT_FOUND,
+                "오류": f'"{query}" 사전 매핑 없음',
+                "질문": query,
+            }
+
+        canonical = _canonical_region(region) or region
+        region_code = None
+        if param.region_scheme:
+            region_code = param.region_scheme.get(canonical)
+            if not region_code:
+                return {
+                    "상태": "failed",
+                    "코드": STATUS_PERIOD_NOT_FOUND,
+                    "오류": f'지역 "{region}" 미지원',
+                    "지원_지역": list(param.region_scheme.keys()),
+                    "질문": query,
+                }
+        elif canonical != "전국":
+            return {
+                "상태": "failed",
+                "코드": STATUS_PERIOD_NOT_FOUND,
+                "오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.',
+                "지원_지역": ["전국"],
+                "질문": query,
+            }
+
+        period_type = _default_period_type(param)
+        start_bounds = _period_bounds(str(start_period or ""), period_type)
+        end_bounds = _period_bounds(str(end_period or ""), period_type)
+        fetch_start = start_bounds[0] or str(start_period or "")
+        fetch_end = end_bounds[1] or str(end_period or "")
+        fetch_low, fetch_high = sorted([fetch_start, fetch_end])
+
+        async with httpx.AsyncClient() as client:
+            data = await _fetch_series(
+                client,
+                key,
+                param,
+                region_code,
+                period_type=period_type,
+                start_year=fetch_low,
+                end_year=fetch_high,
+            )
+        if not data:
+            fallback = await _quick_trend_core(query, canonical, max(years, 5), api_key)
+            data = [
+                {"PRD_DE": row.get("시점"), "DT": row.get("값")}
+                for row in (fallback.get("시계열") or [])
+            ]
+        series_result = {
+            "통계명": param.description,
+            "지역": canonical,
+            "단위": param.unit,
+            "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data],
+            "통계표": param.tbl_nm,
+        }
+        region = canonical
+    else:
+        series_result = await quick_trend(query, region, years, api_key)
     if "오류" in series_result:
         return {
             "상태": "failed",
@@ -3560,6 +3624,8 @@ async def stat_time_compare(
             "상태": "failed",
             "코드": STATUS_PERIOD_NOT_FOUND,
             "오류": "요청한 비교 시점을 시계열에서 찾지 못했습니다.",
+            "요청_시작": start_period,
+            "요청_종료": end_period,
             "가능_시점": times,
             "질문": query,
         }

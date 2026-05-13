@@ -181,6 +181,37 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "answer_explicit_period_growth_2020_2022",
+        "tool": answer_query,
+        "args": ("2020년 대비 2022년 중소기업 사업체수 증가율",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_growth_rate",
+            "comparison_start_prefix": "2020",
+            "comparison_end_prefix": "2022",
+        },
+    },
+    {
+        "name": "answer_explicit_period_growth_both_out_of_range",
+        "tool": answer_query,
+        "args": ("1990년 대비 2050년 중소기업 사업체수 증가율",),
+        "expect": {
+            "status": "failed",
+            "answer_type": "tier_a_growth_rate_failed",
+            "code": "PERIOD_NOT_FOUND",
+        },
+    },
+    {
+        "name": "answer_explicit_period_growth_one_out_of_range",
+        "tool": answer_query,
+        "args": ("2018년 대비 2023년 중소기업 사업체수 증가율",),
+        "expect": {
+            "status": "failed",
+            "answer_type": "tier_a_growth_rate_failed",
+            "code": "PERIOD_NOT_FOUND",
+        },
+    },
+    {
         "name": "explore_table_housing_price_index",
         "tool": explore_table,
         "args": ("408", "DT_30404_B012"),
@@ -278,6 +309,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
     calc = result.get("계산") or {}
     return {
         "error": result.get("오류"),
+        "code": result.get("코드"),
         "empty_result": result.get("결과") == "데이터 없음",
         "status": result.get("상태"),
         "answer_type": result.get("답변유형"),
@@ -314,6 +346,8 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"status={summary['status']}")
     if "answer_type" in expect and summary["answer_type"] != expect["answer_type"]:
         problems.append(f"answer_type={summary['answer_type']}")
+    if "code" in expect and summary["code"] != expect["code"]:
+        problems.append(f"code={summary['code']}")
     if "direct_key" in expect and summary["direct_key"] != expect["direct_key"]:
         problems.append(f"direct_key={summary['direct_key']}")
     if "region" in expect and summary["region"] != expect["region"]:
