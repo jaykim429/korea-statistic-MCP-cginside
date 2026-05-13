@@ -424,6 +424,17 @@ TESTS: list[dict[str, Any]] = [
             "regions_in_sum": ["서울", "경기"],
         },
     },
+    {
+        "name": "answer_central_region_sme_business_count",
+        "tool": answer_query,
+        "args": ("중부권 중소기업 사업체수 합계 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_region_sum",
+            "regions_in_sum": ["대전", "세종", "충북", "충남"],
+            "composite_region": "중부권",
+        },
+    },
 ]
 
 
@@ -466,6 +477,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "table_len": len(table),
         "share_pct": calc.get("비중_퍼센트"),
         "sum_regions": calc.get("포함_지역"),
+        "composite_region": calc.get("합성지역"),
         "used_period": result.get("used_period"),
         "period_age_years": result.get("period_age_years"),
         "used_search_terms": result.get("사용된_검색어") or [],
@@ -544,6 +556,8 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [r for r in expect["regions_in_sum"] if r not in regions]
         if missing:
             problems.append(f"missing_sum_regions={missing}")
+    if "composite_region" in expect and summary.get("composite_region") != expect["composite_region"]:
+        problems.append(f"composite_region={summary.get('composite_region')}")
     if expect.get("explore_table_has_classifications"):
         axes = (result or {}).get("분류축") or {}
         if not isinstance(axes, dict) or not axes:
