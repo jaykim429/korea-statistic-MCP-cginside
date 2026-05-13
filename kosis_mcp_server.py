@@ -1166,6 +1166,16 @@ class NaturalLanguageAnswerEngine:
             and any(term in q for term in ("비교", "비중", "차이", "전체매출"))
         )
 
+    def _is_self_employed_sme_population_question(self, query: str) -> bool:
+        q = self._norm(query)
+        has_self_employed = any(term in q for term in ("자영업자", "자영업", "개인사업자"))
+        has_sme_business = (
+            "중소기업" in q
+            and any(term in q for term in ("사업체", "기업수", "업체수", "중소기업수"))
+        )
+        asks_jointly = any(term in q for term in ("비교", "차이", "비중", "대비", "같이", "함께", "와", "과"))
+        return has_self_employed and has_sme_business and asks_jointly
+
     @staticmethod
     def _needs_advanced_analysis_plan(route_payload: dict[str, Any]) -> bool:
         advanced = {"STAT_CORRELATION", "STAT_REGRESSION", "POLICY_EFFECT_ANALYSIS"}
@@ -1227,6 +1237,46 @@ class NaturalLanguageAnswerEngine:
             ],
             "추천_시각화": ["bar_chart"],
             "검증_주의": self._validation_notes(route_payload),
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
+    async def _answer_self_employed_sme_population_warning(self, query: str, region: str) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        try:
+            sme = await self._latest_stat("중소기업_사업체수", "중소기업 사업체 수", region)
+            self_employed = await self._latest_stat("자영업자수", "자영업자 수", region)
+        except RuntimeError:
+            return await self._answer_search_fallback(query, route_payload)
+
+        notes = self._validation_notes(route_payload)
+        notes.append(
+            "이 질의는 자영업자(종사상지위별 취업자)와 중소기업 사업체 수(사업체 단위)를 함께 언급합니다. "
+            "두 모집단은 단위와 작성 기준이 달라 비율·차이를 자동 계산하지 않았습니다."
+        )
+        if not self._same_period([sme, self_employed]):
+            notes.append(f"시점 불일치: 중소기업 사업체 수 {sme.period}, 자영업자 수 {self_employed.period}")
+
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_population_mixed_comparison",
+            "질문": query,
+            "answer": (
+                f"{region} 기준 중소기업 사업체 수와 자영업자 수를 각각 조회했습니다. "
+                "두 지표는 모집단이 달라 직접 비율이나 차이로 계산하지 않았습니다."
+            ),
+            "표": [sme.to_row(), self_employed.to_row()],
+            "모집단_주의": {
+                "중소기업_사업체수": "사업체 단위 기업규모별 사업체 수",
+                "자영업자수": "종사상지위별 취업자 중 자영업자",
+                "자동계산": "차이·비율 계산 안 함",
+            },
+            "추천_후속": [
+                "자영업자 수만 조회하려면 quick_stat('자영업자수', region='전국', period='latest')",
+                "사업체 단위 비교가 필요하면 같은 사업체조사 계열 통계표를 선택",
+            ],
+            "검증_주의": notes,
             "route": route_payload["route"],
             "출처": "통계청 KOSIS",
         }
@@ -2022,6 +2072,8 @@ class NaturalLanguageAnswerEngine:
         route_payload = precomputed_route or self._route_payload(query)
         effective_region = self._effective_region(route_payload, region)
         inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
+        if self._is_self_employed_sme_population_question(query):
+            return await self._answer_self_employed_sme_population_warning(query, effective_region)
         if self._is_sme_large_sales_question(query):
             return await self._answer_sme_large_sales(query, effective_region)
         if self._is_sme_smallbiz_count_question(query):

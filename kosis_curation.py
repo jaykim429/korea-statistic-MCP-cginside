@@ -2870,6 +2870,10 @@ class NaturalLanguageRouter:
             *(parsed.intent_keys),
             *(parsed.specific_keys),
             *(parsed.generic_keys),
+            *(label for term, label in _TARGET_TERMS.items() if term in q_norm),
+            *(label for term, label in _INDICATOR_TERMS.items() if term in q_norm),
+            *([slots.target] if slots.target else []),
+            *([slots.indicator] if slots.indicator else []),
         ])
 
         if direct_key and search_terms:

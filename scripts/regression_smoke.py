@@ -134,6 +134,18 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"status": "executed", "answer_type": "tier_a_composite_comparison"},
     },
     {
+        "name": "answer_self_employed_sme_population_mismatch",
+        "tool": answer_query,
+        "args": ("자영업자와 중소기업 사업체수를 비교해줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_population_mixed_comparison",
+            "table_len": 2,
+            "answer_contains": "모집단",
+            "matched_concepts_contains": "자영업자",
+        },
+    },
+    {
         "name": "answer_ai_stats_search",
         "tool": answer_query,
         "args": ("AI 관련 통계 찾아줘",),
@@ -451,6 +463,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "slot_enrichment": result.get("검색어_슬롯보강"),
         "dependency_key": result.get("dependency_key"),
         "target_group": result.get("대상군"),
+        "matched_concepts": (result.get("route") or {}).get("matched_concepts") or [],
     }
 
 
@@ -475,6 +488,10 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"dependency_key={summary['dependency_key']}")
     if "target_group" in expect and summary["target_group"] != expect["target_group"]:
         problems.append(f"target_group={summary['target_group']}")
+    if "matched_concepts_contains" in expect:
+        concepts = list(summary.get("matched_concepts") or [])
+        if expect["matched_concepts_contains"] not in concepts:
+            problems.append(f"matched_concepts={concepts}")
     if "region" in expect and summary["region"] != expect["region"]:
         problems.append(f"region={summary['region']}")
     if "period" in expect and str(summary["period"]) != expect["period"]:
