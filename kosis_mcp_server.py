@@ -3672,17 +3672,23 @@ async def chart_dashboard(
         summary["기울기/년"] = lr.get("기울기_연간")
         summary["R²"] = lr.get("R제곱")
     if "변화율" in trend:
+        analysis_period = str(trend.get("기간") or "")
+        summary["분석기간"] = f"{analysis_period} · {trend.get('데이터수')}개 시점"
         summary["평균 변화율"] = f"{trend['변화율']['평균_퍼센트']:+.2f}%"
         recent_window = trend["변화율"].get("최근_구간") or {}
-        recent_start = str(recent_window.get("시작") or "")[:4]
-        recent_end = str(recent_window.get("끝") or "")[:4]
+        recent_start = str(recent_window.get("시작") or "")
+        recent_end = str(recent_window.get("끝") or "")
         recent_label = (
-            f"최근 변화({recent_start}→{recent_end})"
+            "최근 변화"
             if recent_start and recent_end else "최근 변화"
         )
-        summary[recent_label] = f"{trend['변화율']['최근_퍼센트']:+.2f}%"
+        recent_value = f"{trend['변화율']['최근_퍼센트']:+.2f}%"
+        if recent_start and recent_end:
+            recent_value = f"{recent_start}→{recent_end}: {recent_value}"
+        summary[recent_label] = recent_value
     if "극값" in trend:
-        summary["최댓값"] = f"{trend['극값']['최댓값']['시점'][:4]}: {trend['극값']['최댓값']['값']}"
+        max_point = trend["극값"]["최댓값"]
+        summary["분석기간 내 최댓값"] = f"{max_point['시점']}: {max_point['값']}"
     summary["해석"] = trend.get("해석", "")
 
     svg = chart_dashboard_svg(
@@ -3701,7 +3707,8 @@ async def chart_dashboard(
             type="text",
             text=(
                 f"{param.description} 대시보드 — 시계열 {len(timeseries)}개 + "
-                f"예측 {len(forecast_pts)}년 + 지역 비교 {len(items)}개"
+                f"예측 {len(forecast_pts)}년 + 지역 비교 {len(items)}개. "
+                f"추세·요약 분석기간: {trend.get('기간', '확인 불가')}"
             ),
         ),
     ]

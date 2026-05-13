@@ -33,6 +33,23 @@ def _title(parts: list[str], title: str, source: str, w: int) -> None:
         parts.append(f'<text x="{w - 24}" y="30" text-anchor="end" font-size="11" fill="#64748b">{escape(source)}</text>')
 
 
+def _wrap_text(text: str, max_chars: int = 34) -> list[str]:
+    text = str(text)
+    if len(text) <= max_chars:
+        return [text]
+    lines: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars and len(lines) < 2:
+        cut = remaining.rfind(" ", 0, max_chars + 1)
+        if cut <= 0:
+            cut = max_chars
+        lines.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        lines.append(remaining)
+    return lines[:3]
+
+
 def chart_heatmap_svg(
     matrix: list[list[Optional[float]]],
     row_labels: list[str],
@@ -179,8 +196,18 @@ def chart_dashboard_svg(
     parts.append('<rect x="24" y="308" width="410" height="220" fill="#f8fafc" stroke="#cbd5e1"/>')
     y = 338
     for key, value in list(summary.items())[:6]:
-        parts.append(f'<text x="48" y="{y}" font-size="12"><tspan font-weight="700">{escape(str(key))}</tspan>: {escape(str(value))}</text>')
-        y += 26
+        lines = _wrap_text(f"{key}: {value}", 48)
+        for idx, line in enumerate(lines):
+            if idx == 0 and ":" in line:
+                label, rest = line.split(":", 1)
+                parts.append(
+                    f'<text x="48" y="{y}" font-size="12"><tspan font-weight="700">'
+                    f'{escape(label)}</tspan>:{escape(rest)}</text>'
+                )
+            else:
+                parts.append(f'<text x="48" y="{y}" font-size="12">{escape(line)}</text>')
+            y += 16
+        y += 7
     parts.append('<rect x="466" y="308" width="410" height="220" fill="#f8fafc" stroke="#cbd5e1"/>')
     if forecast:
         parts.append(f'<text x="490" y="338" font-size="13" font-weight="700">Forecast ({escape(unit)})</text>')
