@@ -115,6 +115,41 @@ STATUS_INVALID_PERIOD_RANGE = "INVALID_PERIOD_RANGE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
 STATUS_RUNTIME_ERROR = "RUNTIME_ERROR"
 
+GEMMA_DEPRECATED_TOOL_WARNING = {
+    "tool": "answer_query",
+    "manifest_policy": "hide_from_gemma_default",
+    "recommended_replacement": "plan_query",
+    "reason": (
+        "answer_query can execute shortcut answers and may hide partial fulfillment. "
+        "Gemma chatbot integrations should prefer plan_query -> select_table_for_query -> "
+        "resolve_concepts -> query_table -> compute/LLM synthesis."
+    ),
+}
+
+
+def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]:
+    """Self-announce deprecated shortcut tools in the machine-readable payload."""
+    result = dict(payload)
+    result.setdefault("deprecation_warning", GEMMA_DEPRECATED_TOOL_WARNING)
+    result.setdefault("recommended_replacement", {
+        "tool": "plan_query",
+        "first_call": "plan_query(query)",
+        "workflow": [
+            "plan_query",
+            "select_table_for_query",
+            "resolve_concepts",
+            "query_table",
+            "compute_indicator_or_chatbot_synthesis",
+        ],
+    })
+    result.setdefault("llm_guardrails", [
+        "This response came from a deprecated shortcut tool; Gemma default manifests should not call answer_query directly.",
+        "Do not pass this response to the user as the final answer when the query is composite, multi-axis, ratio, ranking, trend, or report-style.",
+        "Re-run the same query through plan_query -> select_table_for_query -> resolve_concepts -> query_table when reliability matters.",
+        "If this response is partial, unsupported, or a search plan, report that limitation instead of filling gaps from model knowledge.",
+    ])
+    return result
+
 FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
     "share_ratio": {
         "canonical": "비중/구성비",
@@ -3324,9 +3359,17 @@ async def answer_query(
     key = _resolve_key(api_key)
     engine = NaturalLanguageAnswerEngine(key)
     try:
-        return await engine.answer(query, region)
+        result = await engine.answer(query, region)
+        return _attach_gemma_deprecation_warning(result)
     except RuntimeError as e:
-        return {"상태": "failed", "코드": STATUS_RUNTIME_ERROR, "오류": str(e), "질문": query}
+        return _attach_gemma_deprecation_warning({
+            "상태": "failed",
+            "status": "failed",
+            "코드": STATUS_RUNTIME_ERROR,
+            "code": STATUS_RUNTIME_ERROR,
+            "오류": str(e),
+            "질문": query,
+        })
 
 
 @mcp.tool()
