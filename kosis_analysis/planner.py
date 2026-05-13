@@ -81,26 +81,41 @@ class QueryWorkflowPlanner:
         calculations = self._calculations(query, route_payload)
         intent = self._intent(route_payload, calculations, dimensions)
         concepts = self._concepts(dimensions, calculations)
-        required = self._required_dimensions(query, dimensions, calculations, route_payload)
-        consistency_warnings = self._consistency_warnings(dimensions, route_payload)
-        metrics = self._metrics(query, dimensions, route_payload)
-        bundle_dimensions = self._bundle_dimensions(query, dimensions, required, route_payload)
+        semantic_required = self._required_dimensions(query, dimensions, calculations, route_payload)
+        table_required = self._table_required_dimensions(semantic_required)
+        raw_metrics = self._metrics(query, dimensions, route_payload)
+        metrics, quarantined_metrics, metric_decisions = self._validate_metrics(raw_metrics, dimensions, route_payload, query)
+        bundle_dimensions = self._bundle_dimensions(query, dimensions, semantic_required, route_payload)
+        semantic_dimensions = self._semantic_dimensions(dimensions, route_payload)
         comparison_targets = self._comparison_targets(query, dimensions, route_payload)
         time_request = self._time_request(dimensions, route_payload)
-        analysis_tasks = self._analysis_tasks(query, intent, dimensions, calculations, route_payload, metrics, bundle_dimensions)
+        rank_candidates = self._rank_candidates(query, route_payload)
+        analysis_tasks = self._analysis_tasks(
+            query,
+            intent,
+            dimensions,
+            calculations,
+            route_payload,
+            metrics,
+            bundle_dimensions,
+            rank_candidates,
+        )
         presentation = self._presentation_spec(query, route_payload)
         handoff_to_llm = self._handoff_to_llm(query, analysis_tasks, presentation)
-        evidence_bundle = self._is_evidence_bundle(metrics, bundle_dimensions, comparison_targets, analysis_tasks, handoff_to_llm)
+        analysis_mode = self._analysis_mode(metrics, bundle_dimensions, comparison_targets, analysis_tasks, handoff_to_llm)
+        evidence_bundle = analysis_mode == "composite_analysis"
+        conflict_decisions = metric_decisions + self._time_conflict_decisions(dimensions, route_payload)
+        consistency_warnings = self._legacy_consistency_warnings(conflict_decisions)
 
         confidence = "medium"
-        if dimensions.get("indicator") and required:
+        if dimensions.get("indicator") and table_required:
             confidence = "high"
         elif route_payload.get("route", {}).get("type") == "miss":
             confidence = "low"
         if self._needs_clarification(dimensions, concepts, calculations, route_payload, metrics, analysis_tasks):
             return self._clarification_response(query, dimensions, concepts, calculations, route_payload)
 
-        workflow = self._workflow(query, intent, required, concepts, dimensions, calculations)
+        workflow = self._workflow(query, intent, table_required, concepts, dimensions, calculations)
 
         return {
             "상태": "planned",
@@ -111,12 +126,17 @@ class QueryWorkflowPlanner:
             "verification_level": "planning_only",
             "confidence": confidence,
             "intended_dimensions": dimensions,
-            "required_dimensions": required,
+            "required_dimensions": table_required,
+            "semantic_required_dimensions": semantic_required,
+            "table_required_dimensions": table_required,
+            "semantic_dimensions": semantic_dimensions,
             "concepts": concepts,
             "calculations": calculations,
-            "analysis_mode": "composite_analysis" if evidence_bundle else "single_path",
+            "analysis_mode": analysis_mode,
             "evidence_bundle": evidence_bundle,
             "metrics": metrics,
+            "raw_metric_candidates": raw_metrics,
+            "quarantined_metrics": quarantined_metrics,
             "dimensions": bundle_dimensions,
             "comparison_targets": comparison_targets,
             "time_request": time_request,
@@ -129,7 +149,11 @@ class QueryWorkflowPlanner:
                 "allowed_statuses": ["matched", "weak_match", "not_matched"],
                 "note": "plan_query extracts requested metrics only; KOSIS availability is verified later from metadata.",
             },
-            "consistency_policy": self.CONSISTENCY_POLICY,
+            "consistency_policy": {
+                "rule": "candidate_normalize_validate_emit",
+                "note": "router_slots는 증거 후보입니다. metrics와 analysis_tasks는 정제·격리된 후보에서만 생성됩니다.",
+            },
+            "conflict_decisions": conflict_decisions,
             "consistency_warnings": consistency_warnings,
             "router_slots_overridden": self._router_slot_overrides(consistency_warnings),
             "suggested_workflow": [step.to_dict() for step in workflow],
@@ -237,6 +261,144 @@ class QueryWorkflowPlanner:
         }
 
     @staticmethod
+    def _table_required_dimensions(required: list[str]) -> list[str]:
+        """Convert semantic dimensions to KOSIS metadata axis requirements."""
+        mapping = {
+            "regions": "region",
+            "industries": "industry",
+            "ages": "age",
+        }
+        output: list[str] = []
+        for item in required:
+            normalized = mapping.get(item, item)
+            if normalized not in output:
+                output.append(normalized)
+        return output
+
+    @staticmethod
+    def _semantic_dimensions(dimensions: dict[str, Any], route_payload: dict[str, Any]) -> dict[str, Any]:
+        semantic: dict[str, Any] = {}
+        for key in ("region", "regions", "region_group", "age", "sex", "industry", "time", "event"):
+            if dimensions.get(key) is not None:
+                semantic[key] = dimensions[key]
+        slots = route_payload.get("slots") or {}
+        if isinstance(slots, dict):
+            if slots.get("target"):
+                semantic["scale"] = slots["target"]
+            elif slots.get("scale"):
+                semantic["scale"] = slots["scale"]
+        return semantic
+
+    def _validate_metrics(
+        self,
+        raw_metrics: list[dict[str, Any]],
+        dimensions: dict[str, Any],
+        route_payload: dict[str, Any],
+        query: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        slots = route_payload.get("slots") or {}
+        router_indicator = slots.get("indicator") if isinstance(slots, dict) else None
+        intended_indicator = dimensions.get("indicator")
+        conflict = self._indicator_conflicts(intended_indicator, router_indicator)
+        explicit_multi = self._explicit_multi_metric_query(query, slots)
+
+        metrics: list[dict[str, Any]] = []
+        quarantined: list[dict[str, Any]] = []
+        decisions: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_metric(metric: dict[str, Any]) -> None:
+            name = metric.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return
+            key = self._metric_key(name)
+            if key in seen:
+                return
+            seen.add(key)
+            item = dict(metric)
+            item.setdefault("availability", "unknown")
+            metrics.append(item)
+
+        for metric in raw_metrics:
+            source = metric.get("source")
+            name = metric.get("name")
+            if conflict and not explicit_multi and source == "router_slots.indicator" and name == router_indicator:
+                quarantined.append({
+                    "name": name,
+                    "reason": "router_indicator_conflicts_with_intended",
+                    "source": source,
+                    "availability": "not_used_in_plan",
+                })
+                decisions.append({
+                    "type": "indicator_quarantine",
+                    "candidate": name,
+                    "source": source,
+                    "reason": "conflicts_with_intended_indicator",
+                    "kept_metric": intended_indicator,
+                    "policy": "conflicting_router_quarantined",
+                })
+                continue
+            add_metric(metric)
+
+        if not metrics and raw_metrics:
+            add_metric(raw_metrics[0])
+        return metrics, quarantined, decisions
+
+    @staticmethod
+    def _explicit_multi_metric_query(query: str, slots: Any) -> bool:
+        secondary = slots.get("secondary_indicators") if isinstance(slots, dict) else None
+        if isinstance(secondary, list) and secondary:
+            return True
+        return any(token in query for token in (",", "·", "/"))
+
+    def _time_conflict_decisions(
+        self,
+        dimensions: dict[str, Any],
+        route_payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        slots = route_payload.get("slots") or {}
+        if not isinstance(slots, dict):
+            return []
+        primary_time = dimensions.get("time")
+        slot_time = slots.get("time")
+        if not self._value_conflicts(primary_time, slot_time):
+            return []
+        return [{
+            "type": "time_conflict",
+            "primary": primary_time,
+            "router_slot": slot_time,
+            "resolution": "intended_time_used",
+            "policy": "query_or_intended_time_preferred",
+        }]
+
+    @staticmethod
+    def _legacy_consistency_warnings(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        for decision in decisions:
+            if decision.get("type") == "indicator_quarantine":
+                warnings.append({
+                    "type": "indicator_conflict",
+                    "slot": "indicator",
+                    "primary": decision.get("kept_metric"),
+                    "router_slot": decision.get("candidate"),
+                    "resolution": "conflicting_router_quarantined",
+                    "message": (
+                        f"router_slots.indicator '{decision.get('candidate')}' was quarantined "
+                        f"because it conflicts with intended indicator '{decision.get('kept_metric')}'."
+                    ),
+                })
+            elif decision.get("type") == "time_conflict":
+                warnings.append({
+                    "type": "time_conflict",
+                    "slot": "time",
+                    "primary": decision.get("primary"),
+                    "router_slot": decision.get("router_slot"),
+                    "resolution": "intended_time_used",
+                    "message": "router_slots.time differs from normalized intended time.",
+                })
+        return warnings
+
+    @staticmethod
     def _consistency_warnings(
         dimensions: dict[str, Any],
         route_payload: dict[str, Any],
@@ -319,13 +481,39 @@ class QueryWorkflowPlanner:
             return False
         if str(secondary) in QueryWorkflowPlanner.GENERIC_ROUTER_INDICATORS:
             return False
+        p_norm = _compact_text(str(primary))
+        s_norm = _compact_text(str(secondary))
+        if p_norm and s_norm and (p_norm in s_norm or s_norm in p_norm):
+            return False
         return True
 
     @staticmethod
     def _value_conflicts(primary: Any, secondary: Any) -> bool:
         if not primary or not secondary:
             return False
+        if isinstance(primary, dict) and isinstance(secondary, dict):
+            if QueryWorkflowPlanner._time_values_equivalent(primary, secondary):
+                return False
         return primary != secondary
+
+    @staticmethod
+    def _time_values_equivalent(primary: dict[str, Any], secondary: dict[str, Any]) -> bool:
+        if primary == secondary:
+            return True
+        primary_type = primary.get("type")
+        secondary_type = secondary.get("type")
+        if primary_type == secondary_type == "relative_period":
+            if primary.get("value") and primary.get("value") == secondary.get("value"):
+                return True
+            if primary.get("years") and secondary.get("years") and int(primary["years"]) == int(secondary["years"]):
+                return True
+            if primary.get("months") and secondary.get("months") and int(primary["months"]) == int(secondary["months"]):
+                return True
+        if {primary_type, secondary_type} == {"year", "month"}:
+            year_value = str(primary.get("value") if primary_type == "year" else secondary.get("value") or "")
+            month_value = str(primary.get("value") if primary_type == "month" else secondary.get("value") or "")
+            return bool(year_value and month_value.startswith(year_value) and month_value.endswith("01"))
+        return False
 
     def _dimensions(self, query: str, route_payload: dict[str, Any]) -> dict[str, Any]:
         q_norm = _compact_text(query)
@@ -824,6 +1012,37 @@ class QueryWorkflowPlanner:
         return slot_time if isinstance(slot_time, dict) else None
 
     @staticmethod
+    def _rank_candidates(query: str, route_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        q_lower = query.lower()
+        q_norm = _compact_text(query)
+        slots = route_payload.get("slots") or {}
+        limit = None
+        limit_match = re.search(r"(\d+)\s*(?:개|곳|위|개의|곳씩|개씩)", query)
+        if limit_match:
+            limit = int(limit_match.group(1))
+        elif top_match := re.search(r"\btop\s*(\d+)\b", q_lower):
+            limit = int(top_match.group(1))
+
+        top_terms = ("가장높", "높은", "상위", "최고", "최대", "top")
+        bottom_terms = ("가장낮", "낮은", "하위", "최저", "최소", "bottom")
+        has_top = any(term in q_norm or term in q_lower for term in top_terms)
+        has_bottom = any(term in q_norm or term in q_lower for term in bottom_terms)
+
+        ranks: list[dict[str, Any]] = []
+        if has_top:
+            ranks.append({"order": "desc", "limit": limit, "label": "top", "raw_phrase": "top"})
+        if has_bottom:
+            ranks.append({"order": "asc", "limit": limit, "label": "bottom", "raw_phrase": "bottom"})
+        if not ranks and isinstance(slots, dict) and slots.get("sort"):
+            ranks.append({
+                "order": slots.get("sort"),
+                "limit": slots.get("limit") or limit,
+                "label": None,
+                "raw_phrase": "router_slots.sort",
+            })
+        return ranks
+
+    @staticmethod
     def _analysis_tasks(
         query: str,
         intent: str,
@@ -832,6 +1051,7 @@ class QueryWorkflowPlanner:
         route_payload: dict[str, Any],
         metrics: list[dict[str, Any]],
         bundle_dimensions: list[dict[str, Any]],
+        rank_candidates: Optional[list[dict[str, Any]]] = None,
     ) -> list[dict[str, Any]]:
         q_norm = _compact_text(query)
         slots = route_payload.get("slots") or {}
@@ -851,13 +1071,24 @@ class QueryWorkflowPlanner:
 
         if "share" in calculations or any(term in q_norm for term in ("비중", "비율", "구성비")):
             add("share_by_group", metrics=metric_names, dimensions=dimension_names)
-        if "growth_rate" in calculations or any(term in q_norm for term in ("증가율", "감소율", "변화율", "증가", "감소", "늘었", "줄어", "커진", "하락")):
+        if "growth_rate" in calculations or any(term in q_norm for term in ("증가율", "감소율", "변화율", "변화", "증가", "감소", "늘었", "줄어", "커진", "하락")):
             add("growth_rate", metrics=metric_names, dimensions=dimension_names)
-        if "change" in calculations or any(term in q_norm for term in ("증가", "감소", "늘었", "줄었", "줄어", "차이", "격차", "대비", "하락")):
+        if "change" in calculations or any(term in q_norm for term in ("변화", "증가", "감소", "늘었", "줄었", "줄어", "차이", "격차", "대비", "하락")):
             add("change_compare", metrics=metric_names, dimensions=dimension_names)
         sort = slots.get("sort") if isinstance(slots, dict) else None
         limit = slots.get("limit") if isinstance(slots, dict) else None
-        if intent == "ranking" or sort or limit or any(term in q_norm for term in ("top", "상위", "하위", "순위", "가장")):
+        ranks = rank_candidates or []
+        if ranks:
+            for rank in ranks:
+                add(
+                    "rank",
+                    metrics=metric_names,
+                    dimensions=dimension_names,
+                    order=rank.get("order"),
+                    limit=rank.get("limit"),
+                    label=rank.get("label"),
+                )
+        elif intent == "ranking" or sort or limit or any(term in q_norm for term in ("top", "상위", "하위", "순위", "가장")):
             add("rank", metrics=metric_names, dimensions=dimension_names, order=sort, limit=limit)
         if "상위" in q_norm and "하위" in q_norm:
             add("top_bottom_rank", metrics=metric_names, dimensions=dimension_names, limit=limit)
@@ -908,7 +1139,7 @@ class QueryWorkflowPlanner:
     @staticmethod
     def _handoff_to_llm(query: str, analysis_tasks: list[dict[str, Any]], presentation: dict[str, Any]) -> dict[str, Any]:
         q_norm = _compact_text(query)
-        report_generation = any(fmt in presentation.get("formats", []) for fmt in ("report", "summary", "narrative"))
+        report_generation = any(fmt in presentation.get("formats", []) for fmt in ("report", "summary"))
         causal = any(term in q_norm for term in ("원인", "이유", "배경", "설명", "해석"))
         return {
             "final_answer_expected": True,
@@ -926,6 +1157,25 @@ class QueryWorkflowPlanner:
             ],
             "uses_analysis_tasks": [task.get("type") for task in analysis_tasks],
         }
+
+    @staticmethod
+    def _analysis_mode(
+        metrics: list[dict[str, Any]],
+        dimensions: list[dict[str, Any]],
+        comparison_targets: list[str],
+        analysis_tasks: list[dict[str, Any]],
+        handoff_to_llm: dict[str, Any],
+    ) -> str:
+        task_count = len(analysis_tasks)
+        if len(metrics) >= 2 or task_count >= 2 or len(dimensions) >= 2 or len(comparison_targets) >= 2:
+            return "composite_analysis"
+        if len(metrics) == 1 and task_count == 0:
+            return "simple_lookup"
+        if len(metrics) == 1 and task_count >= 1:
+            return "analytical_single_metric"
+        if handoff_to_llm.get("report_generation") or handoff_to_llm.get("causal_language") == "cautious":
+            return "composite_analysis"
+        return "simple_lookup"
 
     @staticmethod
     def _is_evidence_bundle(
