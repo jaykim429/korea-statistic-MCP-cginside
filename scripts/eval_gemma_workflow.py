@@ -35,6 +35,8 @@ CASES: list[dict[str, Any]] = [
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table", "compute_indicator"],
         "required_dimensions": ["region"],
         "concepts": ["GRDP", "서울", "per_capita"],
+        "consistency_warning_types": ["indicator_conflict"],
+        "router_slots_overridden": ["indicator"],
     },
     {
         "name": "metro_aging_speed",
@@ -43,6 +45,7 @@ CASES: list[dict[str, Any]] = [
         "required_dimensions": ["region_group", "age", "time"],
         "concepts": ["고령인구비중", "광역시", "65세 이상", "share", "growth_rate"],
         "compute_operations": ["share", "growth_rate"],
+        "consistency_warnings_len": 0,
     },
     {
         "name": "metro_aging_rate_rank",
@@ -57,6 +60,7 @@ CASES: list[dict[str, Any]] = [
         "query": "출생아 수 알려줘",
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
         "concepts": ["출생"],
+        "consistency_warnings_len": 0,
     },
     {
         "name": "marriage_colloquial",
@@ -82,7 +86,18 @@ CASES: list[dict[str, Any]] = [
         "query": "GRDP 최신값",
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
         "concepts": ["GRDP"],
+        "consistency_warning_types": ["indicator_conflict"],
+        "router_slots_overridden": ["indicator"],
         "future_must_not_match_concepts": ["R&D 투자 규모"],
+    },
+    {
+        "name": "metro_grdp_per_capita_conflict",
+        "query": "광역시 1인당 GRDP",
+        "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table", "compute_indicator"],
+        "required_dimensions": ["region_group"],
+        "concepts": ["GRDP", "광역시", "per_capita"],
+        "consistency_warning_types": ["indicator_conflict"],
+        "router_slots_overridden": ["indicator"],
     },
     {
         "name": "chicken_business_closure",
@@ -131,6 +146,17 @@ async def main() -> None:
         missing_compute_ops = _contains_all(compute_operations, case.get("compute_operations", []))
         if missing_compute_ops:
             problems.append({"missing_compute_operations": missing_compute_ops, "actual": compute_operations})
+        warnings = result.get("consistency_warnings", [])
+        if "consistency_warnings_len" in case and len(warnings) != case["consistency_warnings_len"]:
+            problems.append({"consistency_warnings_len": len(warnings), "warnings": warnings})
+        warning_types = [w.get("type") for w in warnings if isinstance(w, dict)]
+        missing_warning_types = _contains_all(warning_types, case.get("consistency_warning_types", []))
+        if missing_warning_types:
+            problems.append({"missing_consistency_warning_types": missing_warning_types, "actual": warning_types})
+        overridden = result.get("router_slots_overridden") or {}
+        missing_overrides = [slot for slot in case.get("router_slots_overridden", []) if slot not in overridden]
+        if missing_overrides:
+            problems.append({"missing_router_slot_overrides": missing_overrides, "actual": overridden})
         rows.append({
             "name": case["name"],
             "status": "PASS" if not problems else "FAIL",
@@ -138,6 +164,8 @@ async def main() -> None:
             "intent": result.get("intent"),
             "workflow": workflow,
             "compute_operations": compute_operations,
+            "consistency_warnings": warnings,
+            "router_slots_overridden": result.get("router_slots_overridden") or {},
             "required_dimensions": result.get("required_dimensions"),
             "concepts": result.get("concepts"),
             "future_expectations": {

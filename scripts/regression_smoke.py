@@ -402,6 +402,18 @@ TESTS: list[dict[str, Any]] = [
             "required_dimensions_contains": ["region"],
             "concepts_contains": ["GRDP", "서울", "per_capita"],
             "workflow_tools_contains": ["compute_indicator"],
+            "consistency_warning_types_contains": ["indicator_conflict"],
+            "router_slots_overridden_contains": ["indicator"],
+        },
+    },
+    {
+        "name": "plan_query_birth_no_consistency_warning",
+        "tool": plan_query,
+        "args": ("출생아 수 알려줘",),
+        "expect": {
+            "machine_status": "planned",
+            "concepts_contains": ["출생"],
+            "consistency_warnings_len": 0,
         },
     },
     {
@@ -651,6 +663,8 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
             for op in ((step.get("args") or {}).get("operations") or [(step.get("args") or {}).get("operation")])
             if op
         ],
+        "consistency_warnings": result.get("consistency_warnings") or [],
+        "router_slots_overridden": result.get("router_slots_overridden") or {},
     }
 
 
@@ -701,6 +715,22 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [op for op in expect["compute_operations_contains"] if op not in operations]
         if missing:
             problems.append(f"compute_operations={sorted(operations)}")
+    if "consistency_warning_types_contains" in expect:
+        warning_types = {
+            warning.get("type")
+            for warning in (summary.get("consistency_warnings") or [])
+            if isinstance(warning, dict)
+        }
+        missing = [typ for typ in expect["consistency_warning_types_contains"] if typ not in warning_types]
+        if missing:
+            problems.append(f"consistency_warning_types={sorted(warning_types)}")
+    if "consistency_warnings_len" in expect and len(summary.get("consistency_warnings") or []) != expect["consistency_warnings_len"]:
+        problems.append(f"consistency_warnings={summary.get('consistency_warnings')}")
+    if "router_slots_overridden_contains" in expect:
+        overridden = summary.get("router_slots_overridden") or {}
+        missing = [slot for slot in expect["router_slots_overridden_contains"] if slot not in overridden]
+        if missing:
+            problems.append(f"router_slots_overridden={overridden}")
     if "verification_level" in expect and summary["verification_level"] != expect["verification_level"]:
         problems.append(f"verification_level={summary['verification_level']}")
     if "aggregation" in expect and summary["aggregation"] != expect["aggregation"]:

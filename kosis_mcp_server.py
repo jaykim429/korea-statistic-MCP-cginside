@@ -994,6 +994,13 @@ class QueryWorkflowPlanner:
         "grdp": "GRDP",
         "gdp": "GDP",
     }
+    CONSISTENCY_POLICY = {
+        "rule": "primary_wins",
+        "primary_source": "intended_dimensions",
+        "secondary_source": "router_slots",
+        "note": "충돌 시 intended_dimensions가 권위입니다. router_slots는 디버깅용 보조 정보입니다.",
+    }
+    GENERIC_ROUTER_INDICATORS = {"비중", "비율", "구성비", "증가율", "감소율", "변화율"}
 
     def build(self, query: str) -> dict[str, Any]:
         route_payload = NaturalLanguageAnswerEngine._route_payload(query)
@@ -1002,6 +1009,7 @@ class QueryWorkflowPlanner:
         intent = self._intent(route_payload, calculations)
         concepts = self._concepts(dimensions, calculations)
         required = self._required_dimensions(dimensions, calculations)
+        consistency_warnings = self._consistency_warnings(dimensions, route_payload)
 
         confidence = "medium"
         if dimensions.get("indicator") and required:
@@ -1025,6 +1033,9 @@ class QueryWorkflowPlanner:
             "required_dimensions": required,
             "concepts": concepts,
             "calculations": calculations,
+            "consistency_policy": self.CONSISTENCY_POLICY,
+            "consistency_warnings": consistency_warnings,
+            "router_slots_overridden": self._router_slot_overrides(consistency_warnings),
             "suggested_workflow": [step.to_dict() for step in workflow],
             "next_call": workflow[0].to_dict() if workflow else None,
             "route": route_payload.get("route", {}),
@@ -1080,6 +1091,9 @@ class QueryWorkflowPlanner:
             "required_dimensions": [],
             "concepts": concepts,
             "calculations": calculations,
+            "consistency_policy": QueryWorkflowPlanner.CONSISTENCY_POLICY,
+            "consistency_warnings": [],
+            "router_slots_overridden": {},
             "suggested_workflow": [],
             "next_call": None,
             "suggested_clarification_questions": [
@@ -1101,6 +1115,97 @@ class QueryWorkflowPlanner:
                 "질문을 구체화한 뒤 plan_query를 다시 호출하세요.",
             ],
         }
+
+    @staticmethod
+    def _consistency_warnings(
+        dimensions: dict[str, Any],
+        route_payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        slots = route_payload.get("slots") or {}
+        if not isinstance(slots, dict):
+            return warnings
+
+        primary_indicator = dimensions.get("indicator")
+        slot_indicator = slots.get("indicator")
+        if QueryWorkflowPlanner._indicator_conflicts(primary_indicator, slot_indicator):
+            warnings.append({
+                "type": "indicator_conflict",
+                "slot": "indicator",
+                "primary": primary_indicator,
+                "router_slot": slot_indicator,
+                "resolution": "primary_indicator_wins",
+                "message": (
+                    f"plan_query primary indicator '{primary_indicator}' differs from "
+                    f"router_slots.indicator '{slot_indicator}'. Use primary indicator."
+                ),
+            })
+
+        primary_region = dimensions.get("region")
+        slot_region = slots.get("region")
+        if QueryWorkflowPlanner._scalar_conflicts(primary_region, slot_region):
+            warnings.append({
+                "type": "region_conflict",
+                "slot": "region",
+                "primary": primary_region,
+                "router_slot": slot_region,
+                "resolution": "primary_region_wins",
+                "message": (
+                    f"plan_query primary region '{primary_region}' differs from "
+                    f"router_slots.region '{slot_region}'. Use primary region."
+                ),
+            })
+
+        primary_time = dimensions.get("time")
+        slot_time = slots.get("time")
+        if QueryWorkflowPlanner._value_conflicts(primary_time, slot_time):
+            warnings.append({
+                "type": "time_conflict",
+                "slot": "time",
+                "primary": primary_time,
+                "router_slot": slot_time,
+                "resolution": "primary_time_wins",
+                "message": "plan_query intended time differs from router_slots.time. Use intended_dimensions.time.",
+            })
+        return warnings
+
+    @staticmethod
+    def _router_slot_overrides(warnings: list[dict[str, Any]]) -> dict[str, Any]:
+        overrides: dict[str, Any] = {}
+        for warning in warnings:
+            slot = warning.get("slot")
+            if not slot:
+                continue
+            overrides[str(slot)] = {
+                "original": warning.get("router_slot"),
+                "used": warning.get("primary"),
+                "resolution": warning.get("resolution"),
+            }
+        return overrides
+
+    @staticmethod
+    def _scalar_conflicts(primary: Any, secondary: Any) -> bool:
+        return (
+            isinstance(primary, str)
+            and isinstance(secondary, str)
+            and bool(primary)
+            and bool(secondary)
+            and primary != secondary
+        )
+
+    @staticmethod
+    def _indicator_conflicts(primary: Any, secondary: Any) -> bool:
+        if not QueryWorkflowPlanner._scalar_conflicts(primary, secondary):
+            return False
+        if str(secondary) in QueryWorkflowPlanner.GENERIC_ROUTER_INDICATORS:
+            return False
+        return True
+
+    @staticmethod
+    def _value_conflicts(primary: Any, secondary: Any) -> bool:
+        if not primary or not secondary:
+            return False
+        return primary != secondary
 
     def _dimensions(self, query: str, route_payload: dict[str, Any]) -> dict[str, Any]:
         q_norm = _compact_text(query)
@@ -1142,6 +1247,8 @@ class QueryWorkflowPlanner:
             dimensions["time"] = time_value
 
         industry = slots.get("industry") if isinstance(slots, dict) else None
+        if not industry and any(term in q_norm for term in ("치킨", "음식점")):
+            industry = "음식점업"
         if industry:
             dimensions["industry"] = industry
         return dimensions
@@ -1153,7 +1260,9 @@ class QueryWorkflowPlanner:
             ("인구", "인구"),
             ("출생", "출생"),
             ("혼인", "혼인"),
-            ("치킨", "음식점업"),
+            ("폐업률", "폐업률"),
+            ("창업률", "창업률"),
+            ("생존율", "생존율"),
             ("폐업", "폐업"),
         ]
         for token, label in manual:
