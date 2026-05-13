@@ -81,6 +81,181 @@ CASES: list[dict[str, Any]] = [
         "time_type": "year",
         "no_time_conflict": True,
     },
+    {
+        "name": "trend_time_group_not_table_axis",
+        "query": "최근 5년간 실업률 추이",
+        "metrics": ["실업률"],
+        "analysis_mode": "analytical_single_metric",
+        "time_type": "relative_period",
+        "table_required_dimensions": ["time"],
+        "must_not_table_required_dimensions": ["year"],
+        "task_types": ["trend"],
+    },
+    {
+        "name": "ppi_alias_maps_to_producer_price_index",
+        "query": "PPI latest",
+        "metrics": ["생산자물가지수"],
+        "must_not_status": "needs_clarification",
+    },
+    {
+        "name": "business_count_intent_from_daily_phrase",
+        "query": "치킨집 얼마나 있어?",
+        "metrics": ["사업체 수"],
+        "table_required_dimensions": ["industry"],
+        "must_not_status": "needs_clarification",
+        "evidence_workflow_nonempty": True,
+    },
+    {
+        "name": "clarification_has_failure_signal",
+        "query": "한국 좀 어때",
+        "status_expected": "needs_clarification",
+        "current_signal_has_failures": True,
+        "current_signal_has_caveats": True,
+        "current_signal_markers": ["needs_clarification", "missing_metrics"],
+    },
+    {
+        "name": "ambiguous_no_indicator_has_caveat",
+        "query": "통계 보여줘",
+        "status_expected": "needs_clarification",
+        "current_signal_has_failures": True,
+        "current_signal_has_caveats": True,
+        "current_signal_markers": ["needs_clarification", "missing_metrics"],
+    },
+    {
+        "name": "crypto_missing_metric_has_caveat",
+        "query": "대한민국 비트코인 채굴량",
+        "status_expected": "needs_clarification",
+        "current_signal_has_failures": True,
+        "current_signal_has_caveats": True,
+        "current_signal_markers": ["needs_clarification", "missing_metrics"],
+    },
+    {
+        "name": "clean_simple_lookup_single_caveat",
+        "query": "2023년 합계출산율",
+        "metrics_length": 1,
+        "quarantined_metrics_length": 0,
+        "current_signal_exact_markers": ["metric_availability_unverified"],
+        "analysis_mode": "simple_lookup",
+        "evidence_bundle": False,
+    },
+    {
+        "name": "monthly_trend_month_not_dimension",
+        "query": "월별 소비자물가지수 추이",
+        "metrics": ["소비자물가지수"],
+        "table_required_dimensions": ["time"],
+        "must_not_table_required_dimensions": ["month"],
+        "task_types": ["trend"],
+    },
+    {
+        "name": "quarterly_trend_quarter_not_dimension",
+        "query": "분기별 GDP 추이",
+        "metrics": ["GDP"],
+        "table_required_dimensions": ["time"],
+        "must_not_table_required_dimensions": ["quarter"],
+        "task_types": ["trend"],
+    },
+    {
+        "name": "industry_and_year_split",
+        "query": "산업별 연도별 사업체수 추이",
+        "metrics": ["사업체 수"],
+        "table_required_dimensions": ["industry", "time"],
+        "must_not_table_required_dimensions": ["year"],
+        "task_types": ["trend"],
+    },
+    {
+        "name": "single_metric_ranking_is_analytical",
+        "query": "2024년 시도별 인구 순위",
+        "metrics_length": 1,
+        "task_types": ["rank"],
+        "analysis_mode": "analytical_single_metric",
+        "evidence_bundle": False,
+    },
+    {
+        "name": "single_metric_calculation_is_analytical",
+        "query": "서울 1인당 GRDP",
+        "metrics_length": 1,
+        "calculations": ["per_capita"],
+        "task_types": ["per_capita"],
+        "analysis_mode": "analytical_single_metric",
+        "evidence_bundle": False,
+    },
+    {
+        "name": "mode_bundle_consistency_simple",
+        "query": "한국 인구",
+        "analysis_mode": "simple_lookup",
+        "evidence_bundle_matches_mode": True,
+    },
+    {
+        "name": "mode_bundle_consistency_analytical",
+        "query": "최근 5년간 실업률 추이",
+        "analysis_mode": "analytical_single_metric",
+        "evidence_bundle_matches_mode": True,
+    },
+    {
+        "name": "mode_bundle_consistency_composite",
+        "query": "소상공인 사업체수와 종사자수 비교",
+        "analysis_mode": "composite_analysis",
+        "evidence_bundle_matches_mode": True,
+        "metrics_length_gte": 2,
+    },
+    {
+        "name": "workflow_sync_planned_nonempty",
+        "query": "치킨집 얼마나 있어?",
+        "must_not_status": "needs_clarification",
+        "evidence_workflow_nonempty": True,
+        "suggested_workflow_not_richer": True,
+    },
+    {
+        "name": "canonical_workflow_nonempty_when_planned",
+        "query": "서울 1인당 GRDP",
+        "canonical_workflow": "evidence_workflow",
+        "evidence_workflow_nonempty": True,
+    },
+    {
+        "name": "birth_rate_and_count_visible",
+        "query": "출생율이 가장 낮은 시도 Top 5와 출생아 수 Top 5가 같은지 비교해줘.",
+        "metrics": ["출생율", "출생아 수"],
+        "table_required_dimensions": ["region"],
+        "task_types": ["rank", "rank_compare", "rank_overlap"],
+    },
+    {
+        "name": "time_expression_tilde_range",
+        "query": "2015~2024 인구 변화",
+        "time_type": "year_range",
+        "time_start": "2015",
+        "time_end": "2024",
+    },
+    {
+        "name": "regression_grdp_trend_combo",
+        "query": "최근 5년간 서울 GRDP 추이",
+        "metrics": ["GRDP"],
+        "must_not_metrics": ["R&D 투자 규모"],
+        "quarantined_metrics": ["R&D 투자 규모"],
+        "time_type": "relative_period",
+        "table_required_dimensions": ["region", "time"],
+        "must_not_table_required_dimensions": ["year"],
+        "task_types": ["trend"],
+    },
+    {
+        "name": "regression_comparison_range_combo",
+        "query": "2015년부터 2024년까지 서울과 부산의 인구 변화",
+        "metrics_length": 1,
+        "semantic_regions": ["서울", "부산"],
+        "table_required_dimensions": ["region", "time"],
+        "must_not_table_required_dimensions": ["regions", "year"],
+        "time_type": "year_range",
+        "time_start": "2015",
+        "time_end": "2024",
+    },
+    {
+        "name": "regression_top_bottom_calculation",
+        "query": "2024년 1인당 GRDP가 가장 높은 시도 3개와 가장 낮은 시도 3개",
+        "rank_orders": ["desc", "asc"],
+        "rank_limit": 3,
+        "calculations": ["per_capita"],
+        "must_not_metrics": ["R&D 투자 규모"],
+        "quarantined_metrics": ["R&D 투자 규모"],
+    },
 ]
 
 
@@ -100,6 +275,11 @@ async def main() -> None:
         metrics_blob = _blob(result.get("metrics") or [])
         quarantined_blob = _blob(result.get("quarantined_metrics") or [])
 
+        if "status_expected" in case and result.get("status") != case["status_expected"]:
+            problems.append({"status": result.get("status"), "expected": case["status_expected"]})
+        if "must_not_status" in case and result.get("status") == case["must_not_status"]:
+            problems.append({"forbidden_status": result.get("status")})
+
         missing_metrics = _missing(metrics_blob, case.get("metrics", []))
         if missing_metrics:
             problems.append({"missing_metrics": missing_metrics, "metrics": result.get("metrics")})
@@ -112,6 +292,21 @@ async def main() -> None:
                 "missing_quarantined_metrics": missing_quarantined,
                 "quarantined_metrics": result.get("quarantined_metrics"),
             })
+        if "metrics_length" in case:
+            metrics_count = len(result.get("metrics") or [])
+            if metrics_count != case["metrics_length"]:
+                problems.append({"metrics_length": metrics_count, "expected": case["metrics_length"]})
+        if "metrics_length_gte" in case:
+            metrics_count = len(result.get("metrics") or [])
+            if metrics_count < case["metrics_length_gte"]:
+                problems.append({"metrics_length": metrics_count, "expected_gte": case["metrics_length_gte"]})
+        if "quarantined_metrics_length" in case:
+            quarantined_count = len(result.get("quarantined_metrics") or [])
+            if quarantined_count != case["quarantined_metrics_length"]:
+                problems.append({
+                    "quarantined_metrics_length": quarantined_count,
+                    "expected": case["quarantined_metrics_length"],
+                })
 
         if "evidence_bundle" in case and result.get("evidence_bundle") is not case["evidence_bundle"]:
             problems.append({"evidence_bundle": result.get("evidence_bundle"), "expected": case["evidence_bundle"]})
@@ -121,6 +316,16 @@ async def main() -> None:
             count = len(result.get("analysis_tasks") or [])
             if count != case["analysis_task_count"]:
                 problems.append({"analysis_task_count": count, "expected": case["analysis_task_count"]})
+        if "task_types" in case:
+            task_types = [task.get("type") for task in result.get("analysis_tasks") or []]
+            missing_tasks = [task for task in case["task_types"] if task not in task_types]
+            if missing_tasks:
+                problems.append({"missing_task_types": missing_tasks, "actual": task_types})
+        if "calculations" in case:
+            calculations = result.get("calculations") or []
+            missing_calculations = [item for item in case["calculations"] if item not in calculations]
+            if missing_calculations:
+                problems.append({"missing_calculations": missing_calculations, "actual": calculations})
 
         contract = result.get("mcp_output_contract") or {}
         if "contract_role" in case and contract.get("role") != case["contract_role"]:
@@ -152,6 +357,37 @@ async def main() -> None:
             current_signals = contract.get("current_signals") or {}
             if "has_caveats" not in current_signals or "markers_present" not in current_signals:
                 problems.append({"current_signals": current_signals})
+            if (
+                "current_signal_has_failures" in case
+                and current_signals.get("has_failures") is not case["current_signal_has_failures"]
+            ):
+                problems.append({
+                    "current_signal_has_failures": current_signals.get("has_failures"),
+                    "expected": case["current_signal_has_failures"],
+                    "current_signals": current_signals,
+                })
+            if (
+                "current_signal_has_caveats" in case
+                and current_signals.get("has_caveats") is not case["current_signal_has_caveats"]
+            ):
+                problems.append({
+                    "current_signal_has_caveats": current_signals.get("has_caveats"),
+                    "expected": case["current_signal_has_caveats"],
+                    "current_signals": current_signals,
+                })
+            missing_markers = [
+                marker for marker in case.get("current_signal_markers", [])
+                if marker not in (current_signals.get("markers_present") or [])
+            ]
+            if missing_markers:
+                problems.append({"missing_current_signal_markers": missing_markers, "current_signals": current_signals})
+            if "current_signal_exact_markers" in case:
+                markers = current_signals.get("markers_present") or []
+                if markers != case["current_signal_exact_markers"]:
+                    problems.append({
+                        "current_signal_exact_markers": markers,
+                        "expected": case["current_signal_exact_markers"],
+                    })
         manifest = result.get("recommended_tool_manifest") or {}
         expose = manifest.get("expose") or []
         hide = manifest.get("hide_by_default") or []
@@ -204,6 +440,24 @@ async def main() -> None:
         forbidden_dims = [dim for dim in case.get("must_not_table_required_dimensions", []) if dim in table_required]
         if forbidden_dims:
             problems.append({"forbidden_table_required_dimensions": forbidden_dims, "actual": table_required})
+        if case.get("evidence_workflow_nonempty") and not result.get("evidence_workflow"):
+            problems.append({"evidence_workflow": result.get("evidence_workflow")})
+        if case.get("suggested_workflow_not_richer") and result.get("status") == "planned":
+            suggested_count = len(result.get("suggested_workflow") or [])
+            evidence_count = len(result.get("evidence_workflow") or [])
+            if suggested_count > evidence_count:
+                problems.append({
+                    "suggested_workflow_count": suggested_count,
+                    "evidence_workflow_count": evidence_count,
+                })
+        if case.get("evidence_bundle_matches_mode"):
+            expected_bundle = result.get("analysis_mode") == "composite_analysis"
+            if result.get("evidence_bundle") is not expected_bundle:
+                problems.append({
+                    "evidence_bundle": result.get("evidence_bundle"),
+                    "expected_from_mode": expected_bundle,
+                    "analysis_mode": result.get("analysis_mode"),
+                })
 
         rows.append({
             "name": case["name"],

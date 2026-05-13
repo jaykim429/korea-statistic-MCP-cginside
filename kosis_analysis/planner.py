@@ -81,6 +81,8 @@ class QueryWorkflowPlanner:
         "population": "인구",
         "cpi": "소비자물가지수",
         "consumer price index": "소비자물가지수",
+        "ppi": "생산자물가지수",
+        "producer price index": "생산자물가지수",
         "grdp": "GRDP",
         "gdp": "GDP",
     }
@@ -91,6 +93,11 @@ class QueryWorkflowPlanner:
         "note": "충돌 시 intended_dimensions가 권위입니다. router_slots는 디버깅용 보조 정보입니다.",
     }
     GENERIC_ROUTER_INDICATORS = {"비중", "비율", "구성비", "증가율", "감소율", "변화율"}
+    TIME_GROUP_BY_TERMS = {
+        "year", "years", "annual", "month", "months", "monthly",
+        "quarter", "quarters", "period", "prd", "time",
+        "연도", "연", "년", "월", "분기", "시점", "기간",
+    }
     INDICATOR_ALTERNATIVES = {
         "인구": [
             {"label": "주민등록인구", "default": True, "scope": "주민등록 기준, 외국인 제외"},
@@ -229,6 +236,8 @@ class QueryWorkflowPlanner:
         analysis_tasks: Optional[list[dict[str, Any]]] = None,
     ) -> bool:
         route = route_payload.get("route") or {}
+        if not metrics and not analysis_tasks:
+            return True
         if route.get("type") != "miss":
             return False
         if metrics or analysis_tasks:
@@ -354,6 +363,7 @@ class QueryWorkflowPlanner:
             quarantined_metrics=quarantined_metrics,
             conflict_decisions=conflict_decisions,
             analysis_tasks=analysis_tasks,
+            role=role,
         )
         return {
             "role": role,
@@ -385,6 +395,7 @@ class QueryWorkflowPlanner:
         quarantined_metrics: list[dict[str, Any]],
         conflict_decisions: list[dict[str, Any]],
         analysis_tasks: list[dict[str, Any]],
+        role: str,
     ) -> dict[str, Any]:
         unknown_metrics = [
             metric.get("name")
@@ -392,6 +403,10 @@ class QueryWorkflowPlanner:
             if metric.get("availability") in {None, "unknown", "weak_match", "missing", "not_matched"}
         ]
         markers: list[str] = []
+        if role == "clarification_required":
+            markers.append("needs_clarification")
+        if not metrics:
+            markers.append("missing_metrics")
         if quarantined_metrics:
             markers.append("quarantined_metrics")
         if conflict_decisions:
@@ -399,7 +414,7 @@ class QueryWorkflowPlanner:
         if unknown_metrics:
             markers.append("metric_availability_unverified")
         return {
-            "has_failures": bool(quarantined_metrics),
+            "has_failures": bool(quarantined_metrics or not metrics or role == "clarification_required"),
             "has_caveats": bool(markers),
             "markers_present": markers,
             "quarantined_metrics_count": len(quarantined_metrics),
@@ -408,6 +423,8 @@ class QueryWorkflowPlanner:
             "analysis_task_count": len(analysis_tasks),
             "unknown_metrics": unknown_metrics,
             "explanation": (
+                "The planner could not identify an executable metric. Ask a more specific statistical question."
+                if not metrics else
                 "plan_query has not verified metric availability yet; follow-up metadata tools must confirm tables and codes."
                 if unknown_metrics else "No immediate planning caveats detected."
             ),
@@ -753,7 +770,36 @@ class QueryWorkflowPlanner:
         for alias, label in self.EN_INDICATOR_ALIASES.items():
             if alias in q_lower:
                 return label
+        implicit_count = self._implicit_count_indicator(query, q_norm, route_payload)
+        if implicit_count:
+            return implicit_count
         return None
+
+    @staticmethod
+    def _implicit_count_indicator(query: str, q_norm: str, route_payload: dict[str, Any]) -> Optional[str]:
+        """Infer a generic count metric for business/place existence questions."""
+        count_terms = (
+            "얼마나있", "얼마나있어", "몇개", "몇곳", "몇군데",
+            "개수", "몇개나", "몇곳이나", "현황", "수는", "수가",
+        )
+        if not any(term in q_norm for term in count_terms):
+            return None
+        slots = route_payload.get("slots") or {}
+        target = ""
+        if isinstance(slots, dict):
+            target = " ".join(str(slots.get(key) or "") for key in ("target", "scale", "industry"))
+        business_context = any(
+            term in q_norm or term in _compact_text(target)
+            for term in (
+                "사업체", "기업", "업체", "가게", "점포", "치킨집",
+                "음식점", "소상공인", "중소기업", "대기업", "회사", "업종",
+            )
+        )
+        if not business_context:
+            return None
+        if "기업" in q_norm or "중소기업" in q_norm or "대기업" in q_norm:
+            return "기업 수"
+        return "사업체 수"
 
     def _region(self, q_norm: str, q_lower: str) -> Optional[str]:
         for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
@@ -989,6 +1035,10 @@ class QueryWorkflowPlanner:
             for dim in group_by:
                 if not isinstance(dim, str):
                     continue
+                if QueryWorkflowPlanner._is_time_group_by(dim):
+                    if "time" not in required:
+                        required.append("time")
+                    continue
                 for normalized in _normalize_required_dimensions([dim]):
                     if normalized not in required:
                         required.append(normalized)
@@ -1004,6 +1054,11 @@ class QueryWorkflowPlanner:
         if any(op in calculations for op in ("time_series", "growth_rate")) and "time" not in required:
             required.append("time")
         return required
+
+    @classmethod
+    def _is_time_group_by(cls, value: str) -> bool:
+        norm = _compact_text(value).lower()
+        return norm in cls.TIME_GROUP_BY_TERMS
 
     @staticmethod
     def _is_region_like_target(target: Any, q_norm: str = "") -> bool:
@@ -1122,6 +1177,9 @@ class QueryWorkflowPlanner:
         if isinstance(slots, dict):
             for name in slots.get("group_by") or []:
                 if isinstance(name, str):
+                    if QueryWorkflowPlanner._is_time_group_by(name):
+                        add("time", "router_slots.group_by", dimensions.get("time"))
+                        continue
                     add(name, "router_slots.group_by")
             target = slots.get("target")
             if target:
@@ -1158,11 +1216,26 @@ class QueryWorkflowPlanner:
     @staticmethod
     def _time_request(dimensions: dict[str, Any], route_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         value = dimensions.get("time")
-        if isinstance(value, dict):
-            return value
         slots = route_payload.get("slots") or {}
+        granularity = None
+        group_by = slots.get("group_by") if isinstance(slots, dict) else None
+        if isinstance(group_by, list):
+            for item in group_by:
+                if isinstance(item, str) and QueryWorkflowPlanner._is_time_group_by(item):
+                    granularity = _compact_text(item).lower()
+                    break
+        if isinstance(value, dict):
+            result = dict(value)
+            if granularity and "granularity" not in result:
+                result["granularity"] = "year" if granularity in {"year", "years", "annual", "연도", "연", "년"} else granularity
+            return result
         slot_time = slots.get("time") if isinstance(slots, dict) else None
-        return slot_time if isinstance(slot_time, dict) else None
+        if isinstance(slot_time, dict):
+            result = dict(slot_time)
+            if granularity and "granularity" not in result:
+                result["granularity"] = "year" if granularity in {"year", "years", "annual", "연도", "연", "년"} else granularity
+            return result
+        return None
 
     @staticmethod
     def _rank_candidates(query: str, route_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1222,6 +1295,10 @@ class QueryWorkflowPlanner:
             item.update(kwargs)
             tasks.append(item)
 
+        if "per_capita" in calculations:
+            add("per_capita", metrics=metric_names, dimensions=dimension_names)
+        if intent == "trend" or "time_series" in calculations:
+            add("trend", metrics=metric_names, dimensions=["time"] if "time" in dimension_names else dimension_names)
         if "share" in calculations or any(term in q_norm for term in ("비중", "비율", "구성비")):
             add("share_by_group", metrics=metric_names, dimensions=dimension_names)
         if "growth_rate" in calculations or any(term in q_norm for term in ("증가율", "감소율", "변화율", "변화", "증가", "감소", "늘었", "줄어", "커진", "하락")):
@@ -1324,12 +1401,14 @@ class QueryWorkflowPlanner:
         handoff_to_llm: dict[str, Any],
     ) -> str:
         task_count = len(analysis_tasks)
-        if len(metrics) >= 2 or task_count >= 2 or len(dimensions) >= 2 or len(comparison_targets) >= 2:
+        if len(metrics) >= 2:
             return "composite_analysis"
         if len(metrics) == 1 and task_count == 0:
             return "simple_lookup"
-        if len(metrics) == 1 and task_count >= 1:
+        if len(metrics) == 1 and task_count == 1:
             return "analytical_single_metric"
+        if task_count >= 2 or len(dimensions) >= 2 or len(comparison_targets) >= 2:
+            return "composite_analysis"
         if handoff_to_llm.get("report_generation") or handoff_to_llm.get("causal_language") == "cautious":
             return "composite_analysis"
         return "simple_lookup"
