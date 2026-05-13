@@ -22,6 +22,7 @@ kosis-analysis-mcp = "kosis_mcp_server:main"
 kosis-analysis-mcp-http = "kosis_http_server:main"
 
 [tool.setuptools]
+packages = ["kosis_analysis"]
 py-modules = [
   "kosis_mcp_server",
   "kosis_http_server",

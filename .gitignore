@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv-kosis/
 __pycache__/
 *.pyc
 build/
@@ -12,11 +13,13 @@ node_modules/
 npm-debug.log*
 
 # Local/generated verification artifacts
+artifacts/
 answer_results_preview.md
 answer_result_assets/
 tier_a_verification.json
 kosis_metadata_discovery.json
 verification_applied_report.md
+openApi_manual_v1.0.pdf
 
 # Temporary archives/backups
 files/

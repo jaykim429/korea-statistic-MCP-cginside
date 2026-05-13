@@ -23,6 +23,7 @@
   },
   "files": [
     "bin",
+    "kosis_analysis",
     "scripts",
     "*.py",
     "requirements.txt",

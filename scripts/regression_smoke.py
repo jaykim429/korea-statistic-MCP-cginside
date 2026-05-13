@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 from kosis_mcp_server import (
     answer_query, check_stat_availability, explore_table, indicator_dependency_map,
     plan_query, query_table, quick_region_compare, quick_stat, quick_trend,
+    resolve_concepts, select_table_for_query,
 )
 
 
@@ -422,6 +423,56 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "query_table_multicode_fanout_none",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["00", "11"]}, ["2025", "2025"]),
+        "expect": {
+            "machine_status": "executed",
+            "aggregation": "none",
+            "row_count": 2,
+        },
+    },
+    {
+        "name": "query_table_multicode_sum_by_group",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["00", "11"]}, ["2025", "2025"], "sum_by_group"),
+        "expect": {
+            "machine_status": "executed",
+            "aggregation": "sum_by_group",
+            "aggregation_assumption": "caller_asserted_additive",
+            "aggregation_warning_contains": "비율·지수·평균",
+            "row_count": 1,
+        },
+    },
+    {
+        "name": "select_table_empty_dimensions_warns",
+        "tool": select_table_for_query,
+        "args": ("실업률",),
+        "expect": {
+            "warning_contains": "required_dimensions is empty",
+        },
+    },
+    {
+        "name": "select_table_sme_workers_industry",
+        "tool": select_table_for_query,
+        "args": ("중소기업 종사자수 업종별", ["industry", "scale"], "중소기업 종사자수"),
+        "expect": {
+            "machine_status": "selected",
+            "selected_missing_dimensions_len": 0,
+            "selected_matched_dimensions_contains": ["industry", "scale"],
+        },
+    },
+    {
+        "name": "resolve_concepts_unemployment_seoul",
+        "tool": resolve_concepts,
+        "args": ("101", "DT_1DA7004S", ["서울", "실업률"]),
+        "expect": {
+            "machine_status": "resolved",
+            "filters_contains_axis": ["A", "ITEM"],
+            "unresolved_len": 0,
+        },
+    },
+    {
         "name": "plan_query_multidim_population",
         "tool": plan_query,
         "args": ("2020년 서울 30대 여성 인구",),
@@ -688,6 +739,9 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
     comparison = result.get("비교") or {}
     calc = result.get("계산") or {}
     workflow = result.get("suggested_workflow") or []
+    selected = result.get("selected") or {}
+    alternatives = result.get("alternatives") or []
+    rejected = result.get("rejected") or []
     query_table_period_range = None
     for step in workflow:
         if isinstance(step, dict) and step.get("tool") == "query_table":
@@ -733,6 +787,8 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "freshness_warning": result.get("⚠️ 데이터_신선도"),
         "verification_level": result.get("verification_level"),
         "aggregation": result.get("aggregation"),
+        "aggregation_assumption": result.get("aggregation_assumption"),
+        "aggregation_warning": result.get("aggregation_warning"),
         "row_count": result.get("row_count"),
         "period_type": result.get("period_type"),
         "validation_errors": result.get("validation_errors") or result.get("검증_오류") or [],
@@ -755,6 +811,14 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         ],
         "consistency_warnings": result.get("consistency_warnings") or [],
         "router_slots_overridden": result.get("router_slots_overridden") or {},
+        "selected_tbl_id": selected.get("tbl_id") if isinstance(selected, dict) else None,
+        "selected_missing_dimensions": selected.get("missing_dimensions") if isinstance(selected, dict) else None,
+        "selected_matched_dimensions": selected.get("matched_dimensions") if isinstance(selected, dict) else None,
+        "alternatives_len": len(alternatives) if isinstance(alternatives, list) else 0,
+        "rejected_len": len(rejected) if isinstance(rejected, list) else 0,
+        "filters": result.get("filters") or {},
+        "unresolved": result.get("unresolved") or [],
+        "warnings": result.get("warnings") or result.get("주의") or [],
     }
 
 
@@ -771,6 +835,24 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"status={summary['status']}")
     if "machine_status" in expect and summary["machine_status"] != expect["machine_status"]:
         problems.append(f"machine_status={summary['machine_status']}")
+    if "selected_missing_dimensions_len" in expect:
+        missing_dims = summary.get("selected_missing_dimensions")
+        if not isinstance(missing_dims, list) or len(missing_dims) != expect["selected_missing_dimensions_len"]:
+            problems.append(f"selected_missing_dimensions={missing_dims}")
+    if "selected_matched_dimensions_contains" in expect:
+        matched_dims = set(summary.get("selected_matched_dimensions") or [])
+        missing = [dim for dim in expect["selected_matched_dimensions_contains"] if dim not in matched_dims]
+        if missing:
+            problems.append(f"selected_matched_dimensions={sorted(matched_dims)}")
+    if "rejected_len_min" in expect and summary.get("rejected_len", 0) < expect["rejected_len_min"]:
+        problems.append(f"rejected_len={summary.get('rejected_len')}")
+    if "filters_contains_axis" in expect:
+        filters = summary.get("filters") or {}
+        missing = [axis for axis in expect["filters_contains_axis"] if axis not in filters]
+        if missing:
+            problems.append(f"filters={filters}")
+    if "unresolved_len" in expect and len(summary.get("unresolved") or []) != expect["unresolved_len"]:
+        problems.append(f"unresolved={summary.get('unresolved')}")
     if "answer_type" in expect and summary["answer_type"] != expect["answer_type"]:
         problems.append(f"answer_type={summary['answer_type']}")
     if "code" in expect and summary["code"] != expect["code"]:
@@ -861,6 +943,16 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"verification_level={summary['verification_level']}")
     if "aggregation" in expect and summary["aggregation"] != expect["aggregation"]:
         problems.append(f"aggregation={summary['aggregation']}")
+    if "aggregation_assumption" in expect and summary.get("aggregation_assumption") != expect["aggregation_assumption"]:
+        problems.append(f"aggregation_assumption={summary.get('aggregation_assumption')}")
+    if "aggregation_warning_contains" in expect:
+        warning = str(summary.get("aggregation_warning") or "")
+        if expect["aggregation_warning_contains"] not in warning:
+            problems.append(f"aggregation_warning={warning!r}")
+    if "warning_contains" in expect:
+        warnings = " ".join(str(w) for w in (summary.get("warnings") or []))
+        if expect["warning_contains"] not in warnings:
+            problems.append(f"warnings={warnings!r}")
     if "period_type" in expect and summary["period_type"] != expect["period_type"]:
         problems.append(f"period_type={summary['period_type']}")
     if "row_count" in expect and summary["row_count"] != expect["row_count"]:
