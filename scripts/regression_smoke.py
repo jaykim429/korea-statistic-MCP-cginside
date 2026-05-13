@@ -105,6 +105,17 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"success": True, "region": "전국", "period": "2023"},
     },
     {
+        "name": "quick_stat_large_people_unit_humanized",
+        "tool": quick_stat,
+        "args": ("중소기업 종사자수", "전국", "latest"),
+        "expect": {
+            "success": True,
+            "region": "전국",
+            "period": "2023",
+            "answer_contains": "만 명",
+        },
+    },
+    {
         "name": "answer_busan_sme_sales_trend",
         "tool": answer_query,
         "args": ("부산 중소기업 매출액 최근 5년 추이 보여줘",),

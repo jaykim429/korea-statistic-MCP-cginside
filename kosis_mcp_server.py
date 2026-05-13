@@ -2219,7 +2219,7 @@ class NaturalLanguageAnswerEngine:
         - YYYY.QQ patterns left alone (quarter labels already humane)
         - Collapses 년년 / 월월 artifacts the substitutions can leave.
         - Appends human-readable unit conversion in parentheses after
-          KOSIS canonical units (천명, 억원, 십억원, 백만달러)."""
+          KOSIS canonical units (천명, 명, 개, 대, 건, 억원, 십억원, 천달러)."""
         if not text:
             return text
         def fix_josa(m: re.Match) -> str:
@@ -2234,7 +2234,7 @@ class NaturalLanguageAnswerEngine:
         text = re.sub(r"년년", "년", text)
         text = re.sub(r"월월", "월", text)
         text = re.sub(
-            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|억원|십억원|천달러)(?!\s*\()",
+            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|십억원|천달러|억원|명|개|대|건)(?!\s*\()",
             cls._append_humanized_unit,
             text,
         )
@@ -2253,6 +2253,12 @@ class NaturalLanguageAnswerEngine:
                 return f"약 {people / 1e8:.2f}억 명"
             if people >= 1e4:
                 return f"약 {round(people / 1e4):,}만 명"
+            return None
+        if unit in {"명", "개", "대", "건"}:
+            if value >= 1e8:
+                return f"약 {value / 1e8:.2f}억 {unit}"
+            if value >= 1e5:
+                return f"약 {round(value / 1e4):,}만 {unit}"
             return None
         if unit == "억원":
             if value >= 1e4:
