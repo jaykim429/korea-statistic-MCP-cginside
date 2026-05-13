@@ -368,8 +368,8 @@ $env:KOSIS_API_KEY="YOUR_KOSIS_API_KEY"
 Gemma 4 26B처럼 로컬 LLM을 MCP 클라이언트로 쓸 때는 답을 한 번에 만들려는 라우터형 흐름보다, 실패하기 어려운 절차형 파이프라인을 권장합니다.
 
 1. `plan_query` — 질문을 의도, 필요 차원, 자연어 개념, 다음 도구 호출 템플릿으로 분해합니다. 이 도구는 표 선택·코드 매핑·값 조회·산술을 하지 않습니다.
-2. `select_table_for_query` — 계획된 다음 단계입니다. 필요한 분류축을 만족하는 통계표만 고르는 역할이며 후속 PR에서 추가될 예정입니다.
-3. `resolve_concepts` — 계획된 다음 단계입니다. "서울", "30대", "여성", "광역시" 같은 개념을 선택된 표의 코드로 바꾸는 역할이며 후속 PR에서 추가될 예정입니다.
+2. `select_table_for_query` — 필요한 분류축을 만족하는 통계표 후보를 KOSIS 메타데이터 기반으로 고릅니다.
+3. `resolve_concepts` — "서울", "30대", "여성", "광역시" 같은 개념을 선택된 표의 코드 후보로 바꿉니다.
 4. `query_table` — `explore_table` 메타로 검증된 `{OBJ_ID: [ITM_ID...]}` 필터를 받아 raw rows를 반환합니다. 합산·평균·비율·해석은 하지 않고 `aggregation: "none"`을 명시합니다.
 5. `compute_indicator` — 계획된 다음 단계입니다. `per_capita`, `share`, `ratio`, `growth_rate` 같은 허용된 산식 enum만 계산하는 역할이며 후속 PR에서 추가될 예정입니다.
 
@@ -488,7 +488,7 @@ chart_line("고령인구", region="전국", years=5)
 
 Gemma 챗봇용 절차형 입구로 `plan_query(query)`가 추가되었습니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 즉 `answer_query`의 즉시 답변 경로에서 발생할 수 있는 silent failure를 줄이기 위한 계획 전용 도구입니다.
 
-Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)를 참고하세요. 기본 manifest에서는 `plan_query`, `explore_table`, `query_table`, `search_kosis`만 노출하고, `answer_query`·`quick_*`·`chart_*` 계열은 내부/전문가용으로 숨기는 구성을 권장합니다.
+Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)를 참고하세요. 기본 manifest에서는 `plan_query`, `select_table_for_query`, `resolve_concepts`, `explore_table`, `query_table`, `search_kosis`만 노출하고, `answer_query`·`quick_*`·`chart_*` 계열은 내부/전문가용으로 숨기는 구성을 권장합니다.
 
 `decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
 

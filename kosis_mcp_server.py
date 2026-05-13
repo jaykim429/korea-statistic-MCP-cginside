@@ -18,10 +18,9 @@ KOSIS MCP — 조회 + 분석 + 시각화 통합 서버
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import os
 import re
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
@@ -31,40 +30,79 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from scipy import stats as scipy_stats
 
+from kosis_analysis.answering import AnswerPlan, AnswerPlanner, AnswerStat
+from kosis_analysis.charts import (
+    _chart_bar_svg,
+    _chart_line_svg,
+    _chart_scatter_svg,
+    _svg_to_image,
+)
+from kosis_analysis.client import (
+    ERROR_MAP,
+    _fetch_classifications,
+    _fetch_meta,
+    _fetch_period_range,
+    _fetch_table_name,
+    _kosis_call,
+    _resolve_key,
+)
+from kosis_analysis.metadata import (
+    _aggregate_rows_sum_by_group,
+    _axis_matches_dimension,
+    _build_axis_codebook,
+    _compact_text,
+    _concept_match_score,
+    _dimension_coverage,
+    _fanout_filter_sets,
+    _indicator_evidence,
+    _infer_required_dimensions_from_query,
+    _normalize_query_table_rows,
+    _normalize_required_dimensions,
+    _query_table_params,
+    _suggest_axis_codes,
+    _validate_query_table_filters,
+)
+from kosis_analysis.periods import (
+    _api_period_de,
+    _api_period_type,
+    _current_quarter,
+    _detect_half_year_request,
+    _detect_precision_downgrade,
+    _extract_open_start_year,
+    _extract_year_range,
+    _format_period_label,
+    _is_latest_period_text,
+    _is_yearly_period_type,
+    _latest_count_for_years,
+    _normalize_period_bound,
+    _parse_month_token,
+    _parse_quarter_token,
+    _parse_year_token,
+    _period_bounds,
+    _period_range_looks_yearly,
+    _period_type,
+    _periods_per_year,
+    _pick_finest_period,
+    _pick_query_table_period_row,
+    _query_table_data_nature,
+    _relative_year,
+    _validate_query_period_range,
+)
+from kosis_analysis.planner import QueryWorkflowPlanner
+from kosis_analysis.quick import (
+    _attach_ignored_params,
+    _extract_single_region_from_query,
+    _extract_single_year_from_query,
+    _quick_stat_unsupported_dimensions,
+    _unsupported_quick_stat_response,
+)
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ============================================================================
 # 상수
 # ============================================================================
-
-KOSIS_BASE = "https://kosis.kr/openapi"
-API_KEY_DEFAULT = os.environ.get("KOSIS_API_KEY", "")
-HTTP_TIMEOUT = 30.0
-
-ERROR_MAP = {
-    # Official KOSIS API error codes
-    "10": "인증키 누락",
-    "11": "인증키 만료",
-    "20": "필수 변수 누락",
-    "21": "잘못된 변수",
-    "30": "결과 없음",
-    "31": "결과 초과 (4만셀)",
-    "40": "호출 제한",
-    "41": "ROW 제한",
-    "42": "사용자별 이용 제한 — KOSIS 관리자에게 문의 필요",
-    "50": "서버 오류",
-    # Common non-official codes observed in the wild
-    "E001": "내부 오류 (E001) — KOSIS 공식 코드가 아닌 래퍼/네트워크 레이어 실패. 재시도 후에도 반복되면 통계표 변경 또는 차단된 파라미터 의심",
-    "E002": "내부 오류 (E002) — 응답 파싱 실패 가능성",
-    "INVALID_PARAM": "잘못된 파라미터 — 요청 변수(통계표 ID, 분류값, 기간) 형식 또는 조합이 KOSIS 검증을 통과하지 못함",
-    "INVALID_KEY": "잘못된 인증키 — KOSIS_API_KEY 값을 다시 확인",
-    "MISSING_KEY": "인증키 미설정 — KOSIS_API_KEY 환경변수가 비어 있음",
-    "TIMEOUT": "요청 타임아웃 — 네트워크 또는 KOSIS 서버 응답 지연",
-    "NETWORK": "네트워크 오류 — DNS/연결/SSL 실패",
-    "-1": "일반 실패 — 구체적 사유가 응답에 포함되지 않음. KOSIS 일시 장애 또는 알 수 없는 클라이언트 오류",
-    "0": "성공이지만 데이터 없음 — 정상 호출이나 매칭 행이 0건",
-}
 
 STATUS_EXECUTED = "EXECUTED"
 STATUS_NEEDS_TABLE_SELECTION = "NEEDS_TABLE_SELECTION"
@@ -185,180 +223,9 @@ from kosis_charts_extra import (
 # 헬퍼
 # ============================================================================
 
-def _resolve_key(provided: Optional[str]) -> str:
-    key = provided or API_KEY_DEFAULT
-    if not key:
-        raise RuntimeError("KOSIS_API_KEY 설정 필요")
-    return key
-
-
 def _lookup_quick(query: str) -> Optional[QuickStatParam]:
     """큐레이션 모듈에 위임 (Tier A 정밀 매핑 + 동의어 + 부분 일치)."""
     return _curation_lookup(query)
-
-
-async def _kosis_call(client: httpx.AsyncClient, endpoint: str, params: dict) -> list[dict]:
-    url = f"{KOSIS_BASE}/{endpoint}"
-    clean = {k: v for k, v in params.items() if v not in (None, "")}
-    resp = await client.get(url, params=clean, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict) and "err" in data:
-        code = str(data["err"])
-        if code == "30":
-            return []
-        raise RuntimeError(f"[KOSIS {code}] {ERROR_MAP.get(code, '미상')}")
-    return data if isinstance(data, list) else [data]
-
-
-async def _fetch_meta(
-    client: httpx.AsyncClient,
-    api_key: str,
-    org_id: str,
-    tbl_id: str,
-    meta_type: str,
-    extra_params: Optional[dict] = None,
-) -> list[dict]:
-    """Generic KOSIS `getMeta` call. meta_type values from the dev guide:
-
-    TBL   — table name (국문/영문)
-    ORG   — owning organization name
-    PRD   — recorded period summary (start / end / 주기)
-    ITM   — classification (objL*) and item (itmId) catalog with names
-            and units — the dynamic alternative to hard-coding industry
-            codes into TIER_A_STATS
-    CMMT  — annotations attached to the table
-    UNIT  — unit registry
-    SOURCE — survey contact information
-    WGT   — weighting metadata
-    NCD   — last-updated timestamp per period
-    """
-    params: dict[str, Any] = {
-        "method": "getMeta",
-        "type": meta_type,
-        "apiKey": api_key,
-        "orgId": org_id,
-        "tblId": tbl_id,
-        "format": "json",
-        "jsonVD": "Y",
-    }
-    if extra_params:
-        params.update(extra_params)
-    return await _kosis_call(client, "statisticsData.do", params)
-
-
-async def _fetch_classifications(
-    org_id: str, tbl_id: str, api_key: Optional[str] = None,
-) -> list[dict]:
-    """Return every (OBJ_ID, OBJ_NM, ITM_ID, ITM_NM, UNIT_NM) tuple for
-    a KOSIS table. Lets dispatchers map "제조업" → the right obj_l2
-    code without baking industry codes into curation."""
-    key = _resolve_key(api_key)
-    async with httpx.AsyncClient() as client:
-        return await _fetch_meta(client, key, org_id, tbl_id, "ITM")
-
-
-async def _fetch_period_range(
-    org_id: str, tbl_id: str,
-    api_key: Optional[str] = None,
-    detail: bool = False,
-) -> list[dict]:
-    """Return PRD_SE / STRT_PRD_DE / END_PRD_DE for a KOSIS table.
-
-    Many tables expose multiple cadences (month/quarter/year) and the
-    meta endpoint returns one row per cadence — use `_pick_finest_period`
-    on the result to select the freshest cadence row, since `[-1]` is
-    not guaranteed to be the most granular one.
-
-    detail=True asks for every recorded timepoint (large response on
-    monthly tables); detail=False asks only for the summary row (cheap,
-    what staleness checks need)."""
-    key = _resolve_key(api_key)
-    extra = {"detail": "Y"} if detail else None
-    async with httpx.AsyncClient() as client:
-        return await _fetch_meta(client, key, org_id, tbl_id, "PRD", extra)
-
-
-async def _fetch_table_name(
-    org_id: str, tbl_id: str, api_key: Optional[str] = None,
-) -> list[dict]:
-    """Return TBL_NM / TBL_NM_ENG for a KOSIS table."""
-    key = _resolve_key(api_key)
-    async with httpx.AsyncClient() as client:
-        return await _fetch_meta(client, key, org_id, tbl_id, "TBL")
-
-
-# KOSIS PRD meta returns one row per cadence — pick the finest one so
-# staleness checks reflect the most granular data available.
-# Korean: 월 > 분기 > 반기 > 년 / English aliases: M Q H Y.
-_PRD_FINENESS = {
-    "월": 0, "M": 0, "MM": 0,
-    "분기": 1, "Q": 1, "QQ": 1,
-    "반기": 2, "H": 2, "HF": 2,
-    "년": 3, "연": 3, "Y": 3, "A": 3,
-}
-
-
-def _pick_finest_period(period_rows: list[dict]) -> Optional[dict]:
-    """Return the PRD row with the finest cadence (월 > 분기 > 반기 >
-    년). Returns None for an empty / falsy list."""
-    if not period_rows:
-        return None
-    def rank(row: dict) -> int:
-        se = str(row.get("PRD_SE") or row.get("prdSe") or "").strip()
-        return _PRD_FINENESS.get(se, 99)
-    return sorted(period_rows, key=rank)[0]
-
-
-def _period_type(row: Optional[dict]) -> Optional[str]:
-    if not row:
-        return None
-    value = str(row.get("PRD_SE") or row.get("prdSe") or "").strip()
-    return value or None
-
-
-def _is_yearly_period_type(period_type: Optional[str]) -> bool:
-    return str(period_type or "").strip() in {"Y", "A", "\ub144", "year", "annual"}
-
-
-def _api_period_type(period_type: Optional[str]) -> Optional[str]:
-    value = str(period_type or "").strip()
-    aliases = {
-        "\uc6d4": "M",
-        "M": "M",
-        "MM": "M",
-        "\ubd84\uae30": "Q",
-        "Q": "Q",
-        "QQ": "Q",
-        "\ubc18\uae30": "H",
-        "H": "H",
-        "HF": "H",
-        "\ub144": "Y",
-        "\uc5f0": "Y",
-        "Y": "Y",
-        "A": "Y",
-    }
-    return aliases.get(value, value or None)
-
-
-def _period_range_looks_yearly(period_range: Optional[list[str]]) -> bool:
-    if not period_range:
-        return False
-    bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
-    return bool(bounds) and all(re.fullmatch(r"\d{4}", p) for p in bounds)
-
-
-def _pick_query_table_period_row(
-    period_rows: list[dict],
-    period_range: Optional[list[str]],
-) -> Optional[dict]:
-    if not period_rows:
-        return None
-    if _period_range_looks_yearly(period_range):
-        for row in period_rows:
-            if _is_yearly_period_type(_period_type(row)):
-                return row
-    return _pick_finest_period(period_rows)
 
 
 def _resolve_classification_term(
@@ -454,263 +321,6 @@ def _format_display_number(v: Any, decimals: Optional[int] = None) -> str:
         return str(v)
 
 
-def _compact_text(text: str) -> str:
-    return re.sub(r"[\s_\-·/()]+", "", str(text)).lower()
-
-
-def _parse_year_token(text: str) -> Optional[str]:
-    if not text:
-        return None
-    year_now = datetime.now().year
-    m = re.match(r"^(\d{4})", text.strip())
-    if m:
-        return m.group(1)
-    if "재작년" in text:
-        return str(year_now - 2)
-    if any(t in text for t in ("작년", "지난해", "전년")):
-        return str(year_now - 1)
-    if any(t in text for t in ("올해", "금년")):
-        return str(year_now)
-    return None
-
-
-def _is_latest_period_text(text: Any) -> bool:
-    if text is None:
-        return True
-    compact = re.sub(r"\s+", "", str(text)).lower()
-    return compact in {
-        "",
-        "latest",
-        "최근",
-        "최신",
-        "가장최근",
-        "제일최근",
-        "최근값",
-        "최신값",
-        "최신치",
-        "최근시점",
-        "최신시점",
-        "현재",
-    }
-
-
-def _relative_year(compact_text: str) -> Optional[int]:
-    """Resolve 재작년/작년/올해/금년 references to an absolute year."""
-    if not compact_text:
-        return None
-    now = datetime.now().year
-    if "재작년" in compact_text:
-        return now - 2
-    if any(t in compact_text for t in ("작년", "지난해", "전년")):
-        return now - 1
-    if any(t in compact_text for t in ("올해", "금년", "이번해", "당해")):
-        return now
-    return None
-
-
-def _current_quarter() -> int:
-    return (datetime.now().month - 1) // 3 + 1
-
-
-def _parse_month_token(text: str) -> Optional[str]:
-    if not text:
-        return None
-    compact = re.sub(r"\s+", "", str(text))
-    m = re.search(r"(19\d{2}|20\d{2})(?:[.\-/]|년)?(0?[1-9]|1[0-2])월?", compact)
-    if m:
-        return f"{m.group(1)}{int(m.group(2)):02d}"
-    # Relative-year + month: "올해 4월", "작년 12월"
-    rel_year = _relative_year(compact)
-    if rel_year is not None:
-        month_m = re.search(r"(0?[1-9]|1[0-2])월", compact)
-        if month_m:
-            return f"{rel_year}{int(month_m.group(1)):02d}"
-        if "이번달" in compact or "금월" in compact:
-            return f"{rel_year}{datetime.now().month:02d}"
-        if "지난달" in compact or "전월" in compact:
-            now = datetime.now()
-            month = now.month - 1
-            year = now.year
-            if month == 0:
-                month = 12
-                year -= 1
-            return f"{year}{month:02d}"
-    if "이번달" in compact or "금월" in compact:
-        return f"{datetime.now().year}{datetime.now().month:02d}"
-    if "지난달" in compact or "전월" in compact:
-        now = datetime.now()
-        month = now.month - 1
-        year = now.year
-        if month == 0:
-            month = 12
-            year -= 1
-        return f"{year}{month:02d}"
-    return None
-
-
-def _parse_quarter_token(text: str) -> Optional[str]:
-    if not text:
-        return None
-    compact = re.sub(r"\s+", "", str(text)).upper()
-    m = re.search(r"(19\d{2}|20\d{2})(?:년)?([1-4])분기", compact)
-    if not m:
-        m = re.search(r"(19\d{2}|20\d{2})Q([1-4])", compact)
-    if m:
-        return f"{m.group(1)}{m.group(2)}"
-    # Relative-year + quarter: "올해 1분기", "작년 4분기"
-    rel_year = _relative_year(compact)
-    if rel_year is not None:
-        q_m = re.search(r"([1-4])분기|Q([1-4])", compact)
-        if q_m:
-            quarter = q_m.group(1) or q_m.group(2)
-            return f"{rel_year}{quarter}"
-        if "이번분기" in compact or "당분기" in compact:
-            return f"{rel_year}{_current_quarter()}"
-    # Bare 이번 분기 / 지난 분기 without explicit year defaults to now
-    if "이번분기" in compact or "당분기" in compact:
-        return f"{datetime.now().year}{_current_quarter()}"
-    if "지난분기" in compact or "전분기" in compact:
-        q = _current_quarter() - 1
-        year = datetime.now().year
-        if q == 0:
-            q = 4
-            year -= 1
-        return f"{year}{q}"
-    return None
-
-
-def _detect_half_year_request(text: str) -> Optional[str]:
-    """Return an advisory string when 상반기/하반기 keywords appear.
-
-    KOSIS does not publish 상반기/하반기 aggregates as first-class
-    periods, so we cannot honor them as a period code. Surface an
-    explicit message instead of silently dropping to year."""
-    if not text:
-        return None
-    compact = re.sub(r"\s+", "", str(text))
-    if "상반기" in compact:
-        return "상반기는 KOSIS 표준 주기에 없음 — 1분기·2분기를 따로 조회하거나 월별 누계 사용"
-    if "하반기" in compact:
-        return "하반기는 KOSIS 표준 주기에 없음 — 3분기·4분기를 따로 조회하거나 월별 누계 사용"
-    return None
-
-
-def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Optional[str]]:
-    """Convert natural period text into KOSIS start/end period codes."""
-    if _is_latest_period_text(period):
-        return None, None
-
-    # Parse finer-grained tokens first even when the target table is annual.
-    # That lets callers surface a precision-downgrade trail for natural
-    # periods such as "이번 분기" instead of treating them as unparseable.
-    quarter = _parse_quarter_token(period)
-    month = None if quarter else _parse_month_token(period)
-
-    if period_type == "M":
-        if month:
-            return month, month
-        if quarter:
-            year, q = int(quarter[:4]), int(quarter[4])
-            start_month = (q - 1) * 3 + 1
-            return f"{year}{start_month:02d}", f"{year}{start_month + 2:02d}"
-
-    if period_type == "Q":
-        if quarter:
-            return quarter, quarter
-        if month:
-            year, mon = int(month[:4]), int(month[4:])
-            return f"{year}{((mon - 1) // 3) + 1}", f"{year}{((mon - 1) // 3) + 1}"
-
-    year = _parse_year_token(period)
-    if not year and quarter:
-        year = quarter[:4]
-    if not year and month:
-        year = month[:4]
-    if not year:
-        return None, None
-    if period_type == "M":
-        return f"{year}01", f"{year}12"
-    if period_type == "Q":
-        return f"{year}1", f"{year}4"
-    return year, year
-
-
-def _detect_precision_downgrade(period: str, period_type: str) -> Optional[str]:
-    """Return a warning string when the requested period asks for finer
-    granularity (month/quarter) than the table supports.
-
-    Without this signal, _period_bounds silently falls back to the year
-    component of a quarter/month token, so the caller never learns that
-    a "2025Q1" request was answered with 2025 annual data."""
-    if not period or period == "latest":
-        return None
-    text = str(period)
-    # Quarter takes precedence — "2025년 1분기" must not be misread as
-    # January via the month regex.
-    has_explicit_quarter = bool(re.search(r"(분기|Q[1-4])", text, re.IGNORECASE))
-    has_quarter = has_explicit_quarter or _parse_quarter_token(period) is not None
-    has_month = (not has_explicit_quarter) and _parse_month_token(period) is not None
-    if has_quarter and period_type not in {"Q", "M"}:
-        return (
-            f"분기 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
-            "연 단위로 응답 — 분기 차이는 반영되지 않음"
-        )
-    if has_month and period_type != "M":
-        return (
-            f"월 정밀도 요청({period}) → 이 통계표는 {period_type} 주기만 지원하므로 "
-            "연 단위로 응답 — 월 차이는 반영되지 않음"
-        )
-    return None
-
-
-def _extract_year_range(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Extract (start_year, end_year) from explicit comparison phrasing.
-
-    Recognizes patterns like "2019년 대비 2023년", "2019~2023", "2019년부터 2023년".
-    Returns (None, None) when fewer than two plausible 4-digit years are present.
-    Order follows text order so "2019 대비 2023" → start=2019, end=2023.
-    """
-    if not text:
-        return None, None
-    years = re.findall(r"(19\d{2}|20\d{2})", text)
-    if len(years) < 2:
-        return None, None
-    start, end = years[0], years[1]
-    if start == end:
-        return None, None
-    return start, end
-
-
-def _extract_open_start_year(text: str) -> Optional[str]:
-    """Extract a single start year from open-ended range phrases.
-
-    "2020년부터", "2020년 이후", "since 2020" ask for a series, not a
-    single period. Two-year ranges are handled by _extract_year_range.
-    """
-    if not text:
-        return None
-    years = re.findall(r"(19\d{2}|20\d{2})", str(text))
-    if len(years) != 1:
-        return None
-    compact = re.sub(r"\s+", "", str(text))
-    year = years[0]
-    if re.search(rf"{year}년?(?:부터|이후|이래|이뒤)", compact):
-        return year
-    if re.search(rf"(?:since|from){year}", compact, re.IGNORECASE):
-        return year
-    return None
-
-
-def _periods_per_year(period_type: str) -> int:
-    if period_type == "M":
-        return 12
-    if period_type == "Q":
-        return 4
-    return 1
-
-
-def _latest_count_for_years(years: int, period_type: str) -> int:
-    return max(1, int(years or 1)) * _periods_per_year(period_type)
 
 
 def _default_period_type(param: QuickStatParam) -> str:
@@ -718,17 +328,6 @@ def _default_period_type(param: QuickStatParam) -> str:
     if "Y" in periods:
         return "Y"
     return periods[0]
-
-
-def _format_period_label(period: Any, period_type: str) -> str:
-    text = str(period or "")
-    if period_type == "M" and len(text) >= 6:
-        return f"{text[:4]}.{text[4:6]}"
-    if period_type == "Q" and len(text) >= 5:
-        return f"{text[:4]}년 {text[-1]}분기"
-    if len(text) >= 4:
-        return f"{text[:4]}년"
-    return text
 
 
 def _format_aggregated_dt(value: float) -> str:
@@ -829,733 +428,6 @@ def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
     if region_obj == "obj_l3":
         return "C3", "C3_NM"
     return "C1", "C1_NM"
-
-
-@dataclass
-class AnswerStat:
-    key: str
-    label: str
-    value: float
-    formatted: str
-    unit: str
-    period: str
-    table: str
-    region: str
-    source: str = "통계청 KOSIS"
-
-    def to_row(self) -> dict[str, Any]:
-        return {
-            "지표": self.label,
-            "값": self.formatted,
-            "원값": self.value,
-            "단위": self.unit,
-            "시점": self.period,
-            "지역": self.region,
-            "통계표": self.table,
-            "출처": self.source,
-        }
-
-
-@dataclass(frozen=True)
-class AnswerPlan:
-    """Execution decision for answer_query.
-
-    The planner decides *what* should run. The engine still owns the actual
-    KOSIS calls and rendering so this first refactor stays behavior-preserving.
-    """
-    action: str
-    region: str
-    direct_key: Optional[str] = None
-    params: dict[str, Any] = field(default_factory=dict)
-
-
-class AnswerPlanner:
-    """Turn a routed natural-language query into one executable action."""
-
-    def __init__(self, engine: "NaturalLanguageAnswerEngine") -> None:
-        self.engine = engine
-
-    def build(self, query: str, region: str, route_payload: dict[str, Any]) -> AnswerPlan:
-        effective_region = self.engine._effective_region(route_payload, region)
-        direct_key = self.engine._infer_direct_stat_key(query, route_payload)
-
-        if self.engine._is_self_employed_sme_population_question(query):
-            return AnswerPlan("mixed_population", effective_region)
-        if self.engine._is_sme_large_sales_question(query):
-            return AnswerPlan("sme_large_sales", effective_region)
-        if self.engine._is_sme_smallbiz_count_question(query):
-            return AnswerPlan("sme_smallbiz_counts", effective_region)
-        if self.engine._is_sme_employee_average_question(query):
-            return AnswerPlan("sme_employee_average", effective_region)
-        if self.engine._is_dynamic_ratio_question(query):
-            return AnswerPlan("dynamic_ratio", effective_region)
-
-        if self.engine._needs_advanced_analysis_plan(route_payload):
-            intents = route_payload.get("intents") or []
-            if "STAT_CORRELATION" in intents:
-                stat_x, stat_y = self.engine._extract_correlation_pair(query)
-                if stat_x and stat_y:
-                    return AnswerPlan(
-                        "auto_correlate",
-                        effective_region,
-                        params={"stat_x": stat_x, "stat_y": stat_y},
-                    )
-            return AnswerPlan("search_fallback", effective_region)
-
-        if direct_key:
-            composites = self.engine._extract_composite_regions(query)
-            if composites:
-                operation = (
-                    "share"
-                    if self.engine._is_share_ratio_question(query, route_payload)
-                    else "sum"
-                )
-                return AnswerPlan(
-                    "composite_aggregate",
-                    effective_region,
-                    direct_key,
-                    {"composite": composites[0], "operation": operation},
-                )
-
-            if self.engine._is_aggregation_question(query):
-                extras = self.engine._extract_extra_regions(query, effective_region, route_payload)
-                regions = [effective_region] + [r for r in extras if r != effective_region]
-                if len(regions) >= 2:
-                    return AnswerPlan("region_sum", effective_region, direct_key, {"regions": regions})
-
-            if self.engine._is_top_n_question(query, route_payload):
-                return AnswerPlan(
-                    "top_n",
-                    effective_region,
-                    direct_key,
-                    {
-                        "top_n": self.engine._extract_top_n(query) or 5,
-                        "include_share_ratio": self.engine._is_share_ratio_question(query, route_payload),
-                    },
-                )
-
-            if self.engine._is_region_compare_question(query):
-                return AnswerPlan("region_compare", effective_region, direct_key)
-
-            if (
-                self.engine._is_share_ratio_question(query, route_payload)
-                and effective_region != "전국"
-                and not self.engine._is_growth_question(query, route_payload)
-            ):
-                return AnswerPlan("share_ratio", effective_region, direct_key)
-
-            return AnswerPlan("direct", effective_region, direct_key)
-
-        return AnswerPlan("search_fallback", effective_region)
-
-
-@dataclass(frozen=True)
-class WorkflowStep:
-    step: int
-    tool: str
-    purpose: str
-    args: dict[str, Any]
-    available_now: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "step": self.step,
-            "tool": self.tool,
-            "purpose": self.purpose,
-            "args": self.args,
-            "available_now": self.available_now,
-        }
-
-
-class QueryWorkflowPlanner:
-    """Plan a safe procedural workflow for a statistical question.
-
-    MUST NOT:
-    - choose a final KOSIS table ID; that belongs to select_table_for_query
-    - map natural concepts to ITM_ID/OBJ_ID codes; that belongs to resolve_concepts
-    - fetch actual statistical values; that belongs to query_table
-    - calculate ratios, sums, growth rates, or per-capita values; that belongs to compute_indicator
-
-    This class extracts intent, dimensions, and the next tool sequence only.
-    """
-
-    AVAILABLE_TOOLS = {"plan_query", "search_kosis", "explore_table", "query_table"}
-    EN_REGION_ALIASES = {
-        "seoul": "서울", "busan": "부산", "daegu": "대구", "incheon": "인천",
-        "gwangju": "광주", "daejeon": "대전", "ulsan": "울산", "sejong": "세종",
-        "gyeonggi": "경기", "gangwon": "강원", "chungbuk": "충북", "chungnam": "충남",
-        "jeonbuk": "전북", "jeonnam": "전남", "gyeongbuk": "경북", "gyeongnam": "경남",
-        "jeju": "제주", "korea": "전국", "national": "전국",
-    }
-    EN_INDICATOR_ALIASES = {
-        "unemployment rate": "실업률",
-        "employment rate": "고용률",
-        "population": "인구",
-        "cpi": "소비자물가지수",
-        "consumer price index": "소비자물가지수",
-        "grdp": "GRDP",
-        "gdp": "GDP",
-    }
-    CONSISTENCY_POLICY = {
-        "rule": "primary_wins",
-        "primary_source": "intended_dimensions",
-        "secondary_source": "router_slots",
-        "note": "충돌 시 intended_dimensions가 권위입니다. router_slots는 디버깅용 보조 정보입니다.",
-    }
-    GENERIC_ROUTER_INDICATORS = {"비중", "비율", "구성비", "증가율", "감소율", "변화율"}
-    INDICATOR_ALTERNATIVES = {
-        "인구": [
-            {"label": "주민등록인구", "default": True, "scope": "주민등록 기준, 외국인 제외"},
-            {"label": "추계인구", "scope": "장래인구추계 기준, 내·외국인 포함 가능, 미래 시점은 추계"},
-            {"label": "인구주택총조사 인구", "scope": "센서스 기준, 조사 주기와 기준시점 확인 필요"},
-        ],
-    }
-
-    def build(self, query: str) -> dict[str, Any]:
-        route_payload = NaturalLanguageAnswerEngine._route_payload(query)
-        dimensions = self._dimensions(query, route_payload)
-        calculations = self._calculations(query, route_payload)
-        intent = self._intent(route_payload, calculations, dimensions)
-        concepts = self._concepts(dimensions, calculations)
-        required = self._required_dimensions(dimensions, calculations)
-        consistency_warnings = self._consistency_warnings(dimensions, route_payload)
-
-        confidence = "medium"
-        if dimensions.get("indicator") and required:
-            confidence = "high"
-        elif route_payload.get("route", {}).get("type") == "miss":
-            confidence = "low"
-        if self._needs_clarification(dimensions, concepts, calculations, route_payload):
-            return self._clarification_response(query, dimensions, concepts, calculations, route_payload)
-
-        workflow = self._workflow(query, intent, required, concepts, dimensions, calculations)
-
-        return {
-            "상태": "planned",
-            "status": "planned",
-            "answer": None,
-            "intent": intent,
-            "query": query,
-            "verification_level": "planning_only",
-            "confidence": confidence,
-            "intended_dimensions": dimensions,
-            "required_dimensions": required,
-            "concepts": concepts,
-            "calculations": calculations,
-            "consistency_policy": self.CONSISTENCY_POLICY,
-            "consistency_warnings": consistency_warnings,
-            "router_slots_overridden": self._router_slot_overrides(consistency_warnings),
-            "suggested_workflow": [step.to_dict() for step in workflow],
-            "next_call": workflow[0].to_dict() if workflow else None,
-            "route": route_payload.get("route", {}),
-            "router_slots": route_payload.get("slots", {}),
-            "validation": route_payload.get("validation", {}),
-            "must_not": [
-                "통계표 ID 확정 금지",
-                "ITM_ID/OBJ_ID 코드 매핑 금지",
-                "실제 값 반환 금지",
-                "산술·산식 계산 금지",
-            ],
-            "notes": [
-                "plan_query는 절차형 레일만 생성합니다. 값 조회와 계산은 후속 도구가 담당합니다.",
-                "available_now=false인 도구는 후속 PR에서 추가될 예정인 파이프라인 단계입니다.",
-            ],
-        }
-
-    @staticmethod
-    def _needs_clarification(
-        dimensions: dict[str, Any],
-        concepts: list[str],
-        calculations: list[str],
-        route_payload: dict[str, Any],
-    ) -> bool:
-        route = route_payload.get("route") or {}
-        if route.get("type") != "miss":
-            return False
-        has_statistical_anchor = bool(
-            dimensions.get("indicator")
-            or dimensions.get("event")
-            or dimensions.get("industry")
-            or calculations
-        )
-        return not has_statistical_anchor and not concepts
-
-    @staticmethod
-    def _clarification_response(
-        query: str,
-        dimensions: dict[str, Any],
-        concepts: list[str],
-        calculations: list[str],
-        route_payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "상태": "needs_clarification",
-            "status": "needs_clarification",
-            "answer": None,
-            "intent": "unknown",
-            "query": query,
-            "verification_level": "planning_only",
-            "confidence": "low",
-            "intended_dimensions": dimensions,
-            "required_dimensions": [],
-            "concepts": concepts,
-            "calculations": calculations,
-            "consistency_policy": QueryWorkflowPlanner.CONSISTENCY_POLICY,
-            "consistency_warnings": [],
-            "router_slots_overridden": {},
-            "suggested_workflow": [],
-            "next_call": None,
-            "suggested_clarification_questions": [
-                "어떤 통계 지표를 보고 싶으신가요? 예: 인구, 실업률, 소비자물가지수, GRDP",
-                "지역이나 기간 기준이 있나요? 예: 서울 2020년, 최근 5년, 전국 최신",
-                "단일값, 추이, 지역 비교, 비중 계산 중 어떤 형태가 필요하신가요?",
-            ],
-            "route": route_payload.get("route", {}),
-            "router_slots": route_payload.get("slots", {}),
-            "validation": route_payload.get("validation", {}),
-            "must_not": [
-                "통계표 ID 확정 금지",
-                "ITM_ID/OBJ_ID 코드 매핑 금지",
-                "실제 값 반환 금지",
-                "산술·산식 계산 금지",
-            ],
-            "notes": [
-                "통계 지표나 분석 대상이 충분히 드러나지 않아 실행 레일을 만들지 않았습니다.",
-                "질문을 구체화한 뒤 plan_query를 다시 호출하세요.",
-            ],
-        }
-
-    @staticmethod
-    def _consistency_warnings(
-        dimensions: dict[str, Any],
-        route_payload: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        warnings: list[dict[str, Any]] = []
-        slots = route_payload.get("slots") or {}
-        if not isinstance(slots, dict):
-            return warnings
-
-        primary_indicator = dimensions.get("indicator")
-        slot_indicator = slots.get("indicator")
-        if QueryWorkflowPlanner._indicator_conflicts(primary_indicator, slot_indicator):
-            warnings.append({
-                "type": "indicator_conflict",
-                "slot": "indicator",
-                "primary": primary_indicator,
-                "router_slot": slot_indicator,
-                "resolution": "primary_indicator_wins",
-                "message": (
-                    f"plan_query primary indicator '{primary_indicator}' differs from "
-                    f"router_slots.indicator '{slot_indicator}'. Use primary indicator."
-                ),
-            })
-
-        primary_region = dimensions.get("regions") or dimensions.get("region")
-        slot_region = slots.get("region")
-        if QueryWorkflowPlanner._scalar_conflicts(primary_region, slot_region):
-            warnings.append({
-                "type": "region_conflict",
-                "slot": "region",
-                "primary": primary_region,
-                "router_slot": slot_region,
-                "resolution": "primary_region_wins",
-                "message": (
-                    f"plan_query primary region '{primary_region}' differs from "
-                    f"router_slots.region '{slot_region}'. Use primary region."
-                ),
-            })
-
-        primary_time = dimensions.get("time")
-        slot_time = slots.get("time")
-        if QueryWorkflowPlanner._value_conflicts(primary_time, slot_time):
-            warnings.append({
-                "type": "time_conflict",
-                "slot": "time",
-                "primary": primary_time,
-                "router_slot": slot_time,
-                "resolution": "primary_time_wins",
-                "message": "plan_query intended time differs from router_slots.time. Use intended_dimensions.time.",
-            })
-        return warnings
-
-    @staticmethod
-    def _router_slot_overrides(warnings: list[dict[str, Any]]) -> dict[str, Any]:
-        overrides: dict[str, Any] = {}
-        for warning in warnings:
-            slot = warning.get("slot")
-            if not slot:
-                continue
-            overrides[str(slot)] = {
-                "original": warning.get("router_slot"),
-                "used": warning.get("primary"),
-                "resolution": warning.get("resolution"),
-            }
-        return overrides
-
-    @staticmethod
-    def _scalar_conflicts(primary: Any, secondary: Any) -> bool:
-        return (
-            isinstance(primary, str)
-            and isinstance(secondary, str)
-            and bool(primary)
-            and bool(secondary)
-            and primary != secondary
-        )
-
-    @staticmethod
-    def _indicator_conflicts(primary: Any, secondary: Any) -> bool:
-        if not QueryWorkflowPlanner._scalar_conflicts(primary, secondary):
-            return False
-        if str(secondary) in QueryWorkflowPlanner.GENERIC_ROUTER_INDICATORS:
-            return False
-        return True
-
-    @staticmethod
-    def _value_conflicts(primary: Any, secondary: Any) -> bool:
-        if not primary or not secondary:
-            return False
-        return primary != secondary
-
-    def _dimensions(self, query: str, route_payload: dict[str, Any]) -> dict[str, Any]:
-        q_norm = _compact_text(query)
-        q_lower = query.lower()
-        slots = route_payload.get("slots") or {}
-        dimensions: dict[str, Any] = {}
-
-        indicator = self._indicator(query, q_norm, q_lower, route_payload)
-        if indicator:
-            dimensions["indicator"] = indicator
-            alternatives = self.INDICATOR_ALTERNATIVES.get(indicator)
-            if alternatives:
-                dimensions["indicator_alternatives"] = alternatives
-                dimensions["disambiguation_suggested"] = (
-                    f"{indicator}는 여러 공식 통계 기준이 있습니다. 기준을 명시하면 더 정확합니다."
-                )
-        if "폐업" in q_norm:
-            dimensions["event"] = "폐업"
-        if "창업" in q_norm:
-            dimensions["event"] = "창업"
-        if "생존" in q_norm:
-            dimensions["event"] = "생존"
-
-        region = slots.get("region") if isinstance(slots, dict) else None
-        if not region:
-            region = self._region(q_norm, q_lower)
-        if region:
-            dimensions["region"] = region
-
-        regions = self._comparison_regions(slots, q_norm, q_lower)
-        if regions:
-            dimensions["regions"] = regions
-
-        composite = self._composite_region(q_norm)
-        if composite:
-            dimensions["region_group"] = composite
-
-        age = self._age(query, q_norm)
-        if age:
-            dimensions["age"] = age
-
-        sex = self._sex(q_norm, q_lower)
-        if sex:
-            dimensions["sex"] = sex
-
-        parsed_time = self._time(query, q_norm)
-        slot_time = slots.get("time") if isinstance(slots, dict) else None
-        time_value = parsed_time or slot_time
-        if time_value:
-            dimensions["time"] = time_value
-
-        industry = slots.get("industry") if isinstance(slots, dict) else None
-        if not industry and any(term in q_norm for term in ("치킨", "음식점")):
-            industry = "음식점업"
-        if industry:
-            dimensions["industry"] = industry
-        return dimensions
-
-    def _indicator(self, query: str, q_norm: str, q_lower: str, route_payload: dict[str, Any]) -> Optional[str]:
-        manual = [
-            ("고령화", "고령인구비중"),
-            ("고령인구", "65세이상인구"),
-            ("인구", "인구"),
-            ("출생", "출생"),
-            ("혼인", "혼인"),
-            ("폐업률", "폐업률"),
-            ("창업률", "창업률"),
-            ("생존율", "생존율"),
-            ("폐업", "폐업"),
-        ]
-        for token, label in manual:
-            if _compact_text(token) in q_norm:
-                return label
-        direct_key = (route_payload.get("route") or {}).get("direct_stat_key")
-        if direct_key:
-            return str(direct_key)
-        slots = route_payload.get("slots") or {}
-        if isinstance(slots, dict) and slots.get("indicator"):
-            return str(slots["indicator"])
-        for alias, label in self.EN_INDICATOR_ALIASES.items():
-            if alias in q_lower:
-                return label
-        return None
-
-    def _region(self, q_norm: str, q_lower: str) -> Optional[str]:
-        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
-            if region != "전국" and _compact_text(region) in q_norm:
-                return region
-        if "전국" in q_norm:
-            return "전국"
-        for alias, region in self.EN_REGION_ALIASES.items():
-            if alias in q_lower:
-                return region
-        return None
-
-    def _comparison_regions(self, slots: Any, q_norm: str, q_lower: str) -> list[str]:
-        regions: list[str] = []
-        targets = slots.get("comparison_target") if isinstance(slots, dict) else None
-        if isinstance(targets, list):
-            for target in targets:
-                if isinstance(target, str):
-                    region = self._normalize_region(target, target.lower())
-                    if region:
-                        regions.append(region)
-        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
-            if region != "전국" and _compact_text(region) in q_norm:
-                regions.append(region)
-        for alias, region in self.EN_REGION_ALIASES.items():
-            if alias in q_lower:
-                regions.append(region)
-        unique = list(dict.fromkeys(regions))
-        return unique if len(unique) >= 2 else []
-
-    def _normalize_region(self, text: str, text_lower: str) -> Optional[str]:
-        norm = _compact_text(text)
-        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
-            if region != "전국" and _compact_text(region) in norm:
-                return region
-        if "전국" in norm:
-            return "전국"
-        for alias, region in self.EN_REGION_ALIASES.items():
-            if alias in text_lower:
-                return region
-        return None
-
-    @staticmethod
-    def _composite_region(q_norm: str) -> Optional[str]:
-        for name in sorted(REGION_COMPOSITES, key=len, reverse=True):
-            if _compact_text(name) in q_norm:
-                return name
-        if "광역시" in q_norm:
-            return "광역시"
-        return None
-
-    @staticmethod
-    def _age(query: str, q_norm: str) -> Optional[dict[str, Any]]:
-        decade = re.search(r"(\d{2})\s*대", query)
-        if decade:
-            n = int(decade.group(1))
-            return {"label": f"{n}대", "type": "decade", "range": [n, n + 9]}
-        explicit = re.search(r"(\d{1,3})\s*[-~]\s*(\d{1,3})\s*세", query)
-        if explicit:
-            return {"label": f"{explicit.group(1)}-{explicit.group(2)}세", "type": "range", "range": [int(explicit.group(1)), int(explicit.group(2))]}
-        if "청년" in q_norm:
-            return {"label": "청년", "type": "named_group", "range": [20, 34]}
-        if "고령" in q_norm or "65세이상" in q_norm:
-            return {"label": "65세 이상", "type": "lower_bound", "range": [65, None]}
-        return None
-
-    @staticmethod
-    def _sex(q_norm: str, q_lower: str) -> Optional[str]:
-        if any(term in q_norm for term in ("여성", "여자", "여자인구")) or re.search(r"\b(female|women|woman)\b", q_lower):
-            return "여성"
-        if any(term in q_norm for term in ("남성", "남자", "남자인구")) or re.search(r"\b(male|men|man)\b", q_lower):
-            return "남성"
-        return None
-
-    @staticmethod
-    def _time(query: str, q_norm: str) -> Optional[dict[str, Any]]:
-        years = re.findall(r"(19\d{2}|20\d{2})", query)
-        if len(years) >= 2 and (
-            any(term in q_norm for term in ("부터", "까지", "에서", "~"))
-            or re.search(r"(?:19\d{2}|20\d{2})\s*[-~]\s*(?:19\d{2}|20\d{2})", query)
-        ):
-            return {"type": "year_range", "start": years[0], "end": years[1]}
-        if years:
-            return {"type": "year", "value": years[0]}
-        relative_years = {
-            "올해": 0,
-            "금년": 0,
-            "작년": -1,
-            "전년": -1,
-            "지난해": -1,
-            "재작년": -2,
-        }
-        for token, offset in relative_years.items():
-            if token in q_norm:
-                return {"type": "relative_year", "label": token, "offset": offset}
-        relative_months = {
-            "이번달": 0,
-            "이번월": 0,
-            "지난달": -1,
-            "전월": -1,
-        }
-        for token, offset in relative_months.items():
-            if token in q_norm:
-                return {"type": "relative_month", "label": token, "offset": offset}
-        if any(term in q_norm for term in ("최근", "최신", "현재")):
-            return {"type": "latest", "value": "latest"}
-        return None
-
-    @staticmethod
-    def _calculations(query: str, route_payload: dict[str, Any]) -> list[str]:
-        q_norm = _compact_text(query)
-        slots = route_payload.get("slots") or {}
-        calculations = list(slots.get("calculation") or []) if isinstance(slots, dict) else []
-        if any(term in q_norm for term in ("1인당", "인당")) or "percapita" in query.lower():
-            calculations.append("per_capita")
-        if any(term in q_norm for term in ("비중", "비율", "구성비", "차지", "고령화율", "고령화")):
-            calculations.append("share")
-        if any(term in q_norm for term in ("폐업률", "창업률", "생존율")):
-            calculations.append("share")
-        if any(term in q_norm for term in ("증가율", "변화율", "감소율")):
-            calculations.append("growth_rate")
-        if any(term in q_norm for term in ("가장빠른", "빠른곳", "속도", "빨라")):
-            calculations.append("growth_rate")
-        if any(term in q_norm for term in ("추이", "시계열", "최근5년", "최근10년")):
-            calculations.append("time_series")
-        return list(dict.fromkeys(calculations))
-
-    @staticmethod
-    def _intent(route_payload: dict[str, Any], calculations: list[str], dimensions: dict[str, Any]) -> str:
-        if "per_capita" in calculations or "share" in calculations:
-            return "computed_indicator"
-        time_value = dimensions.get("time")
-        if isinstance(time_value, dict) and time_value.get("type") == "year_range":
-            return "trend"
-        if "time_series" in calculations:
-            return "trend"
-        if "growth_rate" in calculations:
-            return "growth_rate"
-        intents = route_payload.get("intents") or []
-        if "STAT_RANKING" in intents:
-            return "ranking"
-        if "STAT_COMPARISON" in intents:
-            return "comparison"
-        return "single_value"
-
-    @staticmethod
-    def _required_dimensions(dimensions: dict[str, Any], calculations: list[str]) -> list[str]:
-        required: list[str] = []
-        if dimensions.get("regions"):
-            required.append("regions")
-        elif dimensions.get("region"):
-            required.append("region")
-        for key in ("region_group", "age", "sex", "industry", "time"):
-            if dimensions.get(key):
-                required.append(key)
-        if any(op in calculations for op in ("time_series", "growth_rate")) and "time" not in required:
-            required.append("time")
-        return required
-
-    @staticmethod
-    def _concepts(dimensions: dict[str, Any], calculations: list[str]) -> list[str]:
-        concepts: list[str] = []
-        for key in ("indicator", "region", "region_group", "industry", "sex", "event"):
-            value = dimensions.get(key)
-            if isinstance(value, str):
-                concepts.append(value)
-        regions = dimensions.get("regions")
-        if isinstance(regions, list):
-            concepts.extend(str(region) for region in regions if region)
-        age = dimensions.get("age")
-        if isinstance(age, dict) and age.get("label"):
-            concepts.append(str(age["label"]))
-        time_value = dimensions.get("time")
-        if isinstance(time_value, dict):
-            concepts.extend(str(v) for k, v in time_value.items() if k in {"value", "start", "end", "label"} and v)
-        concepts.extend(calculations)
-        return list(dict.fromkeys(concepts))
-
-    def _workflow(
-        self,
-        query: str,
-        intent: str,
-        required: list[str],
-        concepts: list[str],
-        dimensions: dict[str, Any],
-        calculations: list[str],
-    ) -> list[WorkflowStep]:
-        period_range = self._period_range(dimensions.get("time"))
-        steps = [
-            WorkflowStep(
-                1,
-                "select_table_for_query",
-                "질문 의도와 필요한 분류축을 만족하는 KOSIS 통계표를 고릅니다.",
-                {
-                    "query": query,
-                    "required_dimensions": required,
-                    "indicator": dimensions.get("indicator"),
-                    "indicator_alternatives": dimensions.get("indicator_alternatives"),
-                    "comparison_targets": dimensions.get("regions"),
-                    "reject_if_missing_dimensions": True,
-                },
-                "select_table_for_query" in self.AVAILABLE_TOOLS,
-            ),
-            WorkflowStep(
-                2,
-                "resolve_concepts",
-                "선택된 표의 메타데이터 안에서 자연어 개념을 OBJ_ID/ITM_ID 코드로 바꿉니다.",
-                {
-                    "org_id": "<selected.org_id>",
-                    "tbl_id": "<selected.tbl_id>",
-                    "concepts": concepts,
-                    "valid_only_for": "<selected.tbl_id>",
-                },
-                "resolve_concepts" in self.AVAILABLE_TOOLS,
-            ),
-            WorkflowStep(
-                3,
-                "query_table",
-                "검증된 코드로 KOSIS raw rows를 조회합니다. 합산과 계산은 하지 않습니다.",
-                {
-                    "org_id": "<selected.org_id>",
-                    "tbl_id": "<selected.tbl_id>",
-                    "filters": "<resolve_concepts.filters>",
-                    "period_range": period_range or "<resolve_concepts.period_range>",
-                    "aggregation": "none",
-                },
-                True,
-            ),
-        ]
-        compute_ops = [op for op in calculations if op in {"per_capita", "share", "growth_rate", "cagr", "yoy_diff", "yoy_pct"}]
-        age = dimensions.get("age")
-        if isinstance(age, dict) and age.get("type") in {"decade", "named_group", "lower_bound"}:
-            compute_ops.append("sum_additive_rows")
-        if compute_ops:
-            steps.append(WorkflowStep(
-                4,
-                "compute_indicator",
-                "허용된 산식 enum만 사용해 raw rows를 계산합니다.",
-                {
-                    "operation": compute_ops[0],
-                    "operations": list(dict.fromkeys(compute_ops)),
-                    "allowed_operations": ["per_capita", "share", "ratio", "growth_rate", "cagr", "yoy_diff", "yoy_pct", "sum_additive_rows"],
-                    "input_rows": "<query_table.rows>",
-                    "intent": intent,
-                },
-                "compute_indicator" in self.AVAILABLE_TOOLS,
-            ))
-        return steps
-
-    @staticmethod
-    def _period_range(time_value: Any) -> Optional[list[str]]:
-        if isinstance(time_value, dict):
-            if time_value.get("type") == "year" and time_value.get("value"):
-                return [str(time_value["value"]), str(time_value["value"])]
-            if time_value.get("type") in {"range", "year_range"} and time_value.get("start") and time_value.get("end"):
-                return [str(time_value["start"]), str(time_value["end"])]
-        return None
-
 
 class NaturalLanguageAnswerEngine:
     """자연어 질문을 실제 실행 가능한 답변 또는 안전한 후보 답변으로 변환."""
@@ -3244,220 +2116,14 @@ class NaturalLanguageAnswerEngine:
 # SVG 차트 생성 (외부 라이브러리 없이)
 # ============================================================================
 
-def _svg_header(w: int = 640, h: int = 380) -> str:
-    return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
-        f'viewBox="0 0 {w} {h}" font-family="sans-serif">'
-    )
 
 
-def _svg_to_image(svg: str) -> TextContent:
-    """Wrap an SVG payload in a MCP-compatible content block.
-
-    The MCP spec accepts ImageContent only for raster mime types
-    (image/png, image/jpeg, image/gif, image/webp). Claude Desktop and
-    Claude Code clients reject image/svg+xml outright, which used to
-    break every chart tool with a content-format error.
-
-    We now emit the SVG inside a fenced ```svg block as TextContent.
-    Web embeds that render markdown+SVG (claude.ai, browser MCP
-    clients) still show the chart; CLI clients see the markup as code,
-    which is far better than a hard failure."""
-    return TextContent(type="text", text=f"```svg\n{svg}\n```")
 
 
-def _chart_line_svg(
-    series: list[tuple[str, float]],
-    title: str, ylabel: str = "",
-    source: str = "", note: str = "",
-) -> str:
-    W, H = 640, 380
-    PL, PR, PT, PB = 60, 30, 50, 60
-
-    if not series:
-        return f'{_svg_header(W, H)}<text x="{W//2}" y="{H//2}" text-anchor="middle">데이터 없음</text></svg>'
-
-    labels = [s[0] for s in series]
-    values = [s[1] for s in series]
-    vmin, vmax = min(values), max(values)
-    if vmin == vmax:
-        vmin, vmax = vmin - 1, vmax + 1
-    span = vmax - vmin
-    plot_w = W - PL - PR
-    plot_h = H - PT - PB
-
-    def x(i):
-        if len(values) == 1:
-            return PL + plot_w / 2
-        return PL + i * plot_w / (len(values) - 1)
-
-    def y(v):
-        return PT + plot_h - (v - vmin) / span * plot_h
-
-    points = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
-
-    y_ticks = []
-    for i in range(5):
-        v = vmin + span * i / 4
-        py = y(v)
-        y_ticks.append(
-            f'<line x1="{PL}" y1="{py:.1f}" x2="{W-PR}" y2="{py:.1f}" stroke="#eee" stroke-width="0.5"/>'
-            f'<text x="{PL-8}" y="{py+4:.1f}" text-anchor="end" font-size="10" fill="#666">{_format_number(v)}</text>'
-        )
-
-    step = max(1, len(labels) // 8)
-    x_labels = []
-    for i, lab in enumerate(labels):
-        if i % step == 0 or i == len(labels) - 1:
-            x_labels.append(
-                f'<text x="{x(i):.1f}" y="{H-PB+18}" text-anchor="middle" font-size="10" fill="#666">{lab}</text>'
-            )
-
-    parts = [
-        _svg_header(W, H),
-        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
-        f'<text x="{W//2}" y="24" text-anchor="middle" font-size="14" font-weight="600">{title}</text>',
-        *y_ticks,
-        f'<polyline fill="none" stroke="#2563eb" stroke-width="2" points="{points}"/>',
-    ]
-    for i, v in enumerate(values):
-        parts.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="#2563eb"/>')
-    parts.extend(x_labels)
-    if ylabel:
-        parts.append(
-            f'<text x="14" y="{H//2}" text-anchor="middle" font-size="10" fill="#666" '
-            f'transform="rotate(-90,14,{H//2})">{ylabel}</text>'
-        )
-    if source:
-        parts.append(f'<text x="{PL}" y="{H-8}" font-size="9" fill="#888">출처: {source}</text>')
-    if note:
-        parts.append(f'<text x="{W-PR}" y="{H-8}" text-anchor="end" font-size="9" fill="#888">{note}</text>')
-    parts.append('</svg>')
-    return "".join(parts)
 
 
-def _chart_bar_svg(items: list[tuple[str, float]], title: str, source: str = "") -> str:
-    W, H = 640, 380
-    PL, PR, PT, PB = 60, 30, 50, 80
-
-    if not items:
-        return f'{_svg_header(W, H)}<text x="{W//2}" y="{H//2}" text-anchor="middle">데이터 없음</text></svg>'
-
-    values = [s[1] for s in items]
-    vmin = min(0, min(values))
-    vmax = max(values)
-    if vmin == vmax:
-        vmax = vmin + 1
-    span = vmax - vmin
-
-    plot_w = W - PL - PR
-    plot_h = H - PT - PB
-    n = len(items)
-    bar_w = plot_w / n * 0.7
-    gap = plot_w / n * 0.3
-
-    def y(v):
-        return PT + plot_h - (v - vmin) / span * plot_h
-
-    def x_pos(i):
-        return PL + i * plot_w / n + gap / 2
-
-    y_ticks = []
-    for i in range(5):
-        v = vmin + span * i / 4
-        py = y(v)
-        y_ticks.append(
-            f'<line x1="{PL}" y1="{py:.1f}" x2="{W-PR}" y2="{py:.1f}" stroke="#eee" stroke-width="0.5"/>'
-            f'<text x="{PL-8}" y="{py+4:.1f}" text-anchor="end" font-size="10" fill="#666">{_format_number(v)}</text>'
-        )
-
-    bars = []
-    for i, (lab, v) in enumerate(items):
-        bx = x_pos(i)
-        by = y(max(v, 0))
-        bh = abs(y(v) - y(0))
-        bars.append(
-            f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" fill="#2563eb"/>'
-            f'<text x="{bx+bar_w/2:.1f}" y="{H-PB+18}" text-anchor="middle" font-size="10" fill="#666" '
-            f'transform="rotate(-30,{bx+bar_w/2:.1f},{H-PB+18})">{lab}</text>'
-        )
-
-    parts = [
-        _svg_header(W, H),
-        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
-        f'<text x="{W//2}" y="24" text-anchor="middle" font-size="14" font-weight="600">{title}</text>',
-        *y_ticks, *bars,
-    ]
-    if source:
-        parts.append(f'<text x="{PL}" y="{H-8}" font-size="9" fill="#888">출처: {source}</text>')
-    parts.append("</svg>")
-    return "".join(parts)
 
 
-def _chart_scatter_svg(
-    points: list[tuple[float, float]],
-    title: str, xlabel: str = "", ylabel: str = "",
-    source: str = "", r_value: Optional[float] = None,
-) -> str:
-    W, H = 640, 380
-    PL, PR, PT, PB = 60, 30, 50, 60
-
-    if not points:
-        return f'{_svg_header(W, H)}<text x="{W//2}" y="{H//2}" text-anchor="middle">데이터 없음</text></svg>'
-
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    if xmin == xmax:
-        xmin, xmax = xmin - 1, xmax + 1
-    if ymin == ymax:
-        ymin, ymax = ymin - 1, ymax + 1
-    xspan, yspan = xmax - xmin, ymax - ymin
-    plot_w = W - PL - PR
-    plot_h = H - PT - PB
-
-    def xp(v):
-        return PL + (v - xmin) / xspan * plot_w
-
-    def yp(v):
-        return PT + plot_h - (v - ymin) / yspan * plot_h
-
-    parts = [
-        _svg_header(W, H),
-        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
-        f'<text x="{W//2}" y="24" text-anchor="middle" font-size="14" font-weight="600">{title}</text>',
-        f'<line x1="{PL}" y1="{H-PB}" x2="{W-PR}" y2="{H-PB}" stroke="#888" stroke-width="0.5"/>',
-        f'<line x1="{PL}" y1="{PT}" x2="{PL}" y2="{H-PB}" stroke="#888" stroke-width="0.5"/>',
-    ]
-    for x, y in points:
-        parts.append(f'<circle cx="{xp(x):.1f}" cy="{yp(y):.1f}" r="4" fill="#2563eb" opacity="0.65"/>')
-
-    if len(points) >= 2:
-        slope, intercept, *_ = scipy_stats.linregress(xs, ys)
-        x1, x2 = xmin, xmax
-        y1, y2 = slope * x1 + intercept, slope * x2 + intercept
-        parts.append(
-            f'<line x1="{xp(x1):.1f}" y1="{yp(y1):.1f}" x2="{xp(x2):.1f}" y2="{yp(y2):.1f}" '
-            f'stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5,3"/>'
-        )
-
-    if xlabel:
-        parts.append(f'<text x="{W//2}" y="{H-30}" text-anchor="middle" font-size="11" fill="#444">{xlabel}</text>')
-    if ylabel:
-        parts.append(
-            f'<text x="18" y="{H//2}" text-anchor="middle" font-size="11" fill="#444" '
-            f'transform="rotate(-90,18,{H//2})">{ylabel}</text>'
-        )
-    if r_value is not None:
-        parts.append(
-            f'<text x="{W-PR-10}" y="{PT+18}" text-anchor="end" font-size="11" fill="#dc2626" font-weight="600">'
-            f'r = {r_value:.3f}</text>'
-        )
-    if source:
-        parts.append(f'<text x="{PL}" y="{H-8}" font-size="9" fill="#888">출처: {source}</text>')
-    parts.append("</svg>")
-    return "".join(parts)
 
 
 # ============================================================================
@@ -3472,95 +2138,16 @@ mcp = FastMCP("kosis-analysis")
 _QUICK_STAT_SUPPORTED_PARAMS = frozenset({"query", "region", "period", "api_key"})
 
 
-_DIRECT_REGION_NAMES = (
-    "전국", "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
-    "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
-    "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시",
-    "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원도",
-    "강원특별자치도", "충청북도", "충청남도", "전라북도", "전북특별자치도",
-    "전라남도", "경상북도", "경상남도", "제주특별자치도",
-)
 
 
-def _extract_single_region_from_query(query: str) -> Optional[str]:
-    q = str(query or "")
-    matches: list[str] = []
-    for name in sorted(_DIRECT_REGION_NAMES, key=len, reverse=True):
-        if name in q:
-            canonical = _canonical_region(name) or name
-            if canonical not in matches:
-                matches.append(canonical)
-    return matches[0] if len(matches) == 1 else None
 
 
-def _extract_single_year_from_query(query: str) -> Optional[str]:
-    years = list(dict.fromkeys(re.findall(r"(19\d{2}|20\d{2})", str(query or ""))))
-    return years[0] if len(years) == 1 else None
 
 
-def _quick_stat_unsupported_dimensions(query: str) -> list[str]:
-    q = str(query or "")
-    compact = _compact_text(q)
-    dimensions: list[str] = []
-    if (
-        re.search(r"\d+\s*[-~]\s*\d+\s*세", q)
-        or re.search(r"\d{2,3}\s*대", q)
-        or any(term in compact for term in ("청년", "연령별", "연령", "나이"))
-    ):
-        dimensions.append("age")
-    if any(term in compact for term in ("여성", "여자", "남성", "남자", "성별")):
-        dimensions.append("gender")
-    if any(term in compact for term in ("추이", "시계열", "최근10년", "최근5년", "팬데믹기간")):
-        dimensions.append("time_series")
-    if any(term in compact for term in ("vs", "대비", "비교")):
-        dimensions.append("comparison")
-    if any(region in compact for region in (_compact_text(name) for name in REGION_COMPOSITES)):
-        dimensions.append("region_group")
-    return list(dict.fromkeys(dimensions))
 
 
-def _unsupported_quick_stat_response(
-    query: str,
-    param: QuickStatParam,
-    dimensions: list[str],
-    region: str,
-    period: str,
-) -> dict[str, Any]:
-    return {
-        "상태": "failed",
-        "코드": STATUS_UNVERIFIED_FORMULA,
-        "status": "unsupported",
-        "이행_상태": "unsupported",
-        "질문": query,
-        "answer": (
-            "quick_stat은 단일 통계값 도구라 질문에 포함된 추가 필터를 안전하게 반영하지 못합니다. "
-            "기본값으로 대체하지 않고 중단했습니다."
-        ),
-        "통계표": param.tbl_nm,
-        "통계표ID": param.tbl_id,
-        "기관ID": param.org_id,
-        "요청_지역": region,
-        "요청_기간": period,
-        "누락_차원": dimensions,
-        "dropped_dimensions": dimensions,
-        "권고": [
-            f"explore_table('{param.org_id}', '{param.tbl_id}')로 분류축을 확인하세요.",
-            "연령·성별·권역·시계열 조건은 raw 다축 호출 도구가 필요합니다.",
-        ],
-    }
 
 
-def _attach_ignored_params(result: Any, ignored: list[str], context: str) -> Any:
-    """Attach unsupported-parameter warning to a quick-stat-like response."""
-    if not ignored or not isinstance(result, dict):
-        return result
-    result["⚠️ 무시된_파라미터"] = ignored
-    result["⚠️ 무시된_파라미터_안내"] = (
-        f"{context} 함수는 정해진 파라미터(query/region/period 등)만 받습니다. "
-        "industry, scale, sector 등 추가 슬라이싱은 자연어 query에 키워드를 "
-        "포함하거나 search_kosis로 통계표 ID를 먼저 확인해야 합니다."
-    )
-    return result
 
 
 @mcp.tool()
@@ -5148,6 +3735,316 @@ async def search_kosis(
     )
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+@mcp.tool()
+async def resolve_concepts(
+    org_id: str,
+    tbl_id: str,
+    concepts: list[str],
+    axes_to_search: Optional[list[str]] = None,
+    limit: int = 5,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🧩] 자연어 개념을 특정 KOSIS 표의 메타 코드 후보로 해석한다.
+
+    이 도구는 수도권·산업군·연령대 같은 도메인 정의를 자체 사전으로
+    만들지 않는다. LLM이 정한 개념 문자열을 표의 OBJ_ID/ITM_NM/ITM_ID
+    메타와 비교해 후보 코드만 반환한다. 같은 표현도 표마다 코드가 다를
+    수 있으므로 결과는 valid_only_for(tbl_id)로만 사용해야 한다.
+    """
+    if not org_id or not tbl_id:
+        return {
+            "상태": "failed",
+            "status": "unsupported",
+            "error": "org_id and tbl_id are required.",
+            "오류": "org_id와 tbl_id가 필요합니다.",
+        }
+    if not isinstance(concepts, list) or not concepts:
+        return {
+            "상태": "failed",
+            "status": "unsupported",
+            "error": "concepts must be a non-empty list.",
+            "오류": "concepts는 비어 있지 않은 리스트여야 합니다.",
+        }
+
+    key = _resolve_key(api_key)
+    async with httpx.AsyncClient() as client:
+        try:
+            name_rows, item_rows = await asyncio.gather(
+                _fetch_meta(client, key, org_id, tbl_id, "TBL"),
+                _fetch_meta(client, key, org_id, tbl_id, "ITM"),
+            )
+        except Exception as exc:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": STATUS_STAT_NOT_FOUND,
+                "code": STATUS_STAT_NOT_FOUND,
+                "error": f"Metadata lookup failed: {exc}",
+                "오류": f"메타 조회 실패: {exc}",
+                "org_id": org_id,
+                "tbl_id": tbl_id,
+            }
+    if not isinstance(item_rows, list) or not item_rows:
+        return {
+            "상태": "failed",
+            "status": "unsupported",
+            "코드": STATUS_STAT_NOT_FOUND,
+            "code": STATUS_STAT_NOT_FOUND,
+            "error": "No classification metadata is available.",
+            "오류": "분류축 메타가 없습니다.",
+            "org_id": org_id,
+            "tbl_id": tbl_id,
+        }
+
+    axes, axis_order = _build_axis_codebook(item_rows)
+    allowed_axes = set(axes_to_search or [])
+    if allowed_axes:
+        allowed_axes.update(
+            obj_id
+            for obj_id, axis in axes.items()
+            if str(axis.get("OBJ_NM") or "") in allowed_axes
+        )
+    table_name = None
+    if isinstance(name_rows, list) and name_rows:
+        table_name = name_rows[0].get("TBL_NM") or name_rows[0].get("tblNm")
+
+    matches_by_concept: list[dict[str, Any]] = []
+    filters: dict[str, list[str]] = {}
+    unresolved: list[str] = []
+    ambiguities: list[dict[str, Any]] = []
+
+    for concept in concepts:
+        concept_matches: list[dict[str, Any]] = []
+        for obj_id in axis_order:
+            if allowed_axes and obj_id not in allowed_axes:
+                continue
+            axis = axes[obj_id]
+            for code, meta in (axis.get("items") or {}).items():
+                score = max(
+                    _concept_match_score(str(concept), meta.get("label"), code),
+                    _concept_match_score(str(concept), meta.get("label_en"), code),
+                )
+                if score <= 0:
+                    continue
+                concept_matches.append({
+                    "score": score,
+                    "OBJ_ID": obj_id,
+                    "OBJ_NM": axis.get("OBJ_NM"),
+                    "ITM_ID": code,
+                    "ITM_NM": meta.get("label"),
+                    "UNIT_NM": meta.get("unit"),
+                    "UP_ITM_ID": meta.get("parent"),
+                })
+        concept_matches.sort(key=lambda row: (-int(row["score"]), str(row["OBJ_ID"]), str(row["ITM_ID"])))
+        top = concept_matches[:limit]
+        matches_by_concept.append({"concept": concept, "matches": top})
+        if not top:
+            unresolved.append(str(concept))
+            continue
+        best = top[0]
+        close = [
+            row for row in top
+            if row["score"] >= best["score"] - 5 and (
+                row["OBJ_ID"] != best["OBJ_ID"] or row["ITM_ID"] != best["ITM_ID"]
+            )
+        ]
+        if close:
+            ambiguities.append({"concept": concept, "best": best, "also_possible": close})
+        if best["score"] >= 60:
+            filters.setdefault(str(best["OBJ_ID"]), [])
+            if best["ITM_ID"] not in filters[str(best["OBJ_ID"])]:
+                filters[str(best["OBJ_ID"])].append(str(best["ITM_ID"]))
+
+    status = "resolved" if filters and not unresolved else "partial" if filters else "needs_concept_selection"
+    return {
+        "상태": status,
+        "status": status,
+        "verification_level": "metadata_match",
+        "confidence": "medium" if status == "resolved" else "low",
+        "org_id": org_id,
+        "tbl_id": tbl_id,
+        "table_name": table_name,
+        "valid_only_for": tbl_id,
+        "concepts": concepts,
+        "filters": filters,
+        "matches_by_concept": matches_by_concept,
+        "unresolved": unresolved,
+        "ambiguities": ambiguities,
+        "available_axes": [
+            {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM"), "item_count": len(axes[obj_id].get("items") or {})}
+            for obj_id in axis_order
+        ],
+        "주의": [
+            "resolve_concepts는 표 메타 안에서 문자열 후보를 찾을 뿐, 수도권·산업군·가법성 같은 도메인 정의를 만들지 않습니다.",
+            "filters는 같은 tbl_id에만 유효합니다. 다른 표에는 재사용하지 마세요.",
+        ],
+    }
+
+
+@mcp.tool()
+async def select_table_for_query(
+    query: str,
+    required_dimensions: Optional[list[str]] = None,
+    indicator: Optional[str] = None,
+    search_terms: Optional[list[str]] = None,
+    infer_dimensions: bool = False,
+    reject_if_missing_dimensions: bool = True,
+    limit: int = 8,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🧭] 자연어 질문에 맞는 KOSIS 통계표 후보를 메타데이터 기반으로 고른다.
+
+    이 도구는 특정 질문/통계표 ID를 하드코딩하지 않는다. LLM이 넘긴
+    required_dimensions를 기준으로 search_kosis 후보 표의 ITM/PRD 메타를
+    확인해 필요한 분류축(region, industry, age, sex, time 등)을 만족하는지
+    점수화한다. 실제 코드 매핑과 값 조회는 resolve_concepts/query_table
+    단계의 책임이다. infer_dimensions는 legacy 보조 옵션이며 기본값은 False다.
+    """
+    inferred_dimensions = _infer_required_dimensions_from_query(query) if infer_dimensions else []
+    required = _normalize_required_dimensions([
+        *(required_dimensions or []),
+        *inferred_dimensions,
+    ])
+    key = _resolve_key(api_key)
+    search_queries = [
+        term.strip()
+        for term in [query, *(search_terms or []), indicator or ""]
+        if isinstance(term, str) and term.strip()
+    ]
+    search_queries = list(dict.fromkeys(search_queries))
+    searches = await asyncio.gather(*[
+        search_kosis(term, limit=limit, use_routing=True, api_key=key)
+        for term in search_queries
+    ])
+    raw_candidates: list[dict[str, Any]] = []
+    for term, search in zip(search_queries, searches):
+        tier_a = search.get("Tier_A_직접_매핑")
+        if isinstance(tier_a, dict) and tier_a.get("통계표ID"):
+            raw_candidates.append({
+                "통계표명": tier_a.get("통계표"),
+                "통계표ID": tier_a.get("통계표ID"),
+                "기관ID": tier_a.get("기관ID"),
+                "source": "tier_a_direct_mapping",
+                "search_term": term,
+            })
+        for row in search.get("결과") or []:
+            if row.get("통계표ID") and row.get("기관ID"):
+                raw_candidates.append({
+                    **row,
+                    "source": row.get("검색어") or "search_kosis",
+                    "search_term": term,
+                })
+
+    seen: set[tuple[str, str]] = set()
+    candidates: list[dict[str, Any]] = []
+    async with httpx.AsyncClient() as client:
+        for row in raw_candidates:
+            org_id = str(row.get("기관ID") or "")
+            tbl_id = str(row.get("통계표ID") or "")
+            if not org_id or not tbl_id or (org_id, tbl_id) in seen:
+                continue
+            seen.add((org_id, tbl_id))
+            try:
+                name_rows, item_rows, period_rows = await asyncio.gather(
+                    _fetch_meta(client, key, org_id, tbl_id, "TBL"),
+                    _fetch_meta(client, key, org_id, tbl_id, "ITM"),
+                    _fetch_meta(client, key, org_id, tbl_id, "PRD"),
+                )
+            except Exception as exc:
+                candidates.append({
+                    "org_id": org_id,
+                    "tbl_id": tbl_id,
+                    "table_name": row.get("통계표명"),
+                    "status": "metadata_failed",
+                    "error": str(exc),
+                    "source": row.get("source"),
+                    "search_term": row.get("search_term"),
+                })
+                continue
+            axes, _ = _build_axis_codebook(item_rows if isinstance(item_rows, list) else [])
+            table_name = None
+            if isinstance(name_rows, list) and name_rows:
+                table_name = name_rows[0].get("TBL_NM") or name_rows[0].get("tblNm")
+            table_name = table_name or row.get("통계표명")
+            matched, missing, axis_evidence = _dimension_coverage(
+                axes,
+                period_rows if isinstance(period_rows, list) else [],
+                required,
+            )
+            indicator_score, indicator_hits = _indicator_evidence(table_name, axes, indicator)
+            score = indicator_score + len(matched) * 5 - len(missing) * 6
+            status = "selected" if not missing or not reject_if_missing_dimensions else "rejected_missing_dimensions"
+            candidates.append({
+                "status": status,
+                "score": score,
+                "org_id": org_id,
+                "tbl_id": tbl_id,
+                "table_name": table_name,
+                "source": row.get("source"),
+                "search_term": row.get("search_term"),
+                "matched_dimensions": matched,
+                "missing_dimensions": missing,
+                "axis_evidence": axis_evidence,
+                "indicator_evidence": indicator_hits,
+                "axis_summary": [
+                    {
+                        "OBJ_ID": obj_id,
+                        "OBJ_NM": axis.get("OBJ_NM"),
+                        "item_count": len(axis.get("items") or {}),
+                    }
+                    for obj_id, axis in axes.items()
+                ],
+                "periods": [
+                    {
+                        "cadence": prd.get("PRD_SE"),
+                        "start_period": prd.get("STRT_PRD_DE"),
+                        "latest_period": prd.get("END_PRD_DE"),
+                    }
+                    for prd in (period_rows if isinstance(period_rows, list) else [])[:5]
+                ],
+            })
+
+    candidates.sort(key=lambda c: (c.get("status") != "selected", -int(c.get("score") or 0)))
+    selected = [c for c in candidates if c.get("status") == "selected"]
+    warnings = []
+    if not required:
+        warnings.append(
+            "required_dimensions is empty; table selection can only use search/routing evidence and cannot verify axis coverage."
+        )
+    return {
+        "상태": "selected" if selected else "needs_table_selection",
+        "status": "selected" if selected else "needs_table_selection",
+        "query": query,
+        "indicator": indicator,
+        "search_terms_used": search_queries,
+        "required_dimensions": required,
+        "infer_dimensions": infer_dimensions,
+        "inferred_dimensions": _normalize_required_dimensions(inferred_dimensions),
+        "reject_if_missing_dimensions": reject_if_missing_dimensions,
+        "selected": selected[0] if selected else None,
+        "alternatives": candidates[:limit],
+        "rejected": [c for c in candidates if c.get("status") != "selected"][:limit],
+        "warnings": warnings,
+        "주의": [
+            "select_table_for_query는 표 후보와 축 충족 여부만 판단합니다.",
+            "required_dimensions가 비어 있으면 축 충족 검증이 약해집니다. 가능하면 LLM이 필요한 차원을 명시하세요.",
+            "ITM_ID/OBJ_ID 코드 매핑은 resolve_concepts 또는 explore_table 이후 query_table로 수행하세요.",
+        ],
+    }
+
+
 @mcp.tool()
 async def curation_status(detail: bool = False) -> dict:
     """[🛠] 큐레이션 데이터 현황 조회.
@@ -5276,323 +4173,20 @@ async def check_stat_availability(
     return result
 
 
-def _build_axis_codebook(item_rows: list[dict]) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    axes: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for row in item_rows:
-        obj_id = str(row.get("OBJ_ID") or "")
-        itm_id = str(row.get("ITM_ID") or "")
-        if not obj_id or not itm_id:
-            continue
-        if obj_id not in axes:
-            axes[obj_id] = {
-                "OBJ_NM": row.get("OBJ_NM"),
-                "OBJ_NM_ENG": row.get("OBJ_NM_ENG"),
-                "items": {},
-            }
-            order.append(obj_id)
-        axes[obj_id]["items"][itm_id] = {
-            "code": itm_id,
-            "label": row.get("ITM_NM"),
-            "label_en": row.get("ITM_NM_ENG"),
-            "unit": row.get("UNIT_NM"),
-            "parent": row.get("UP_ITM_ID"),
-        }
-    return axes, order
 
 
-def _suggest_axis_codes(axis: dict[str, Any], bad_code: str, limit: int = 8) -> list[dict[str, Any]]:
-    items = axis.get("items") or {}
-    bad_norm = _compact_text(bad_code)
-    preferred_order = {
-        "00": 0, "0": 0,
-        "11": 1, "21": 2, "22": 3, "23": 4, "24": 5, "25": 6, "26": 7, "27": 8,
-        "31": 9, "32": 10, "33": 11, "34": 12, "35": 13, "36": 14, "37": 15, "38": 16, "39": 17,
-    }
-    scored: list[tuple[int, int, int, int, str, dict[str, Any]]] = []
-    for code, meta in items.items():
-        label = str(meta.get("label") or "")
-        label_norm = _compact_text(label)
-        score = 3
-        if bad_code == code:
-            score = 0
-        elif bad_norm and (bad_norm in _compact_text(code) or bad_norm in label_norm):
-            score = 1
-        elif bad_norm and any(part and part in label_norm for part in re.split(r"[^0-9A-Za-z가-힣]+", bad_norm)):
-            score = 2
-        parent_rank = 0 if not meta.get("parent") else 1
-        order_rank = preferred_order.get(str(code), 100)
-        scored.append((score, parent_rank, order_rank, len(str(code)), str(code), meta))
-    scored.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
-    return [
-        {"code": code, "label": meta.get("label"), "unit": meta.get("unit")}
-        for _, _, _, _, code, meta in scored[:limit]
-    ]
 
 
-def _validate_query_table_filters(
-    filters: dict[str, Any],
-    axes: dict[str, dict[str, Any]],
-    axis_order: list[str],
-) -> tuple[Optional[dict[str, list[str]]], list[dict[str, Any]], dict[str, list[str]]]:
-    if not isinstance(filters, dict):
-        return None, [{"오류": "filters는 {OBJ_ID: [ITM_ID, ...]} 형식의 객체여야 합니다."}], {}
-
-    normalized: dict[str, list[str]] = {}
-    errors: list[dict[str, Any]] = []
-    auto_defaults: dict[str, list[str]] = {}
-
-    for axis_id, raw_codes in filters.items():
-        axis = str(axis_id)
-        if axis not in axes:
-            errors.append({
-                "axis": axis,
-                "오류": "존재하지 않는 분류축",
-                "available_axes": [
-                    {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM")}
-                    for obj_id in axis_order
-                ],
-            })
-            continue
-        codes = raw_codes if isinstance(raw_codes, list) else [raw_codes]
-        clean_codes = [str(code) for code in codes if str(code or "").strip()]
-        if not clean_codes:
-            errors.append({"axis": axis, "오류": "비어 있는 필터 코드"})
-            continue
-        items = axes[axis]["items"]
-        for code in clean_codes:
-            if code not in items:
-                errors.append({
-                    "axis": axis,
-                    "code": code,
-                    "오류": "분류축에 없는 ITM_ID",
-                    "suggested_codes": _suggest_axis_codes(axes[axis], code),
-                })
-        normalized[axis] = clean_codes
-
-    item_axis = "ITEM" if "ITEM" in axes else None
-    if item_axis and item_axis not in normalized:
-        item_codes = list((axes[item_axis].get("items") or {}).keys())
-        if len(item_codes) == 1:
-            normalized[item_axis] = [item_codes[0]]
-            auto_defaults[item_axis] = [item_codes[0]]
-        else:
-            errors.append({
-                "axis": item_axis,
-                "오류": "ITEM 축은 명시해야 합니다.",
-                "suggested_codes": _suggest_axis_codes(axes[item_axis], ""),
-            })
-
-    for axis in axis_order:
-        if axis == "ITEM" or axis in normalized:
-            continue
-        axis_codes = list((axes[axis].get("items") or {}).keys())
-        if len(axis_codes) == 1:
-            normalized[axis] = [axis_codes[0]]
-            auto_defaults[axis] = [axis_codes[0]]
-        else:
-            errors.append({
-                "axis": axis,
-                "오류": "다중 값을 가진 분류축은 명시해야 합니다. 전체 조회가 필요하면 원하는 ITM_ID들을 모두 전달하세요.",
-                "suggested_codes": _suggest_axis_codes(axes[axis], ""),
-            })
-
-    if errors:
-        return None, errors, auto_defaults
-    return normalized, [], auto_defaults
 
 
-def _query_table_params(
-    org_id: str,
-    tbl_id: str,
-    filters: dict[str, list[str]],
-    axis_order: list[str],
-    period_range: Optional[list[str]],
-    period_type: Optional[str],
-) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "method": "getList",
-        "apiKey": None,
-        "orgId": org_id,
-        "tblId": tbl_id,
-        "format": "json",
-        "jsonVD": "Y",
-    }
-    if period_type:
-        params["prdSe"] = period_type
-    data_axis_index = 0
-    for axis in axis_order:
-        if axis != "ITEM":
-            data_axis_index += 1
-        codes = filters.get(axis)
-        if not codes:
-            continue
-        value = ",".join(codes)
-        if axis == "ITEM":
-            params["itmId"] = value
-        else:
-            params[f"objL{data_axis_index}"] = value
-    if period_range:
-        bounds = [str(p) for p in period_range if str(p or "").strip()]
-        if len(bounds) == 1:
-            params["startPrdDe"] = _api_period_de(bounds[0])
-            params["endPrdDe"] = _api_period_de(bounds[0])
-        elif len(bounds) >= 2:
-            params["startPrdDe"] = _api_period_de(bounds[0])
-            params["endPrdDe"] = _api_period_de(bounds[1])
-    return params
 
 
-def _api_period_de(value: Any) -> str:
-    text = str(value or "").strip()
-    monthly = re.fullmatch(r"(\d{4})\.(\d{2})", text)
-    if monthly:
-        return f"{monthly.group(1)}{monthly.group(2)}"
-    return text
 
 
-def _normalize_period_bound(value: Any, *, upper: bool = False) -> Optional[int]:
-    text = re.sub(r"\D", "", str(value or ""))
-    if not text:
-        return None
-    if len(text) == 4:
-        return int(text + ("99" if upper else "00"))
-    return int(text)
 
 
-def _validate_query_period_range(
-    period_range: Optional[list[str]],
-    selected_period: Optional[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    if not period_range:
-        return None
-    bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
-    if not bounds:
-        return None
-    if len(bounds) == 1:
-        bounds = [bounds[0], bounds[0]]
-    start, end = bounds[0], bounds[1]
-    start_num = _normalize_period_bound(start, upper=False)
-    end_num = _normalize_period_bound(end, upper=True)
-    if start_num is not None and end_num is not None and start_num > end_num:
-        return {
-            "code": STATUS_INVALID_PERIOD_RANGE,
-            "error": "period_range start is later than end.",
-            "오류": "period_range 시작 시점이 종료 시점보다 큽니다.",
-            "period_range_received": [start, end],
-            "suggested_period_range": [end, start],
-        }
-    if not selected_period:
-        return None
-    available_start = selected_period.get("STRT_PRD_DE")
-    available_end = selected_period.get("END_PRD_DE")
-    available_start_num = _normalize_period_bound(available_start, upper=False)
-    available_end_num = _normalize_period_bound(available_end, upper=True)
-    if (
-        start_num is not None
-        and end_num is not None
-        and available_start_num is not None
-        and available_end_num is not None
-        and (end_num < available_start_num or start_num > available_end_num)
-    ):
-        return {
-            "code": STATUS_PERIOD_NOT_FOUND,
-            "error": "Requested period is outside the table's recorded period range.",
-            "오류": "요청 시점이 통계표 수록 범위 밖입니다.",
-            "period_range_received": [start, end],
-            "available_period_range": [str(available_start), str(available_end)],
-        }
-    return None
 
 
-def _query_table_data_nature(
-    table_name: Optional[str],
-    period_range: Optional[list[str]],
-    latest_period: Optional[str],
-) -> dict[str, Any]:
-    name = str(table_name or "")
-    requested_end = None
-    if period_range:
-        bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
-        if bounds:
-            requested_end = bounds[-1]
-    requested_num = _normalize_period_bound(requested_end, upper=True)
-    latest_num = _normalize_period_bound(latest_period, upper=True)
-    projection_by_name = any(term in name for term in ("추계", "장래", "전망", "예측"))
-    current_year = datetime.now().year
-    requested_year = int(str(requested_num)[:4]) if requested_num is not None else None
-    latest_year = int(str(latest_num)[:4]) if latest_num is not None else None
-    projection_by_requested_future = requested_year is not None and requested_year > current_year
-    projection_by_future_series = latest_year is not None and latest_year > current_year + 1
-    if projection_by_name or projection_by_requested_future or projection_by_future_series:
-        horizon = None
-        if requested_year is not None:
-            horizon = requested_year - current_year
-        return {
-            "data_nature": "projection",
-            "period_nature": "future_projection" if horizon is not None and horizon > 0 else "projection_series",
-            "projection_horizon_years": horizon if horizon is not None and horizon > 0 else None,
-            "data_quality_note": "통계표명 또는 요청 시점 기준으로 추계/전망 성격의 데이터입니다. 실측값처럼 단정하지 말고 추계 기준임을 표시하세요.",
-            "추계_안내": "이 데이터는 추계/전망 성격일 수 있습니다. 사용자 응답에 기준을 함께 표시하세요.",
-        }
-    return {
-        "data_nature": "observed",
-        "period_nature": "observed_or_reported",
-        "projection_horizon_years": None,
-        "data_quality_note": None,
-    }
-
-
-def _normalize_query_table_rows(
-    rows: list[dict],
-    filters: dict[str, list[str]],
-    axes: dict[str, dict[str, Any]],
-    axis_order: list[str],
-) -> list[dict[str, Any]]:
-    normalized_rows: list[dict[str, Any]] = []
-    data_axis_index = 0
-    data_axis_map: dict[int, str] = {}
-    for axis in axis_order:
-        if axis == "ITEM":
-            continue
-        data_axis_index += 1
-        if filters.get(axis):
-            data_axis_map[data_axis_index] = axis
-
-    for row in rows:
-        dimensions: dict[str, Any] = {}
-        item_code = str(row.get("ITM_ID") or row.get("ITM_ID1") or "")
-        item_label = row.get("ITM_NM")
-        if "ITEM" in axes:
-            if item_code in axes["ITEM"]["items"]:
-                meta = axes["ITEM"]["items"][item_code]
-                item_label = item_label or meta.get("label")
-                dimensions["ITEM"] = {"code": item_code, "label": item_label, "unit": meta.get("unit")}
-            elif len(filters.get("ITEM", [])) == 1:
-                code = filters["ITEM"][0]
-                meta = axes["ITEM"]["items"].get(code, {})
-                dimensions["ITEM"] = {"code": code, "label": meta.get("label"), "unit": meta.get("unit")}
-
-        for idx, axis in data_axis_map.items():
-            code = str(row.get(f"C{idx}") or "")
-            label = row.get(f"C{idx}_NM")
-            if not code and len(filters.get(axis, [])) == 1:
-                code = filters[axis][0]
-            meta = (axes.get(axis, {}).get("items") or {}).get(code, {})
-            dimensions[axis] = {
-                "code": code,
-                "label": label or meta.get("label"),
-                "unit": meta.get("unit"),
-            }
-
-        normalized_rows.append({
-            "period": row.get("PRD_DE"),
-            "value": row.get("DT"),
-            "unit": row.get("UNIT_NM") or (dimensions.get("ITEM") or {}).get("unit"),
-            "dimensions": dimensions,
-            "raw": row,
-        })
-    return normalized_rows
 
 
 @mcp.tool()
@@ -5601,12 +4195,16 @@ async def query_table(
     tbl_id: str,
     filters: dict[str, Any],
     period_range: Optional[list[str]] = None,
+    aggregation: str = "none",
+    group_by: Optional[list[str]] = None,
     api_key: Optional[str] = None,
 ) -> dict:
     """[🧪] 검증된 메타 코드로 KOSIS 표를 raw 조회한다.
 
-    filters는 explore_table이 반환한 OBJ_ID와 ITM_ID만 받는다. 여러 코드를
-    넘겨도 합산/평균을 하지 않고 KOSIS 원행을 개별 rows로 반환한다.
+    filters는 explore_table/resolve_concepts가 반환한 OBJ_ID와 ITM_ID만 받는다.
+    여러 코드는 서버 내부 fan-out으로 조회한다. 기본 aggregation="none"은
+    개별 rows만 반환한다. aggregation="sum_by_group"은 호출자가 가법성을
+    명시적으로 책임지는 경우에만 합산한다.
     """
     if not org_id or not tbl_id:
         return {
@@ -5614,6 +4212,16 @@ async def query_table(
             "status": "unsupported",
             "error": "org_id and tbl_id are required.",
             "오류": "org_id와 tbl_id가 필요합니다.",
+        }
+    if aggregation not in {"none", "sum_by_group"}:
+        return {
+            "상태": "failed",
+            "status": "unsupported",
+            "코드": "INVALID_AGGREGATION",
+            "code": "INVALID_AGGREGATION",
+            "error": "aggregation must be one of: none, sum_by_group.",
+            "오류": "aggregation은 none 또는 sum_by_group만 지원합니다.",
+            "allowed_aggregations": ["none", "sum_by_group"],
         }
 
     key = _resolve_key(api_key)
@@ -5711,17 +4319,33 @@ async def query_table(
                 "metadata_source": metadata_source,
             }
 
-        params = _query_table_params(
-            org_id,
-            tbl_id,
-            normalized_filters,
-            axis_order,
-            effective_period_range,
-            period_type,
-        )
-        params["apiKey"] = key
+        normalized_rows_from_fanout: list[dict[str, Any]] = []
         try:
-            rows = await _kosis_call(client, "Param/statisticsParameterData.do", params)
+            fanout_filters = _fanout_filter_sets(normalized_filters)
+            row_groups = await asyncio.gather(*[
+                _kosis_call(
+                    client,
+                    "Param/statisticsParameterData.do",
+                    {
+                        **_query_table_params(
+                            org_id,
+                            tbl_id,
+                            filter_set,
+                            axis_order,
+                            effective_period_range,
+                            period_type,
+                        ),
+                        "apiKey": key,
+                    },
+                )
+                for filter_set in fanout_filters
+            ])
+            rows = [row for group in row_groups for row in (group if isinstance(group, list) else [])]
+            for filter_set, group in zip(fanout_filters, row_groups):
+                if isinstance(group, list):
+                    normalized_rows_from_fanout.extend(
+                        _normalize_query_table_rows(group, filter_set, axes, axis_order)
+                    )
         except Exception as exc:
             return {
                 "상태": "failed",
@@ -5731,7 +4355,7 @@ async def query_table(
                 "error": f"KOSIS raw extraction failed: {exc}",
                 "오류": f"KOSIS raw 호출 실패: {exc}",
                 "filters_used": normalized_filters,
-                "aggregation": "none",
+                "aggregation": aggregation,
                 "metadata_source": metadata_source,
             }
 
@@ -5741,15 +4365,32 @@ async def query_table(
         table_name = name_rows[0].get("TBL_NM") or name_rows[0].get("tblNm")
         table_name_eng = name_rows[0].get("TBL_NM_ENG") or name_rows[0].get("tblNmEng")
     latest_period = selected_period
-    normalized_rows = _normalize_query_table_rows(rows, normalized_filters, axes, axis_order)
+    normalized_rows = normalized_rows_from_fanout
+    aggregated_axes: list[str] = []
+    if aggregation == "sum_by_group":
+        normalized_rows, aggregated_axes = _aggregate_rows_sum_by_group(
+            normalized_rows,
+            normalized_filters,
+            group_by,
+        )
     latest_period_value = str(latest_period.get("END_PRD_DE")) if latest_period and latest_period.get("END_PRD_DE") else None
     nature = _query_table_data_nature(table_name, effective_period_range, latest_period_value)
+    aggregation_assumption = "caller_asserted_additive" if aggregation == "sum_by_group" else None
+    aggregation_warning = (
+        "sum_by_group은 호출자가 선택한 지표와 축이 가법적이라고 판단했다는 전제에서만 수행됩니다. "
+        "비율·지수·평균·증감률 지표는 합산하면 통계적으로 의미가 없을 수 있습니다."
+        if aggregation == "sum_by_group" else None
+    )
     result = {
         "상태": "executed",
         "status": "executed",
         "verification_level": "explored_raw",
         "confidence": "medium",
-        "aggregation": "none",
+        "aggregation": aggregation,
+        "group_by": group_by or None,
+        "aggregated_axes": aggregated_axes,
+        "aggregation_assumption": aggregation_assumption,
+        "aggregation_warning": aggregation_warning,
         "기관ID": org_id,
         "통계표ID": tbl_id,
         "통계표명": table_name,
@@ -5764,6 +4405,11 @@ async def query_table(
         "period_type": period_type,
         "period_type_label": period_type_label,
         "auto_default_period_range": auto_default_period_range,
+        "fanout": {
+            "enabled": any(len(codes) > 1 for codes in normalized_filters.values()),
+            "call_count": len(_fanout_filter_sets(normalized_filters)),
+            "reason": "KOSIS multi-code parameters can fail with code 21, so the server uses verified single-code calls.",
+        },
         "rows": normalized_rows,
         "row_count": len(normalized_rows),
         "metadata_source": metadata_source,
@@ -5778,11 +4424,15 @@ async def query_table(
             "latest_period": latest_period.get("END_PRD_DE") if latest_period else None,
         } if latest_period else None,
         "주의": [
-            "query_table은 raw extraction 도구입니다. 합산·평균·비율·해석을 수행하지 않습니다.",
+            "query_table은 raw extraction 도구입니다. 기본 aggregation=none에서는 합산·평균·비율·해석을 수행하지 않습니다.",
+            "aggregation=sum_by_group은 호출자가 해당 값의 가법성을 명시적으로 책임진다는 전제에서만 사용하세요.",
+            *( [aggregation_warning] if aggregation_warning else [] ),
             "confidence는 값의 품질이 아니라 코드 매핑과 호출 조건의 검증 수준입니다.",
         ],
         "warnings": [
-            "query_table is a raw extraction tool. It does not aggregate, average, calculate ratios, or interpret values.",
+            "query_table is a raw extraction tool. aggregation=none does not aggregate, average, calculate ratios, or interpret values.",
+            "aggregation=sum_by_group assumes the caller has verified additivity for the selected statistic.",
+            *( [aggregation_warning] if aggregation_warning else [] ),
             "confidence describes mapping and call-condition verification, not statistical data quality.",
         ],
     }
@@ -5795,6 +4445,10 @@ async def explore_table(
     org_id: str,
     tbl_id: str,
     industry_term: Optional[str] = None,
+    axes_to_include: Optional[list[str]] = None,
+    compact: bool = False,
+    include_english_labels: bool = True,
+    sample_limit: int = 30,
     api_key: Optional[str] = None,
 ) -> dict:
     """[🧭] Pull the metadata KOSIS publishes for a single statistical
@@ -5814,6 +4468,10 @@ async def explore_table(
             the matching ITM_ID so the caller can pass it as objL2 to
             quick_stat. Use this to bridge "제조업"/"음식점업" to KOSIS
             internal codes dynamically rather than via TIER_A_STATS.
+        axes_to_include: optional OBJ_ID or axis-name fragments to return.
+        compact: if true, return only a sample of long axes.
+        include_english_labels: if false, omit English labels to reduce tokens.
+        sample_limit: max items per axis in compact mode.
 
     Returns: dict with table name, classification rows, period range,
         contact info, and (optionally) the resolved industry row plus
@@ -5884,6 +4542,31 @@ async def explore_table(
                 "UP_ITM_ID": row.get("UP_ITM_ID"),
                 "UNIT_NM": row.get("UNIT_NM"),
             })
+
+    if axes_to_include:
+        wanted_raw = [str(axis) for axis in axes_to_include if str(axis or "").strip()]
+        wanted = {_compact_text(axis) for axis in wanted_raw}
+        wanted_dimensions = set(_normalize_required_dimensions(wanted_raw))
+        classifications = {
+            obj_id: axis
+            for obj_id, axis in classifications.items()
+            if _compact_text(obj_id) in wanted
+            or any(term in _compact_text(str(axis.get("OBJ_NM") or "")) for term in wanted)
+            or any(_axis_matches_dimension(str(axis.get("OBJ_NM") or ""), dim) for dim in wanted_dimensions)
+        }
+    if compact:
+        limit = max(1, int(sample_limit or 30))
+        for axis in classifications.values():
+            items = axis.get("items") or []
+            axis["item_count"] = len(items)
+            axis["truncated"] = len(items) > limit
+            axis["items"] = items[:limit]
+    if not include_english_labels:
+        for axis in classifications.values():
+            axis.pop("OBJ_NM_ENG", None)
+            for item in axis.get("items") or []:
+                if isinstance(item, dict):
+                    item.pop("ITM_NM_ENG", None)
 
     table_name = None
     table_name_eng = None

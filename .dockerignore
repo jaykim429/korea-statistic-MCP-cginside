@@ -1,5 +1,6 @@
 .git
 .venv
+.venv-kosis
 __pycache__
 *.pyc
 build
@@ -7,3 +8,5 @@ dist
 dist-test
 *.egg-info
 .env
+artifacts
+openApi_manual_v1.0.pdf
