@@ -4485,6 +4485,22 @@ async def explore_table(
             f"이 통계표의 최신 시점은 {used_period} (약 {period_age:.1f}년 경과)"
         )
 
+    if not industry_term:
+        industry_axes = [
+            {"OBJ_ID": obj_id, "OBJ_NM": axis.get("OBJ_NM")}
+            for obj_id, axis in classifications.items()
+            if any(token in str(axis.get("OBJ_NM") or "") for token in ("산업", "업종", "분류"))
+        ]
+        if industry_axes:
+            result["industry_term_안내"] = {
+                "안내": (
+                    "industry_term을 함께 주면 해당 산업·업종 표현을 이 통계표의 ITM_ID로 "
+                    "매핑해 resolved_industry 블록에 표시합니다."
+                ),
+                "감지된_분류축": industry_axes,
+                "예시_호출": f"explore_table('{org_id}', '{tbl_id}', industry_term='제조업')",
+            }
+
     if industry_term:
         match = _resolve_classification_term(industry_term, item_rows if isinstance(item_rows, list) else [])
         if match is not None:

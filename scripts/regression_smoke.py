@@ -297,6 +297,15 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"explore_table_has_classifications": True},
     },
     {
+        "name": "explore_table_industry_hint_without_term",
+        "tool": explore_table,
+        "args": ("142", "DT_BR_C001"),
+        "expect": {
+            "explore_table_has_classifications": True,
+            "industry_term_hint": True,
+        },
+    },
+    {
         "name": "explore_table_invalid_id_fails",
         "tool": explore_table,
         "args": ("101", "NO_SUCH_TABLE"),
@@ -539,6 +548,8 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         axes = (result or {}).get("분류축") or {}
         if not isinstance(axes, dict) or not axes:
             problems.append("explore_table_no_classifications")
+    if expect.get("industry_term_hint") and not (result or {}).get("industry_term_안내"):
+        problems.append("industry_term_hint_missing")
     if "resolved_industry_itm_id" in expect:
         resolved = (result or {}).get("resolved_industry") or {}
         if resolved.get("ITM_ID") != expect["resolved_industry_itm_id"]:
