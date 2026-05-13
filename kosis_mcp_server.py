@@ -3967,6 +3967,33 @@ async def explore_table(
             safe_fetch("SOURCE"),
         )
 
+    meta_errors = {
+        meta_type: rows.get("오류")
+        for meta_type, rows in (
+            ("TBL", name_rows),
+            ("ITM", item_rows),
+            ("PRD", period_rows),
+            ("SOURCE", source_rows),
+        )
+        if isinstance(rows, dict) and rows.get("오류")
+    }
+    meta_counts = {
+        "TBL": len(name_rows) if isinstance(name_rows, list) else 0,
+        "ITM": len(item_rows) if isinstance(item_rows, list) else 0,
+        "PRD": len(period_rows) if isinstance(period_rows, list) else 0,
+        "SOURCE": len(source_rows) if isinstance(source_rows, list) else 0,
+    }
+    if not meta_errors and not any(meta_counts.values()):
+        return {
+            "상태": "failed",
+            "코드": STATUS_STAT_NOT_FOUND,
+            "오류": "KOSIS 메타 API가 해당 org_id/tbl_id에 대해 어떤 메타도 반환하지 않았습니다.",
+            "기관ID": org_id,
+            "통계표ID": tbl_id,
+            "조회_결과": meta_counts,
+            "권고": "기관ID와 통계표ID를 다시 확인하거나 search_kosis로 통계표를 재검색하세요.",
+        }
+
     classifications: dict[str, dict[str, Any]] = {}
     if isinstance(item_rows, list):
         for row in item_rows:
@@ -4026,6 +4053,23 @@ async def explore_table(
             "전화": first.get("DEPT_PHONE") or first.get("deptPhone"),
         }
 
+    item_list = item_rows if isinstance(item_rows, list) else []
+    items_with_units = sum(1 for row in item_list if row.get("UNIT_NM"))
+    items_with_english = sum(1 for row in item_list if row.get("ITM_NM_ENG"))
+    metadata_coverage = {
+        "통계표명": bool(table_name),
+        "통계표명_영문": bool(table_name_eng),
+        "수록기간": bool(period_summary),
+        "출처": bool(contact),
+        "분류축_개수": len(classifications),
+        "항목_개수": len(item_list),
+        "단위_있는_항목": items_with_units,
+        "영문라벨_있는_항목": items_with_english,
+        "조회_결과": meta_counts,
+    }
+    if meta_errors:
+        metadata_coverage["조회_실패"] = meta_errors
+
     result: dict[str, Any] = {
         "통계표ID": tbl_id,
         "기관ID": org_id,
@@ -4036,6 +4080,7 @@ async def explore_table(
         "period_age_years": period_age,
         "출처": contact,
         "분류축": classifications,
+        "메타_완성도": metadata_coverage,
         "출처_KOSIS_API": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD/SOURCE",
     }
 

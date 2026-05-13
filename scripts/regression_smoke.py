@@ -218,6 +218,15 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"explore_table_has_classifications": True},
     },
     {
+        "name": "explore_table_invalid_id_fails",
+        "tool": explore_table,
+        "args": ("101", "NO_SUCH_TABLE"),
+        "expect": {
+            "status": "failed",
+            "code": "STAT_NOT_FOUND",
+        },
+    },
+    {
         "name": "explore_table_industry_manufacturing_parent",
         "tool": explore_table,
         "args": ("142", "DT_BR_C001", "제조업"),
