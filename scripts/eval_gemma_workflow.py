@@ -26,6 +26,7 @@ CASES: list[dict[str, Any]] = [
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table", "compute_indicator"],
         "required_dimensions": ["region", "age", "sex", "time"],
         "concepts": ["인구", "서울", "30대", "여성", "2020"],
+        "indicator_alternatives_min": 3,
         "future_expected_table": "DT_1BPB001",
         "future_must_not_select_tables": ["DT_1B040A3"],
     },
@@ -61,6 +62,33 @@ CASES: list[dict[str, Any]] = [
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
         "concepts": ["출생"],
         "consistency_warnings_len": 0,
+    },
+    {
+        "name": "region_pair_comparison",
+        "query": "서울과 부산 인구 비교",
+        "expected_intent": "comparison",
+        "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
+        "required_dimensions": ["regions"],
+        "concepts": ["인구", "서울", "부산"],
+        "dimension_checks": {"regions": ["서울", "부산"]},
+    },
+    {
+        "name": "explicit_year_range_trend",
+        "query": "2015년부터 2023년까지 출생아 수 추이",
+        "expected_intent": "trend",
+        "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
+        "required_dimensions": ["time"],
+        "concepts": ["출생", "2015", "2023"],
+        "dimension_checks": {"time.type": "year_range", "time.start": "2015", "time.end": "2023"},
+        "period_range": ["2015", "2023"],
+    },
+    {
+        "name": "relative_year_last_year",
+        "query": "작년 서울 실업률",
+        "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
+        "required_dimensions": ["region", "time"],
+        "concepts": ["실업률", "서울", "작년"],
+        "dimension_checks": {"time.type": "relative_year", "time.offset": -1},
     },
     {
         "name": "marriage_colloquial",
@@ -126,14 +154,21 @@ async def main() -> None:
     for case in CASES:
         result = await plan_query(case["query"])
         workflow = [step.get("tool") for step in result.get("suggested_workflow", [])]
+        period_range = None
         compute_operations = []
         for step in result.get("suggested_workflow", []):
-            if isinstance(step, dict) and step.get("tool") == "compute_indicator":
+            if not isinstance(step, dict):
+                continue
+            if step.get("tool") == "query_table":
+                period_range = (step.get("args") or {}).get("period_range")
+            if step.get("tool") == "compute_indicator":
                 args = step.get("args") or {}
                 compute_operations = args.get("operations") or [args.get("operation")]
         problems = []
         if "expected_status" in case and result.get("status") != case["expected_status"]:
             problems.append({"status": result.get("status"), "expected": case["expected_status"]})
+        if "expected_intent" in case and result.get("intent") != case["expected_intent"]:
+            problems.append({"intent": result.get("intent"), "expected": case["expected_intent"]})
         missing_workflow = _contains_all(workflow, case.get("expected_workflow", []))
         if missing_workflow:
             problems.append({"missing_workflow": missing_workflow, "actual": workflow})
@@ -146,6 +181,23 @@ async def main() -> None:
         missing_compute_ops = _contains_all(compute_operations, case.get("compute_operations", []))
         if missing_compute_ops:
             problems.append({"missing_compute_operations": missing_compute_ops, "actual": compute_operations})
+        dimensions = result.get("intended_dimensions") or {}
+        for path, expected in case.get("dimension_checks", {}).items():
+            current: Any = dimensions
+            for part in path.split("."):
+                current = current.get(part) if isinstance(current, dict) else None
+            if isinstance(expected, list):
+                missing = _contains_all(current if isinstance(current, list) else [], expected)
+                if missing:
+                    problems.append({"dimension": path, "missing": missing, "actual": current})
+            elif current != expected:
+                problems.append({"dimension": path, "actual": current, "expected": expected})
+        if "period_range" in case and period_range != case["period_range"]:
+            problems.append({"period_range": period_range, "expected": case["period_range"]})
+        if "indicator_alternatives_min" in case:
+            alternatives = dimensions.get("indicator_alternatives")
+            if not isinstance(alternatives, list) or len(alternatives) < case["indicator_alternatives_min"]:
+                problems.append({"indicator_alternatives": alternatives})
         warnings = result.get("consistency_warnings", [])
         if "consistency_warnings_len" in case and len(warnings) != case["consistency_warnings_len"]:
             problems.append({"consistency_warnings_len": len(warnings), "warnings": warnings})
@@ -163,10 +215,12 @@ async def main() -> None:
             "problems": problems,
             "intent": result.get("intent"),
             "workflow": workflow,
+            "period_range": period_range,
             "compute_operations": compute_operations,
             "consistency_warnings": warnings,
             "router_slots_overridden": result.get("router_slots_overridden") or {},
             "required_dimensions": result.get("required_dimensions"),
+            "intended_dimensions": result.get("intended_dimensions"),
             "concepts": result.get("concepts"),
             "future_expectations": {
                 key: value

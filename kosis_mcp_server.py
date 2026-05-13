@@ -1001,12 +1001,19 @@ class QueryWorkflowPlanner:
         "note": "충돌 시 intended_dimensions가 권위입니다. router_slots는 디버깅용 보조 정보입니다.",
     }
     GENERIC_ROUTER_INDICATORS = {"비중", "비율", "구성비", "증가율", "감소율", "변화율"}
+    INDICATOR_ALTERNATIVES = {
+        "인구": [
+            {"label": "주민등록인구", "default": True, "scope": "주민등록 기준, 외국인 제외"},
+            {"label": "추계인구", "scope": "장래인구추계 기준, 내·외국인 포함 가능, 미래 시점은 추계"},
+            {"label": "인구주택총조사 인구", "scope": "센서스 기준, 조사 주기와 기준시점 확인 필요"},
+        ],
+    }
 
     def build(self, query: str) -> dict[str, Any]:
         route_payload = NaturalLanguageAnswerEngine._route_payload(query)
         dimensions = self._dimensions(query, route_payload)
         calculations = self._calculations(query, route_payload)
-        intent = self._intent(route_payload, calculations)
+        intent = self._intent(route_payload, calculations, dimensions)
         concepts = self._concepts(dimensions, calculations)
         required = self._required_dimensions(dimensions, calculations)
         consistency_warnings = self._consistency_warnings(dimensions, route_payload)
@@ -1141,7 +1148,7 @@ class QueryWorkflowPlanner:
                 ),
             })
 
-        primary_region = dimensions.get("region")
+        primary_region = dimensions.get("regions") or dimensions.get("region")
         slot_region = slots.get("region")
         if QueryWorkflowPlanner._scalar_conflicts(primary_region, slot_region):
             warnings.append({
@@ -1216,6 +1223,12 @@ class QueryWorkflowPlanner:
         indicator = self._indicator(query, q_norm, q_lower, route_payload)
         if indicator:
             dimensions["indicator"] = indicator
+            alternatives = self.INDICATOR_ALTERNATIVES.get(indicator)
+            if alternatives:
+                dimensions["indicator_alternatives"] = alternatives
+                dimensions["disambiguation_suggested"] = (
+                    f"{indicator}는 여러 공식 통계 기준이 있습니다. 기준을 명시하면 더 정확합니다."
+                )
         if "폐업" in q_norm:
             dimensions["event"] = "폐업"
         if "창업" in q_norm:
@@ -1229,6 +1242,10 @@ class QueryWorkflowPlanner:
         if region:
             dimensions["region"] = region
 
+        regions = self._comparison_regions(slots, q_norm, q_lower)
+        if regions:
+            dimensions["regions"] = regions
+
         composite = self._composite_region(q_norm)
         if composite:
             dimensions["region_group"] = composite
@@ -1241,8 +1258,9 @@ class QueryWorkflowPlanner:
         if sex:
             dimensions["sex"] = sex
 
-        time_value = slots.get("time") if isinstance(slots, dict) else None
-        time_value = time_value or self._time(query, q_norm)
+        parsed_time = self._time(query, q_norm)
+        slot_time = slots.get("time") if isinstance(slots, dict) else None
+        time_value = parsed_time or slot_time
         if time_value:
             dimensions["time"] = time_value
 
@@ -1290,6 +1308,36 @@ class QueryWorkflowPlanner:
                 return region
         return None
 
+    def _comparison_regions(self, slots: Any, q_norm: str, q_lower: str) -> list[str]:
+        regions: list[str] = []
+        targets = slots.get("comparison_target") if isinstance(slots, dict) else None
+        if isinstance(targets, list):
+            for target in targets:
+                if isinstance(target, str):
+                    region = self._normalize_region(target, target.lower())
+                    if region:
+                        regions.append(region)
+        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
+            if region != "전국" and _compact_text(region) in q_norm:
+                regions.append(region)
+        for alias, region in self.EN_REGION_ALIASES.items():
+            if alias in q_lower:
+                regions.append(region)
+        unique = list(dict.fromkeys(regions))
+        return unique if len(unique) >= 2 else []
+
+    def _normalize_region(self, text: str, text_lower: str) -> Optional[str]:
+        norm = _compact_text(text)
+        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
+            if region != "전국" and _compact_text(region) in norm:
+                return region
+        if "전국" in norm:
+            return "전국"
+        for alias, region in self.EN_REGION_ALIASES.items():
+            if alias in text_lower:
+                return region
+        return None
+
     @staticmethod
     def _composite_region(q_norm: str) -> Optional[str]:
         for name in sorted(REGION_COMPOSITES, key=len, reverse=True):
@@ -1325,10 +1373,33 @@ class QueryWorkflowPlanner:
     @staticmethod
     def _time(query: str, q_norm: str) -> Optional[dict[str, Any]]:
         years = re.findall(r"(19\d{2}|20\d{2})", query)
-        if len(years) >= 2 and any(term in q_norm for term in ("부터", "까지", "대비", "~")):
-            return {"type": "range", "start": years[0], "end": years[1]}
+        if len(years) >= 2 and (
+            any(term in q_norm for term in ("부터", "까지", "에서", "~"))
+            or re.search(r"(?:19\d{2}|20\d{2})\s*[-~]\s*(?:19\d{2}|20\d{2})", query)
+        ):
+            return {"type": "year_range", "start": years[0], "end": years[1]}
         if years:
             return {"type": "year", "value": years[0]}
+        relative_years = {
+            "올해": 0,
+            "금년": 0,
+            "작년": -1,
+            "전년": -1,
+            "지난해": -1,
+            "재작년": -2,
+        }
+        for token, offset in relative_years.items():
+            if token in q_norm:
+                return {"type": "relative_year", "label": token, "offset": offset}
+        relative_months = {
+            "이번달": 0,
+            "이번월": 0,
+            "지난달": -1,
+            "전월": -1,
+        }
+        for token, offset in relative_months.items():
+            if token in q_norm:
+                return {"type": "relative_month", "label": token, "offset": offset}
         if any(term in q_norm for term in ("최근", "최신", "현재")):
             return {"type": "latest", "value": "latest"}
         return None
@@ -1353,9 +1424,12 @@ class QueryWorkflowPlanner:
         return list(dict.fromkeys(calculations))
 
     @staticmethod
-    def _intent(route_payload: dict[str, Any], calculations: list[str]) -> str:
+    def _intent(route_payload: dict[str, Any], calculations: list[str], dimensions: dict[str, Any]) -> str:
         if "per_capita" in calculations or "share" in calculations:
             return "computed_indicator"
+        time_value = dimensions.get("time")
+        if isinstance(time_value, dict) and time_value.get("type") == "year_range":
+            return "trend"
         if "time_series" in calculations:
             return "trend"
         if "growth_rate" in calculations:
@@ -1370,7 +1444,11 @@ class QueryWorkflowPlanner:
     @staticmethod
     def _required_dimensions(dimensions: dict[str, Any], calculations: list[str]) -> list[str]:
         required: list[str] = []
-        for key in ("region", "region_group", "age", "sex", "industry", "time"):
+        if dimensions.get("regions"):
+            required.append("regions")
+        elif dimensions.get("region"):
+            required.append("region")
+        for key in ("region_group", "age", "sex", "industry", "time"):
             if dimensions.get(key):
                 required.append(key)
         if any(op in calculations for op in ("time_series", "growth_rate")) and "time" not in required:
@@ -1384,12 +1462,15 @@ class QueryWorkflowPlanner:
             value = dimensions.get(key)
             if isinstance(value, str):
                 concepts.append(value)
+        regions = dimensions.get("regions")
+        if isinstance(regions, list):
+            concepts.extend(str(region) for region in regions if region)
         age = dimensions.get("age")
         if isinstance(age, dict) and age.get("label"):
             concepts.append(str(age["label"]))
         time_value = dimensions.get("time")
         if isinstance(time_value, dict):
-            concepts.extend(str(v) for k, v in time_value.items() if k in {"value", "start", "end"} and v)
+            concepts.extend(str(v) for k, v in time_value.items() if k in {"value", "start", "end", "label"} and v)
         concepts.extend(calculations)
         return list(dict.fromkeys(concepts))
 
@@ -1412,6 +1493,8 @@ class QueryWorkflowPlanner:
                     "query": query,
                     "required_dimensions": required,
                     "indicator": dimensions.get("indicator"),
+                    "indicator_alternatives": dimensions.get("indicator_alternatives"),
+                    "comparison_targets": dimensions.get("regions"),
                     "reject_if_missing_dimensions": True,
                 },
                 "select_table_for_query" in self.AVAILABLE_TOOLS,
@@ -1467,7 +1550,7 @@ class QueryWorkflowPlanner:
         if isinstance(time_value, dict):
             if time_value.get("type") == "year" and time_value.get("value"):
                 return [str(time_value["value"]), str(time_value["value"])]
-            if time_value.get("type") == "range" and time_value.get("start") and time_value.get("end"):
+            if time_value.get("type") in {"range", "year_range"} and time_value.get("start") and time_value.get("end"):
                 return [str(time_value["start"]), str(time_value["end"])]
         return None
 
