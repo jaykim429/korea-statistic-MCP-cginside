@@ -389,6 +389,7 @@ TESTS: list[dict[str, Any]] = [
             "intent": "single_value",
             "required_dimensions_contains": ["region", "age", "sex", "time"],
             "concepts_contains": ["인구", "서울", "30대", "여성", "2020"],
+            "indicator_alternatives_min": 3,
             "workflow_tools_contains": ["select_table_for_query", "resolve_concepts", "query_table"],
         },
     },
@@ -414,6 +415,43 @@ TESTS: list[dict[str, Any]] = [
             "machine_status": "planned",
             "concepts_contains": ["출생"],
             "consistency_warnings_len": 0,
+        },
+    },
+    {
+        "name": "plan_query_region_pair_comparison",
+        "tool": plan_query,
+        "args": ("서울과 부산 인구 비교",),
+        "expect": {
+            "machine_status": "planned",
+            "intent": "comparison",
+            "required_dimensions_contains": ["regions"],
+            "concepts_contains": ["인구", "서울", "부산"],
+            "dimension_path_contains": {"regions": ["서울", "부산"]},
+            "indicator_alternatives_min": 3,
+        },
+    },
+    {
+        "name": "plan_query_explicit_year_range",
+        "tool": plan_query,
+        "args": ("2015년부터 2023년까지 출생아 수 추이",),
+        "expect": {
+            "machine_status": "planned",
+            "intent": "trend",
+            "required_dimensions_contains": ["time"],
+            "concepts_contains": ["출생", "2015", "2023"],
+            "dimension_path_equals": {"time.type": "year_range", "time.start": "2015", "time.end": "2023"},
+            "query_table_period_range": ["2015", "2023"],
+        },
+    },
+    {
+        "name": "plan_query_relative_year_last_year",
+        "tool": plan_query,
+        "args": ("작년 서울 실업률",),
+        "expect": {
+            "machine_status": "planned",
+            "required_dimensions_contains": ["region", "time"],
+            "concepts_contains": ["실업률", "서울", "작년"],
+            "dimension_path_equals": {"time.type": "relative_year", "time.offset": -1},
         },
     },
     {
@@ -608,6 +646,11 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
     series = result.get("시계열") or []
     comparison = result.get("비교") or {}
     calc = result.get("계산") or {}
+    workflow = result.get("suggested_workflow") or []
+    query_table_period_range = None
+    for step in workflow:
+        if isinstance(step, dict) and step.get("tool") == "query_table":
+            query_table_period_range = (step.get("args") or {}).get("period_range")
     return {
         "error": result.get("오류"),
         "answer": result.get("answer"),
@@ -653,12 +696,14 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "period_type": result.get("period_type"),
         "validation_errors": result.get("validation_errors") or result.get("검증_오류") or [],
         "intent": result.get("intent"),
+        "intended_dimensions": result.get("intended_dimensions") or {},
         "required_dimensions": result.get("required_dimensions") or [],
         "concepts": result.get("concepts") or [],
-        "workflow_tools": [step.get("tool") for step in (result.get("suggested_workflow") or []) if isinstance(step, dict)],
+        "workflow_tools": [step.get("tool") for step in workflow if isinstance(step, dict)],
+        "query_table_period_range": query_table_period_range,
         "compute_operations": [
             op
-            for step in (result.get("suggested_workflow") or [])
+            for step in workflow
             if isinstance(step, dict) and step.get("tool") == "compute_indicator"
             for op in ((step.get("args") or {}).get("operations") or [(step.get("args") or {}).get("operation")])
             if op
@@ -703,6 +748,28 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [concept for concept in expect["concepts_contains"] if concept not in concepts]
         if missing:
             problems.append(f"concepts={sorted(concepts)}")
+    if "dimension_path_equals" in expect:
+        for path, expected in expect["dimension_path_equals"].items():
+            current: Any = summary.get("intended_dimensions") or {}
+            for part in path.split("."):
+                current = current.get(part) if isinstance(current, dict) else None
+            if current != expected:
+                problems.append(f"{path}={current!r}")
+    if "dimension_path_contains" in expect:
+        for path, expected_values in expect["dimension_path_contains"].items():
+            current: Any = summary.get("intended_dimensions") or {}
+            for part in path.split("."):
+                current = current.get(part) if isinstance(current, dict) else None
+            actual = current if isinstance(current, list) else []
+            missing = [value for value in expected_values if value not in actual]
+            if missing:
+                problems.append(f"{path}={actual!r}")
+    if "indicator_alternatives_min" in expect:
+        alternatives = (summary.get("intended_dimensions") or {}).get("indicator_alternatives")
+        if not isinstance(alternatives, list) or len(alternatives) < expect["indicator_alternatives_min"]:
+            problems.append(f"indicator_alternatives={alternatives!r}")
+    if "query_table_period_range" in expect and summary.get("query_table_period_range") != expect["query_table_period_range"]:
+        problems.append(f"query_table_period_range={summary.get('query_table_period_range')}")
     if "workflow_tools_contains" in expect:
         tools = set(summary.get("workflow_tools") or [])
         missing = [tool for tool in expect["workflow_tools_contains"] if tool not in tools]
