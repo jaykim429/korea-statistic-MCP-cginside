@@ -1395,6 +1395,7 @@ class NaturalLanguageAnswerEngine:
         query: str,
         direct_key: str,
         top_n: int,
+        include_share_ratio: bool = False,
     ) -> dict[str, Any]:
         route_payload = self._route_payload(query)
         comparison = await quick_region_compare(direct_key, api_key=self.api_key)
@@ -1410,15 +1411,18 @@ class NaturalLanguageAnswerEngine:
         unit = comparison.get("단위", "")
         period = comparison.get("시점")
         direction = "많은" if descending else "적은"
+        rank_label = "상위" if descending else "하위"
         if selected:
             leader = selected[0]
             answer = (
-                f"{period} 기준 {comparison.get('통계명', direct_key)} 상위 {len(selected)}개 지역 중 "
+                f"{period} 기준 {comparison.get('통계명', direct_key)} {rank_label} {len(selected)}개 지역 중 "
                 f"가장 {direction} 지역은 {leader['지역']}({leader['값']}{unit})입니다."
             )
         else:
             answer = "상위/하위 비교 데이터를 조회하지 못했습니다."
-        return {
+
+        notes = self._validation_notes(route_payload)
+        payload: dict[str, Any] = {
             "상태": "executed",
             "코드": STATUS_EXECUTED,
             "답변유형": "tier_a_top_n",
@@ -1429,10 +1433,56 @@ class NaturalLanguageAnswerEngine:
             "요청_top_n": top_n,
             "정렬": "내림차순" if descending else "오름차순",
             "추천_시각화": ["bar_chart"],
-            "검증_주의": route_payload["validation"].get("warnings", []),
+            "검증_주의": notes,
             "route": route_payload["route"],
             "출처": "통계청 KOSIS",
         }
+        if not include_share_ratio or not selected:
+            return payload
+
+        try:
+            subtotal = sum(
+                self._to_float(row.get("원값", row.get("값")))
+                for row in selected
+            )
+        except (TypeError, ValueError):
+            return payload
+
+        whole = await quick_stat(direct_key, "전국", str(period or "latest"), self.api_key)
+        if "오류" in whole or "값" not in whole:
+            return payload
+        try:
+            whole_value = self._to_float(whole["값"])
+        except (KeyError, ValueError):
+            return payload
+        if not whole_value:
+            return payload
+
+        whole_period = str(whole.get("시점", ""))
+        if period and whole_period and str(period) != whole_period:
+            notes.append(f"분자 시점 {period} ↔ 분모 시점 {whole_period} 불일치")
+        share = subtotal / whole_value * 100
+        stat_label = comparison.get("통계명", direct_key)
+        payload.update({
+            "답변유형": "tier_a_top_n_share_ratio",
+            "answer": (
+                f"{period} 기준 {stat_label} {rank_label} {len(selected)}개 지역"
+                f"({'+'.join(row['지역'] for row in selected)}) 합계는 "
+                f"{_format_number(subtotal)}{unit}로, 전국({_format_number(whole_value)}{unit}) 대비 "
+                f"약 {share:.2f}%입니다."
+            ),
+            "계산": {
+                "분자": _format_number(subtotal),
+                "분모": _format_number(whole_value),
+                "비중_퍼센트": round(share, 2),
+                "포함_지역": [row["지역"] for row in selected],
+                "산식": f"({' + '.join(row['지역'] for row in selected)}) / 전국 * 100",
+                "동일시점_여부": str(period or "") == whole_period,
+            },
+            "추천_시각화": ["bar_chart", "pie_chart"],
+            "검증_주의": notes,
+        })
+        return payload
 
     async def _answer_share_ratio(
         self,
@@ -1623,7 +1673,20 @@ class NaturalLanguageAnswerEngine:
         else:
             indicator = "생존율"
         formula_spec = await indicator_dependency_map(indicator)
-        search = await search_kosis(f"{indicator} {query}", 8, True, self.api_key)
+        dynamic_terms = [
+            f"{indicator} {query}",
+            f"{indicator} 업종별",
+            f"{indicator} 산업별",
+            f"기업생멸행정통계 {indicator}",
+            f"신생기업 {indicator}",
+        ]
+        search = await _search_kosis_keywords(
+            f"{indicator} {query}",
+            dynamic_terms,
+            8,
+            self.api_key,
+            used_routing=True,
+        )
         return {
             "상태": "needs_table_selection",
             "코드": STATUS_NEEDS_TABLE_SELECTION,
@@ -1886,7 +1949,12 @@ class NaturalLanguageAnswerEngine:
 
         if inferred_direct_key and self._is_top_n_question(query, route_payload):
             top_n = self._extract_top_n(query) or 5
-            return await self._answer_top_n(query, inferred_direct_key, top_n)
+            return await self._answer_top_n(
+                query,
+                inferred_direct_key,
+                top_n,
+                include_share_ratio=self._is_share_ratio_question(query, route_payload),
+            )
 
         if inferred_direct_key and self._is_region_compare_question(query):
             return await self._answer_region_compare(query, inferred_direct_key)
@@ -1941,11 +2009,13 @@ class NaturalLanguageAnswerEngine:
 
     _INTENT_FULFILLMENT: dict[str, frozenset[str]] = {
         "STAT_RANKING": frozenset({
-            "tier_a_top_n", "tier_a_region_comparison", "tier_a_region_sum",
+            "tier_a_top_n", "tier_a_top_n_share_ratio",
+            "tier_a_region_comparison", "tier_a_region_sum",
         }),
         "STAT_SHARE_RATIO": frozenset({
             "tier_a_share_ratio", "tier_a_composite_comparison",
             "tier_a_composite", "tier_a_composite_share_ratio",
+            "tier_a_top_n_share_ratio",
         }),
         "STAT_GROWTH_RATE": frozenset({
             "tier_a_growth_rate", "tier_a_trend",
@@ -1983,7 +2053,9 @@ class NaturalLanguageAnswerEngine:
                     "단일값/요약에 그쳤을 수 있으니 시도별 비교나 비중 계산을 별도 요청 필요"
                 )
 
-        if cls._is_aggregation_question(query) and answer_type != "tier_a_region_sum":
+        if cls._is_aggregation_question(query) and answer_type not in {
+            "tier_a_region_sum", "tier_a_composite_share_ratio", "tier_a_top_n_share_ratio",
+        }:
             warnings.append(
                 f"합계/합산 키워드 감지됐으나 응답 유형은 {answer_type or '미지정'} — "
                 "두 번째 지역을 인식하지 못해 단일 지역 값으로 폴백했을 수 있음"

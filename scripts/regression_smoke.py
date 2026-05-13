@@ -140,6 +140,17 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "answer_food_survival_dynamic_ratio_terms",
+        "tool": answer_query,
+        "args": ("음식점업 5년간 살아남는 비율 알려줘",),
+        "expect": {
+            "status": "needs_table_selection",
+            "answer_type": "dynamic_ratio_advisory",
+            "used_search_contains": "생존율 음식점업 5년간 살아남는 비율 알려줘",
+            "used_search_not_contains": "구성비",
+        },
+    },
+    {
         "name": "answer_housing_seoul_latest",
         "tool": answer_query,
         "args": ("서울 집값 최신 지수 알려줘",),
@@ -294,6 +305,29 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "answer_bottom_5_sme_business_count_label",
+        "tool": answer_query,
+        "args": ("중소기업 사업체수가 가장 적은 5곳 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_top_n",
+            "table_len": 5,
+            "answer_contains": "하위 5개",
+            "answer_not_contains": "상위 5개",
+        },
+    },
+    {
+        "name": "answer_top_3_sme_business_count_share",
+        "tool": answer_query,
+        "args": ("중소기업 사업체수 Top 3 비중 합계 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_top_n_share_ratio",
+            "table_len": 3,
+            "share_pct": 53.16,
+        },
+    },
+    {
         "name": "answer_seoul_sme_sales_share",
         "tool": answer_query,
         "args": ("서울 중소기업 매출액이 전국에서 차지하는 비중",),
@@ -329,6 +363,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
     calc = result.get("계산") or {}
     return {
         "error": result.get("오류"),
+        "answer": result.get("answer"),
         "code": result.get("코드"),
         "empty_result": result.get("결과") == "데이터 없음",
         "status": result.get("상태"),
@@ -390,6 +425,18 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
             problems.append(f"comparison_end={summary['comparison_end']}")
     if "table_len" in expect and summary["table_len"] != expect["table_len"]:
         problems.append(f"table_len={summary['table_len']}")
+    if "answer_contains" in expect:
+        answer = str(summary.get("answer") or "")
+        if expect["answer_contains"] not in answer:
+            problems.append(f"answer_missing={expect['answer_contains']!r}")
+    if "answer_not_contains" in expect:
+        answer = str(summary.get("answer") or "")
+        if expect["answer_not_contains"] in answer:
+            problems.append(f"answer_unexpected={expect['answer_not_contains']!r}")
+    if "share_pct" in expect:
+        actual = summary.get("share_pct")
+        if actual is None or abs(float(actual) - float(expect["share_pct"])) > 0.02:
+            problems.append(f"share_pct={actual}")
     if "regions_in_sum" in expect:
         regions = list(summary.get("sum_regions") or [])
         missing = [r for r in expect["regions_in_sum"] if r not in regions]
@@ -411,6 +458,10 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         used_terms = list(summary.get("used_search_terms") or [])
         if expect["used_search_contains"] not in used_terms:
             problems.append(f"used_search_terms={used_terms}")
+    if "used_search_not_contains" in expect:
+        used_terms = list(summary.get("used_search_terms") or [])
+        if any(expect["used_search_not_contains"] in term for term in used_terms):
+            problems.append(f"used_search_terms_contains_forbidden={used_terms}")
     if expect.get("slot_enrichment_present") and not summary.get("slot_enrichment"):
         problems.append("slot_enrichment_missing")
     if expect.get("status") == "executed" and summary["used_period"] in (None, ""):
