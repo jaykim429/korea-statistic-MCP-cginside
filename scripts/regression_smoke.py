@@ -160,7 +160,29 @@ TESTS: list[dict[str, Any]] = [
         "name": "quick_trend_seoul_housing_alias",
         "tool": quick_trend,
         "args": ("집값", "서울", 5),
-        "expect": {"success": True, "region": "서울", "data_count": 5},
+        "expect": {"success": True, "region": "서울", "data_count_min": 36},
+    },
+    {
+        "name": "quick_trend_housing_three_years_monthly",
+        "tool": quick_trend,
+        "args": ("부동산 가격지수", "서울", 3),
+        "expect": {"success": True, "region": "서울", "data_count": 36},
+    },
+    {
+        "name": "quick_stat_open_range_rejected",
+        "tool": quick_stat,
+        "args": ("중소기업 사업체수", "전국", "2020년부터"),
+        "expect": {"status": "failed", "code": "PERIOD_RANGE_REQUESTED"},
+    },
+    {
+        "name": "answer_open_range_routes_to_trend",
+        "tool": answer_query,
+        "args": ("2020년부터 중소기업 사업체수 추이",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_trend",
+            "first_period_prefix": "2020",
+        },
     },
     {
         "name": "gdp_region_misuse_blocked",
@@ -359,6 +381,7 @@ def first_table_region(result: dict[str, Any]) -> str | None:
 
 def summarize(result: dict[str, Any]) -> dict[str, Any]:
     table = result.get("표") or []
+    series = result.get("시계열") or []
     comparison = result.get("비교") or {}
     calc = result.get("계산") or {}
     return {
@@ -377,6 +400,11 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "data_count": result.get("데이터수"),
         "direct_key": (result.get("route") or {}).get("direct_stat_key"),
         "first_row": table[0] if table else None,
+        "first_period": (
+            (table[0] if table else series[0]).get("시점")
+            if (table or series) and isinstance((table[0] if table else series[0]), dict)
+            else None
+        ),
         "comparison_start": (comparison.get("시작") or {}).get("시점"),
         "comparison_end": (comparison.get("종료") or {}).get("시점"),
         "growth_rate": comparison.get("변화율_퍼센트"),
@@ -415,6 +443,10 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append(f"region_count={summary['region_count']}")
     if "data_count" in expect and summary["data_count"] != expect["data_count"]:
         problems.append(f"data_count={summary['data_count']}")
+    if "data_count_min" in expect:
+        count = summary["data_count"]
+        if count is None or count < expect["data_count_min"]:
+            problems.append(f"data_count={summary['data_count']}")
     if "comparison_start_prefix" in expect:
         start = str(summary["comparison_start"] or "")
         if not start.startswith(expect["comparison_start_prefix"]):
@@ -423,6 +455,10 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         end = str(summary["comparison_end"] or "")
         if not end.startswith(expect["comparison_end_prefix"]):
             problems.append(f"comparison_end={summary['comparison_end']}")
+    if "first_period_prefix" in expect:
+        first_period = str(summary["first_period"] or "")
+        if not first_period.startswith(expect["first_period_prefix"]):
+            problems.append(f"first_period={summary['first_period']}")
     if "table_len" in expect and summary["table_len"] != expect["table_len"]:
         problems.append(f"table_len={summary['table_len']}")
     if "answer_contains" in expect:

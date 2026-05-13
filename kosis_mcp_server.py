@@ -70,6 +70,7 @@ STATUS_EXECUTED = "EXECUTED"
 STATUS_NEEDS_TABLE_SELECTION = "NEEDS_TABLE_SELECTION"
 STATUS_STAT_NOT_FOUND = "STAT_NOT_FOUND"
 STATUS_PERIOD_NOT_FOUND = "PERIOD_NOT_FOUND"
+STATUS_PERIOD_RANGE_REQUESTED = "PERIOD_RANGE_REQUESTED"
 STATUS_UNVERIFIED_FORMULA = "UNVERIFIED_FORMULA"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
 STATUS_RUNTIME_ERROR = "RUNTIME_ERROR"
@@ -583,6 +584,38 @@ def _extract_year_range(text: str) -> tuple[Optional[str], Optional[str]]:
     if start == end:
         return None, None
     return start, end
+
+
+def _extract_open_start_year(text: str) -> Optional[str]:
+    """Extract a single start year from open-ended range phrases.
+
+    "2020년부터", "2020년 이후", "since 2020" ask for a series, not a
+    single period. Two-year ranges are handled by _extract_year_range.
+    """
+    if not text:
+        return None
+    years = re.findall(r"(19\d{2}|20\d{2})", str(text))
+    if len(years) != 1:
+        return None
+    compact = re.sub(r"\s+", "", str(text))
+    year = years[0]
+    if re.search(rf"{year}년?(?:부터|이후|이래|이뒤)", compact):
+        return year
+    if re.search(rf"(?:since|from){year}", compact, re.IGNORECASE):
+        return year
+    return None
+
+
+def _periods_per_year(period_type: str) -> int:
+    if period_type == "M":
+        return 12
+    if period_type == "Q":
+        return 4
+    return 1
+
+
+def _latest_count_for_years(years: int, period_type: str) -> int:
+    return max(1, int(years or 1)) * _periods_per_year(period_type)
 
 
 def _default_period_type(param: QuickStatParam) -> str:
@@ -1293,13 +1326,30 @@ class NaturalLanguageAnswerEngine:
         if any(term in q for term in ("추이", "최근", "시계열", "그래프", "선그래프", "분석")):
             years_match = re.search(r"최근\s*(\d+)\s*년", query)
             years = int(years_match.group(1)) if years_match else 5
-            trend = await quick_trend(direct_key, region, years, self.api_key)
+            open_start_year = _extract_open_start_year(query)
+            trend = await _quick_trend_core(
+                direct_key,
+                region,
+                years,
+                self.api_key,
+                start_year=open_start_year,
+            )
             if "오류" in trend:
                 return await self._answer_search_fallback(query, route_payload)
-            answer = (
-                f"{region}의 {trend.get('통계명', direct_key)} 최근 {len(trend.get('시계열', []))}개 시점 "
-                f"자료를 조회했습니다."
-            )
+            if open_start_year:
+                answer = (
+                    f"{region}의 {trend.get('통계명', direct_key)} {open_start_year}년부터 최신까지 "
+                    f"{len(trend.get('시계열', []))}개 시점 자료를 조회했습니다."
+                )
+            else:
+                answer = (
+                    f"{region}의 {trend.get('통계명', direct_key)} 최근 {len(trend.get('시계열', []))}개 시점 "
+                    f"자료를 조회했습니다."
+                )
+            notes = list(route_payload["validation"].get("warnings", []))
+            period_interpretation = trend.get("⚠️ 기간_해석")
+            if period_interpretation:
+                notes.append(period_interpretation)
             result: dict[str, Any] = {
                 "상태": "executed",
                 "코드": STATUS_EXECUTED,
@@ -1312,13 +1362,43 @@ class NaturalLanguageAnswerEngine:
                 "데이터수": len(trend.get("시계열", [])),
                 "통계표": trend.get("통계표"),
                 "추천_시각화": ["line_chart"],
-                "검증_주의": route_payload["validation"].get("warnings", []),
+                "검증_주의": notes,
                 "route": route_payload["route"],
                 "출처": "통계청 KOSIS",
             }
             if "분석" in q:
                 result["분석"] = await analyze_trend(direct_key, region, max(years, 5), self.api_key)
             return result
+
+        open_start_year = _extract_open_start_year(query)
+        if open_start_year:
+            trend = await _quick_trend_core(
+                direct_key,
+                region,
+                5,
+                self.api_key,
+                start_year=open_start_year,
+            )
+            if "오류" not in trend:
+                return {
+                    "상태": "executed",
+                    "코드": STATUS_EXECUTED,
+                    "답변유형": "tier_a_trend",
+                    "질문": query,
+                    "answer": (
+                        f"{region}의 {trend.get('통계명', direct_key)} {open_start_year}년부터 최신까지 "
+                        f"{len(trend.get('시계열', []))}개 시점 자료를 조회했습니다."
+                    ),
+                    "표": trend.get("시계열", []),
+                    "단위": trend.get("단위"),
+                    "지역": region,
+                    "데이터수": len(trend.get("시계열", [])),
+                    "통계표": trend.get("통계표"),
+                    "추천_시각화": ["line_chart"],
+                    "검증_주의": route_payload["validation"].get("warnings", []),
+                    "route": route_payload["route"],
+                    "출처": "통계청 KOSIS",
+                }
 
         period = self._period_argument(query, route_payload)
         stat = await quick_stat(direct_key, region, period, self.api_key)
@@ -2553,6 +2633,25 @@ async def _quick_stat_core(
         region = canonical
 
         period_type = _default_period_type(param)
+        range_start = _extract_open_start_year(period)
+        if period != "latest" and range_start:
+            years_hint = max(1, datetime.now().year - int(range_start) + 1)
+            return {
+                "상태": "failed",
+                "코드": STATUS_PERIOD_RANGE_REQUESTED,
+                "오류": f'기간 "{period}"은 단일 시점이 아니라 열린 범위 요청입니다.',
+                "answer": (
+                    f"'{period}'은 {range_start}년부터 최신까지의 시계열 요청으로 해석됩니다. "
+                    "quick_stat은 단일값 도구이므로 최신값으로 대체하지 않고 중단했습니다."
+                ),
+                "통계표": param.tbl_nm,
+                "요청_기간": period,
+                "해석된_시작시점": range_start,
+                "추천_도구_호출": [
+                    f"quick_trend('{query}', region='{region}', years={years_hint})",
+                    f"answer_query('{range_start}년부터 {query} 추이')",
+                ],
+            }
         start_period, end_period = _period_bounds(period, period_type)
         precision_downgrade = _detect_precision_downgrade(period, period_type)
         half_year_advisory = _detect_half_year_request(period)
@@ -2713,6 +2812,8 @@ async def quick_trend(
 async def _quick_trend_core(
     query: str, region: str = "전국", years: int = 10,
     api_key: Optional[str] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> dict:
     key = _resolve_key(api_key)
     param = _lookup_quick(query)
@@ -2729,16 +2830,26 @@ async def _quick_trend_core(
         return {"오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.', "지원_지역": ["전국"]}
     region = canonical
 
+    period_type = _default_period_type(param)
+    latest_count = _latest_count_for_years(years, period_type)
+    start_period = end_period = None
+    if start_year:
+        start_period, _ = _period_bounds(start_year, period_type)
+        _, end_period = _period_bounds(end_year or str(datetime.now().year), period_type)
+
     async with httpx.AsyncClient() as client:
         data = await _fetch_series(
             client,
             key,
             param,
             region_code,
-            period_type=_default_period_type(param),
-            latest_n=years,
+            period_type=period_type,
+            start_year=start_period,
+            end_year=end_period,
+            latest_n=None if start_period else latest_count,
         )
 
+    data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
     series = [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data]
     used_period = str(series[-1]["시점"]) if series else ""
     age = NaturalLanguageAnswerEngine._period_age_years(used_period)
@@ -2748,7 +2859,18 @@ async def _quick_trend_core(
         "데이터수": len(data), "통계표": param.tbl_nm,
         "used_period": used_period,
         "period_age_years": age,
+        "수록주기": period_type,
+        "요청_기간_년": years,
+        "요청_시점수": latest_count if not start_period else None,
     }
+    if start_period:
+        result["요청_시작시점"] = start_period
+        result["요청_종료시점"] = end_period
+    elif period_type in {"M", "Q"}:
+        unit_label = "개월" if period_type == "M" else "분기"
+        result["⚠️ 기간_해석"] = (
+            f"years={years} → {period_type} 주기 통계이므로 최근 {latest_count}개 {unit_label} 시점 조회"
+        )
     if age is not None and age >= 1.0:
         result["⚠️ 데이터_신선도"] = (
             f"시계열 최신 시점 {used_period} (약 {age:.1f}년 경과) — "
