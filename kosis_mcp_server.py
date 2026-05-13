@@ -1002,13 +1002,16 @@ class QueryWorkflowPlanner:
         intent = self._intent(route_payload, calculations)
         concepts = self._concepts(dimensions, calculations)
         required = self._required_dimensions(dimensions, calculations)
-        workflow = self._workflow(query, intent, required, concepts, dimensions, calculations)
 
         confidence = "medium"
         if dimensions.get("indicator") and required:
             confidence = "high"
         elif route_payload.get("route", {}).get("type") == "miss":
             confidence = "low"
+        if self._needs_clarification(dimensions, concepts, calculations, route_payload):
+            return self._clarification_response(query, dimensions, concepts, calculations, route_payload)
+
+        workflow = self._workflow(query, intent, required, concepts, dimensions, calculations)
 
         return {
             "상태": "planned",
@@ -1036,6 +1039,66 @@ class QueryWorkflowPlanner:
             "notes": [
                 "plan_query는 절차형 레일만 생성합니다. 값 조회와 계산은 후속 도구가 담당합니다.",
                 "available_now=false인 도구는 후속 PR에서 추가될 예정인 파이프라인 단계입니다.",
+            ],
+        }
+
+    @staticmethod
+    def _needs_clarification(
+        dimensions: dict[str, Any],
+        concepts: list[str],
+        calculations: list[str],
+        route_payload: dict[str, Any],
+    ) -> bool:
+        route = route_payload.get("route") or {}
+        if route.get("type") != "miss":
+            return False
+        has_statistical_anchor = bool(
+            dimensions.get("indicator")
+            or dimensions.get("event")
+            or dimensions.get("industry")
+            or calculations
+        )
+        return not has_statistical_anchor and not concepts
+
+    @staticmethod
+    def _clarification_response(
+        query: str,
+        dimensions: dict[str, Any],
+        concepts: list[str],
+        calculations: list[str],
+        route_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "상태": "needs_clarification",
+            "status": "needs_clarification",
+            "answer": None,
+            "intent": "unknown",
+            "query": query,
+            "verification_level": "planning_only",
+            "confidence": "low",
+            "intended_dimensions": dimensions,
+            "required_dimensions": [],
+            "concepts": concepts,
+            "calculations": calculations,
+            "suggested_workflow": [],
+            "next_call": None,
+            "suggested_clarification_questions": [
+                "어떤 통계 지표를 보고 싶으신가요? 예: 인구, 실업률, 소비자물가지수, GRDP",
+                "지역이나 기간 기준이 있나요? 예: 서울 2020년, 최근 5년, 전국 최신",
+                "단일값, 추이, 지역 비교, 비중 계산 중 어떤 형태가 필요하신가요?",
+            ],
+            "route": route_payload.get("route", {}),
+            "router_slots": route_payload.get("slots", {}),
+            "validation": route_payload.get("validation", {}),
+            "must_not": [
+                "통계표 ID 확정 금지",
+                "ITM_ID/OBJ_ID 코드 매핑 금지",
+                "실제 값 반환 금지",
+                "산술·산식 계산 금지",
+            ],
+            "notes": [
+                "통계 지표나 분석 대상이 충분히 드러나지 않아 실행 레일을 만들지 않았습니다.",
+                "질문을 구체화한 뒤 plan_query를 다시 호출하세요.",
             ],
         }
 
@@ -1168,7 +1231,7 @@ class QueryWorkflowPlanner:
         calculations = list(slots.get("calculation") or []) if isinstance(slots, dict) else []
         if any(term in q_norm for term in ("1인당", "인당")) or "percapita" in query.lower():
             calculations.append("per_capita")
-        if any(term in q_norm for term in ("비중", "비율", "구성비", "차지")):
+        if any(term in q_norm for term in ("비중", "비율", "구성비", "차지", "고령화율", "고령화")):
             calculations.append("share")
         if any(term in q_norm for term in ("폐업률", "창업률", "생존율")):
             calculations.append("share")
@@ -1281,6 +1344,7 @@ class QueryWorkflowPlanner:
                 "허용된 산식 enum만 사용해 raw rows를 계산합니다.",
                 {
                     "operation": compute_ops[0],
+                    "operations": list(dict.fromkeys(compute_ops)),
                     "allowed_operations": ["per_capita", "share", "ratio", "growth_rate", "cagr", "yoy_diff", "yoy_pct", "sum_additive_rows"],
                     "input_rows": "<query_table.rows>",
                     "intent": intent,

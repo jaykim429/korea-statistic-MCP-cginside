@@ -42,6 +42,15 @@ CASES: list[dict[str, Any]] = [
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table", "compute_indicator"],
         "required_dimensions": ["region_group", "age", "time"],
         "concepts": ["고령인구비중", "광역시", "65세 이상", "share", "growth_rate"],
+        "compute_operations": ["share", "growth_rate"],
+    },
+    {
+        "name": "metro_aging_rate_rank",
+        "query": "광역시 중 고령화율이 가장 높은 곳",
+        "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table", "compute_indicator"],
+        "required_dimensions": ["region_group", "age"],
+        "concepts": ["고령인구비중", "광역시", "65세 이상", "share"],
+        "compute_operations": ["share"],
     },
     {
         "name": "simple_birth",
@@ -80,6 +89,14 @@ CASES: list[dict[str, Any]] = [
         "query": "치킨집 폐업률 알려줘",
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table", "compute_indicator"],
         "concepts": ["음식점업", "폐업"],
+        "compute_operations": ["share"],
+    },
+    {
+        "name": "ambiguous_low_confidence",
+        "query": "한국 좀 어때",
+        "expected_status": "needs_clarification",
+        "expected_workflow": [],
+        "concepts": [],
     },
 ]
 
@@ -94,7 +111,14 @@ async def main() -> None:
     for case in CASES:
         result = await plan_query(case["query"])
         workflow = [step.get("tool") for step in result.get("suggested_workflow", [])]
+        compute_operations = []
+        for step in result.get("suggested_workflow", []):
+            if isinstance(step, dict) and step.get("tool") == "compute_indicator":
+                args = step.get("args") or {}
+                compute_operations = args.get("operations") or [args.get("operation")]
         problems = []
+        if "expected_status" in case and result.get("status") != case["expected_status"]:
+            problems.append({"status": result.get("status"), "expected": case["expected_status"]})
         missing_workflow = _contains_all(workflow, case.get("expected_workflow", []))
         if missing_workflow:
             problems.append({"missing_workflow": missing_workflow, "actual": workflow})
@@ -104,12 +128,16 @@ async def main() -> None:
         missing_concepts = _contains_all(result.get("concepts", []), case.get("concepts", []))
         if missing_concepts:
             problems.append({"missing_concepts": missing_concepts, "actual": result.get("concepts", [])})
+        missing_compute_ops = _contains_all(compute_operations, case.get("compute_operations", []))
+        if missing_compute_ops:
+            problems.append({"missing_compute_operations": missing_compute_ops, "actual": compute_operations})
         rows.append({
             "name": case["name"],
             "status": "PASS" if not problems else "FAIL",
             "problems": problems,
             "intent": result.get("intent"),
             "workflow": workflow,
+            "compute_operations": compute_operations,
             "required_dimensions": result.get("required_dimensions"),
             "concepts": result.get("concepts"),
             "future_expectations": {
