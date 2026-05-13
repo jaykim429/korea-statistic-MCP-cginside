@@ -30,6 +30,7 @@ CASES: list[dict[str, Any]] = [
     },
     {
         "name": "smallbiz_industry_top_bottom_since_2020",
+        "evidence_bundle": False,
         "query": "2020년 이후 소상공인 사업체 수가 증가한 업종과 감소한 업종을 각각 Top 5로 정리해줘.",
         "metrics": ["사업체 수"],
         "dimensions": ["industry", "time", "scale"],
@@ -53,6 +54,7 @@ CASES: list[dict[str, Any]] = [
     },
     {
         "name": "metro_nonmetro_industry_gap",
+        "evidence_bundle": False,
         "query": "수도권과 비수도권의 소상공인 사업체 수 차이를 비교하고, 업종별로 격차가 가장 큰 분야를 찾아줘.",
         "metrics": ["사업체 수"],
         "dimensions": ["region_group", "industry", "scale"],
@@ -92,8 +94,9 @@ async def main() -> None:
         targets = result.get("comparison_targets") or []
         time_request = result.get("time_request") or {}
         problems: list[Any] = []
-        if result.get("evidence_bundle") is not True:
-            problems.append({"evidence_bundle": result.get("evidence_bundle")})
+        expected_bundle = case.get("evidence_bundle", True)
+        if result.get("evidence_bundle") is not expected_bundle:
+            problems.append({"evidence_bundle": result.get("evidence_bundle"), "expected": expected_bundle})
         for label, actual_key in [
             ("metrics", metrics),
             ("dimensions", dimensions),

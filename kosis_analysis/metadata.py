@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from itertools import product
 from typing import Any, Optional
 
@@ -196,6 +197,171 @@ def _build_axis_codebook(item_rows: list[dict]) -> tuple[dict[str, dict[str, Any
             "parent": row.get("UP_ITM_ID"),
         }
     return axes, order
+
+
+@dataclass(frozen=True)
+class TableMetadataProfile:
+    """KOSIS table metadata snapshot used for table-selection scoring."""
+
+    org_id: str
+    tbl_id: str
+    table_name: Optional[str]
+    axes: dict[str, dict[str, Any]]
+    axis_order: list[str]
+    period_rows: list[dict[str, Any]]
+    candidate_source: Any = None
+    search_term: Any = None
+
+    @classmethod
+    def from_rows(
+        cls,
+        org_id: str,
+        tbl_id: str,
+        candidate_row: dict[str, Any],
+        name_rows: list[dict[str, Any]] | Any,
+        item_rows: list[dict[str, Any]] | Any,
+        period_rows: list[dict[str, Any]] | Any,
+    ) -> "TableMetadataProfile":
+        axes, axis_order = _build_axis_codebook(item_rows if isinstance(item_rows, list) else [])
+        table_name = None
+        if isinstance(name_rows, list) and name_rows:
+            table_name = name_rows[0].get("TBL_NM") or name_rows[0].get("tblNm")
+        table_name = table_name or candidate_row.get("통계표명") or candidate_row.get("통계표") or candidate_row.get("table_name")
+        clean_periods = period_rows if isinstance(period_rows, list) else []
+        return cls(
+            org_id=org_id,
+            tbl_id=tbl_id,
+            table_name=table_name,
+            axes=axes,
+            axis_order=axis_order,
+            period_rows=clean_periods,
+            candidate_source=candidate_row.get("source"),
+            search_term=candidate_row.get("search_term"),
+        )
+
+    def dimension_coverage(
+        self,
+        required_dimensions: list[str],
+    ) -> tuple[list[str], list[str], dict[str, list[dict[str, Any]]]]:
+        return _dimension_coverage(self.axes, self.period_rows, required_dimensions)
+
+    def indicator_evidence(self, indicator: Optional[str]) -> tuple[int, list[str]]:
+        return _indicator_evidence(self.table_name, self.axes, indicator)
+
+    def axis_summary(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "OBJ_ID": obj_id,
+                "OBJ_NM": axis.get("OBJ_NM"),
+                "item_count": len(axis.get("items") or {}),
+            }
+            for obj_id, axis in self.axes.items()
+        ]
+
+    def periods_summary(self, limit: int = 5) -> list[dict[str, Any]]:
+        return [
+            {
+                "cadence": prd.get("PRD_SE"),
+                "start_period": prd.get("STRT_PRD_DE"),
+                "latest_period": prd.get("END_PRD_DE"),
+            }
+            for prd in self.period_rows[:limit]
+        ]
+
+    def metadata_profile(self) -> dict[str, Any]:
+        unit_count = 0
+        item_count = 0
+        for axis in self.axes.values():
+            for meta in (axis.get("items") or {}).values():
+                item_count += 1
+                if meta.get("unit"):
+                    unit_count += 1
+        return {
+            "sources_used": ["TBL", "ITM", "PRD"],
+            "axis_count": len(self.axes),
+            "item_count": item_count,
+            "unit_item_count": unit_count,
+            "period_metadata_available": bool(self.period_rows),
+            "stat_description_available": False,
+            "stat_description_note": (
+                "통계설명자료 API는 아직 호출하지 않았습니다. 현재 판단은 TBL/ITM/PRD 메타 기반입니다."
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class MetadataCompatibilityResult:
+    profile: TableMetadataProfile
+    status: str
+    score: int
+    matched_dimensions: list[str]
+    missing_dimensions: list[str]
+    axis_evidence: dict[str, list[dict[str, Any]]]
+    indicator_evidence: list[str]
+    indicator_score: int
+    required_dimensions: list[str]
+
+    def to_response(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "score": self.score,
+            "org_id": self.profile.org_id,
+            "tbl_id": self.profile.tbl_id,
+            "table_name": self.profile.table_name,
+            "source": self.profile.candidate_source,
+            "search_term": self.profile.search_term,
+            "matched_dimensions": self.matched_dimensions,
+            "missing_dimensions": self.missing_dimensions,
+            "axis_evidence": self.axis_evidence,
+            "indicator_evidence": self.indicator_evidence,
+            "axis_summary": self.profile.axis_summary(),
+            "periods": self.profile.periods_summary(),
+            "metadata_profile": self.profile.metadata_profile(),
+            "compatibility": {
+                "required_dimensions": self.required_dimensions,
+                "matched_dimensions": self.matched_dimensions,
+                "missing_dimensions": self.missing_dimensions,
+                "indicator_score": self.indicator_score,
+                "verification_level": (
+                    "metadata_verified" if not self.missing_dimensions else "metadata_partial"
+                ),
+            },
+        }
+
+
+class MetadataCompatibilityScorer:
+    """Scores whether a KOSIS table can satisfy requested semantic dimensions."""
+
+    def __init__(
+        self,
+        required_dimensions: list[str],
+        indicator: Optional[str] = None,
+        reject_if_missing_dimensions: bool = True,
+    ) -> None:
+        self.required_dimensions = _normalize_required_dimensions(required_dimensions)
+        self.indicator = indicator
+        self.reject_if_missing_dimensions = reject_if_missing_dimensions
+
+    def evaluate(self, profile: TableMetadataProfile) -> MetadataCompatibilityResult:
+        matched, missing, axis_evidence = profile.dimension_coverage(self.required_dimensions)
+        indicator_score, indicator_hits = profile.indicator_evidence(self.indicator)
+        score = indicator_score + len(matched) * 5 - len(missing) * 6
+        status = (
+            "selected"
+            if not missing or not self.reject_if_missing_dimensions
+            else "rejected_missing_dimensions"
+        )
+        return MetadataCompatibilityResult(
+            profile=profile,
+            status=status,
+            score=score,
+            matched_dimensions=matched,
+            missing_dimensions=missing,
+            axis_evidence=axis_evidence,
+            indicator_evidence=indicator_hits,
+            indicator_score=indicator_score,
+            required_dimensions=self.required_dimensions,
+        )
 
 
 def _suggest_axis_codes(axis: dict[str, Any], bad_code: str, limit: int = 8) -> list[dict[str, Any]]:

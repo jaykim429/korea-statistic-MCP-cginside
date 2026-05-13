@@ -23,7 +23,7 @@ CASES: list[dict[str, Any]] = [
     {
         "name": "rate_vs_count_birth",
         "query": "출생율이 가장 낮은 시도 Top 5와 출생아 수 Top 5가 같은지 비교해줘.",
-        "metrics": ["출생율", "출생아 수"],
+        "metrics": ["조출생률", "출생아수"],
         "dimensions": ["region"],
         "tasks": ["rank", "rank_compare", "rank_overlap"],
     },

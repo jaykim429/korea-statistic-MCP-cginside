@@ -76,6 +76,17 @@ class QueryWorkflowPlanner:
         "jeju": "제주", "korea": "전국", "national": "전국",
     }
     EN_INDICATOR_ALIASES = {
+        "gdp deflator": "GDP 디플레이터",
+        "gross domestic product": "GDP",
+        "gross national product": "국민총생산",
+        "gross national income": "국민총소득",
+        "gross domestic income": "국내총소득",
+        "gross regional domestic product": "GRDP",
+        "purchasing power parity": "구매력평가",
+        "economically active population": "경제활동인구",
+        "labor force participation rate": "경제활동참가율",
+        "foreign direct investment": "외국인직접투자",
+        "mergers and acquisitions": "인수합병",
         "unemployment rate": "실업률",
         "employment rate": "고용률",
         "population": "인구",
@@ -85,6 +96,15 @@ class QueryWorkflowPlanner:
         "producer price index": "생산자물가지수",
         "grdp": "GRDP",
         "gdp": "GDP",
+        "gnp": "국민총생산",
+        "gni": "국민총소득",
+        "gdi": "국내총소득",
+        "ppp": "구매력평가",
+        "eap": "경제활동인구",
+        "ur": "실업률",
+        "lfpr": "경제활동참가율",
+        "fdi": "외국인직접투자",
+        "m&a": "인수합병",
     }
     CONSISTENCY_POLICY = {
         "rule": "primary_wins",
@@ -742,11 +762,16 @@ class QueryWorkflowPlanner:
             industry = "업종"
         if not industry and any(term in q_norm for term in ("치킨", "음식점")):
             industry = "음식점업"
+        if not industry:
+            industry = self._industry_phrase(query, q_norm)
         if industry:
             dimensions["industry"] = industry
         return dimensions
 
     def _indicator(self, query: str, q_norm: str, q_lower: str, route_payload: dict[str, Any]) -> Optional[str]:
+        direct_key = (route_payload.get("route") or {}).get("direct_stat_key")
+        if direct_key:
+            return str(direct_key)
         manual = [
             ("고령화", "고령인구비중"),
             ("고령인구", "65세이상인구"),
@@ -761,19 +786,27 @@ class QueryWorkflowPlanner:
         for token, label in manual:
             if _compact_text(token) in q_norm:
                 return label
-        direct_key = (route_payload.get("route") or {}).get("direct_stat_key")
-        if direct_key:
-            return str(direct_key)
         slots = route_payload.get("slots") or {}
         if isinstance(slots, dict) and slots.get("indicator"):
             return str(slots["indicator"])
         for alias, label in self.EN_INDICATOR_ALIASES.items():
-            if alias in q_lower:
+            if self._alias_in_query(alias, q_lower):
                 return label
         implicit_count = self._implicit_count_indicator(query, q_norm, route_payload)
         if implicit_count:
             return implicit_count
         return None
+
+    @staticmethod
+    def _alias_in_query(alias: str, q_lower: str) -> bool:
+        """Match English abbreviations without leaking short tokens into normal words."""
+        if not alias:
+            return False
+        if re.fullmatch(r"[a-z]{2,5}", alias):
+            return re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", q_lower) is not None
+        if alias == "m&a":
+            return re.search(r"(?<![a-z])m\s*&\s*a(?![a-z])", q_lower) is not None
+        return alias in q_lower
 
     @staticmethod
     def _implicit_count_indicator(query: str, q_norm: str, route_payload: dict[str, Any]) -> Optional[str]:
@@ -849,6 +882,37 @@ class QueryWorkflowPlanner:
         return None
 
     @staticmethod
+    def _industry_phrase(query: str, q_norm: str) -> Optional[str]:
+        """Preserve user-supplied industry terms without assigning a domain code."""
+        metric_markers = (
+            "평균 매출액", "매출액", "사업체 수", "사업체수", "기업 수", "기업수",
+            "종사자 수", "종사자수", "폐업률", "창업률", "생존율", "수출액",
+        )
+        marker_pattern = "|".join(re.escape(marker).replace(r"\ ", r"\s*") for marker in metric_markers)
+        match = re.search(rf"^\s*(.+?)\s*(?:{marker_pattern})", query)
+        if not match:
+            return None
+        candidate = match.group(1)
+        candidate = re.sub(r"(?:최근\s*\d+\s*(?:년|개월)|\d{4}\s*년|작년|올해|전년|지난해|재작년)", " ", candidate)
+        candidate = re.sub(r"(?:시도별|지역별|업종별|산업별|산업대분류|산업중분류)", " ", candidate)
+        candidate = candidate.strip(" -·,/")
+        candidate = re.sub(r"^(?:간|동안)\s*", "", candidate).strip(" -·,/")
+        compact = _compact_text(candidate)
+        if not compact or len(compact) < 2:
+            return None
+        stop_terms = {
+            "소상공인", "중소기업", "대기업", "기업", "사업체", "전체", "전국",
+            "한국", "대한민국", "국내", "평균",
+        }
+        stop_terms.update(_compact_text(region) for region in REGION_DEMOGRAPHIC)
+        stop_terms.update(_compact_text(region) for region in REGION_COMPOSITES)
+        if compact in stop_terms:
+            return None
+        if any(token in compact for token in ("와", "과", "랑", "및")):
+            return None
+        return candidate
+
+    @staticmethod
     def _composite_region(q_norm: str) -> Optional[str]:
         for name in sorted(REGION_COMPOSITES, key=len, reverse=True):
             if _compact_text(name) in q_norm:
@@ -883,6 +947,13 @@ class QueryWorkflowPlanner:
     @staticmethod
     def _time(query: str, q_norm: str) -> Optional[dict[str, Any]]:
         years = re.findall(r"(19\d{2}|20\d{2})", query)
+        if years and any(term in q_norm for term in ("전년대비", "전년동기대비")):
+            year = int(years[0])
+            return {
+                "type": "point_compare",
+                "periods": [str(year - 1), str(years[0])],
+                "basis": "previous_year",
+            }
         if "코로나" in q_norm and "이전" in q_norm and "이후" in q_norm:
             return {
                 "type": "named_period_compare",
@@ -974,6 +1045,8 @@ class QueryWorkflowPlanner:
         if any(term in q_norm for term in ("폐업률", "창업률", "생존율")):
             calculations.append("share")
         if any(term in q_norm for term in ("증가율", "변화율", "감소율")):
+            calculations.append("growth_rate")
+        if any(term in q_norm for term in ("전년대비", "전년동기대비")):
             calculations.append("growth_rate")
         if any(term in q_norm for term in ("가장빠른", "빠른곳", "속도", "빨라")):
             calculations.append("growth_rate")
@@ -1097,7 +1170,39 @@ class QueryWorkflowPlanner:
 
     @staticmethod
     def _metric_key(name: Any) -> str:
-        return re.sub(r"[\s_]+", "", str(name or "")).lower()
+        compact = _compact_text(str(name or "")).lower()
+        aliases = {
+            "출생률": "조출생률",
+            "출생율": "조출생률",
+            "조출생률": "조출생률",
+            "출생아수": "출생아수",
+            "출생아수(명)": "출생아수",
+            "소상공인수": "소상공인사업체수",
+            "소상공인사업체수": "소상공인사업체수",
+            "소상공인_사업체수": "소상공인사업체수",
+            "중소기업수": "중소기업사업체수",
+            "중소기업사업체수": "중소기업사업체수",
+            "중소기업_사업체수": "중소기업사업체수",
+        }
+        return aliases.get(compact, re.sub(r"[\s_]+", "", compact))
+
+    @staticmethod
+    def _metric_display_name(name: str) -> str:
+        compact = _compact_text(name).lower()
+        aliases = {
+            "출생률": "조출생률",
+            "출생율": "조출생률",
+            "조출생률": "조출생률",
+            "출생아수": "출생아수",
+            "출생아수(명)": "출생아수",
+            "소상공인수": "소상공인 수",
+            "소상공인사업체수": "소상공인 수",
+            "소상공인_사업체수": "소상공인 수",
+            "중소기업수": "중소기업 수",
+            "중소기업사업체수": "중소기업 수",
+            "중소기업_사업체수": "중소기업 수",
+        }
+        return aliases.get(compact, name.strip())
 
     def _metrics(self, query: str, dimensions: dict[str, Any], route_payload: dict[str, Any]) -> list[dict[str, Any]]:
         slots = route_payload.get("slots") or {}
@@ -1112,7 +1217,7 @@ class QueryWorkflowPlanner:
                 return
             seen.add(key)
             metrics.append({
-                "name": name.strip(),
+                "name": self._metric_display_name(name),
                 "role": role,
                 "source": source,
                 "availability": "unknown",
@@ -1301,10 +1406,13 @@ class QueryWorkflowPlanner:
             add("trend", metrics=metric_names, dimensions=["time"] if "time" in dimension_names else dimension_names)
         if "share" in calculations or any(term in q_norm for term in ("비중", "비율", "구성비")):
             add("share_by_group", metrics=metric_names, dimensions=dimension_names)
+        has_yoy_growth = "growth_rate" in calculations and any(term in q_norm for term in ("전년대비", "전년동기대비"))
         if "growth_rate" in calculations or any(term in q_norm for term in ("증가율", "감소율", "변화율", "변화", "증가", "감소", "늘었", "줄어", "커진", "하락")):
             add("growth_rate", metrics=metric_names, dimensions=dimension_names)
-        if "change" in calculations or any(term in q_norm for term in ("변화", "증가", "감소", "늘었", "줄었", "줄어", "차이", "격차", "대비", "하락")):
+        if not has_yoy_growth and ("change" in calculations or any(term in q_norm for term in ("변화", "증가", "감소", "늘었", "줄었", "줄어", "차이", "격차", "대비", "하락"))):
             add("change_compare", metrics=metric_names, dimensions=dimension_names)
+        if intent == "comparison" or (len(metric_names) == 1 and not has_yoy_growth and any(term in q_norm for term in ("비교", "대비", "차이"))):
+            add("compare_dimensions", metrics=metric_names, dimensions=dimension_names)
         sort = slots.get("sort") if isinstance(slots, dict) else None
         limit = slots.get("limit") if isinstance(slots, dict) else None
         ranks = rank_candidates or []
@@ -1339,7 +1447,11 @@ class QueryWorkflowPlanner:
             add("rank_overlap", metrics=metric_names, dimensions=dimension_names)
         if any(term in q_norm for term in ("순위변동", "순위가바뀌", "순위가어떻게변", "순위변화")):
             add("rank_change", metrics=metric_names, dimensions=dimension_names)
-        if isinstance(dimensions.get("time"), dict) and dimensions["time"].get("type") == "point_compare":
+        if (
+            isinstance(dimensions.get("time"), dict)
+            and dimensions["time"].get("type") == "point_compare"
+            and dimensions["time"].get("basis") != "previous_year"
+        ):
             add("point_compare", metrics=metric_names, dimensions=dimension_names, periods=dimensions["time"].get("periods"))
         if "이전" in q_norm and "이후" in q_norm and "평균" in q_norm:
             add("period_average_compare", metrics=metric_names, time=dimensions.get("time"))
@@ -1405,7 +1517,7 @@ class QueryWorkflowPlanner:
             return "composite_analysis"
         if len(metrics) == 1 and task_count == 0:
             return "simple_lookup"
-        if len(metrics) == 1 and task_count == 1:
+        if len(metrics) == 1 and task_count >= 1:
             return "analytical_single_metric"
         if task_count >= 2 or len(dimensions) >= 2 or len(comparison_targets) >= 2:
             return "composite_analysis"
@@ -1437,7 +1549,9 @@ class QueryWorkflowPlanner:
     ) -> list[dict[str, Any]]:
         if not metrics:
             return []
-        required_dimensions = [d.get("name") for d in dimensions if d.get("name")]
+        required_dimensions = QueryWorkflowPlanner._table_required_dimensions([
+            str(d.get("name")) for d in dimensions if d.get("name")
+        ])
         return [
             {
                 "step": 1,

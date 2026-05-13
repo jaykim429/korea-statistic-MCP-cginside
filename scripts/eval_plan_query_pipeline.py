@@ -214,9 +214,26 @@ CASES: list[dict[str, Any]] = [
     {
         "name": "birth_rate_and_count_visible",
         "query": "출생율이 가장 낮은 시도 Top 5와 출생아 수 Top 5가 같은지 비교해줘.",
-        "metrics": ["출생율", "출생아 수"],
+        "metrics": ["조출생률", "출생아수"],
         "table_required_dimensions": ["region"],
         "task_types": ["rank", "rank_compare", "rank_overlap"],
+    },
+    {
+        "name": "birth_rate_direct_key_wins_over_generic_birth",
+        "query": "출생률이 가장 낮은 시도 Top 5를 알려줘.",
+        "metrics": ["조출생률"],
+        "must_not_metrics": ["\"출생\""],
+        "table_required_dimensions": ["region"],
+        "task_types": ["rank"],
+    },
+    {
+        "name": "birth_count_direct_key_wins_over_generic_birth",
+        "query": "작년 출생아 수",
+        "metrics": ["출생아수"],
+        "must_not_metrics": ["\"출생\""],
+        "time_type": "relative_year",
+        "time_offset": -1,
+        "analysis_mode": "simple_lookup",
     },
     {
         "name": "time_expression_tilde_range",
@@ -255,6 +272,37 @@ CASES: list[dict[str, Any]] = [
         "calculations": ["per_capita"],
         "must_not_metrics": ["R&D 투자 규모"],
         "quarantined_metrics": ["R&D 투자 규모"],
+    },
+    {
+        "name": "preserve_unmapped_industry_phrase",
+        "query": "반도체 매출액",
+        "metrics": ["매출액"],
+        "semantic_industry": "반도체",
+        "concepts": ["반도체"],
+        "table_required_dimensions": ["industry"],
+    },
+    {
+        "name": "comparison_intent_creates_task",
+        "query": "서울과 부산 인구 비교",
+        "metrics": ["인구"],
+        "semantic_regions": ["서울", "부산"],
+        "table_required_dimensions": ["region"],
+        "must_not_table_required_dimensions": ["regions"],
+        "task_types": ["compare_dimensions"],
+        "analysis_mode": "analytical_single_metric",
+        "evidence_bundle": False,
+        "evidence_workflow_required_dimensions": ["region"],
+    },
+    {
+        "name": "yoy_growth_uses_previous_year_period",
+        "query": "2023년 전년 대비 소상공인 수 증가율",
+        "metrics": ["소상공인 수"],
+        "time_type": "point_compare",
+        "time_periods": ["2022", "2023"],
+        "task_types": ["growth_rate"],
+        "analysis_mode": "analytical_single_metric",
+        "evidence_bundle": False,
+        "analysis_task_count": 1,
     },
 ]
 
@@ -420,6 +468,8 @@ async def main() -> None:
             problems.append({"time_end": time_request.get("end"), "expected": case["time_end"]})
         if "time_offset" in case and time_request.get("offset") != case["time_offset"]:
             problems.append({"time_offset": time_request.get("offset"), "expected": case["time_offset"]})
+        if "time_periods" in case and time_request.get("periods") != case["time_periods"]:
+            problems.append({"time_periods": time_request.get("periods"), "expected": case["time_periods"]})
         if case.get("no_time_conflict"):
             time_conflicts = [
                 item for item in result.get("conflict_decisions") or []
@@ -433,6 +483,11 @@ async def main() -> None:
             regions = semantic.get("regions")
             if regions != case["semantic_regions"]:
                 problems.append({"semantic_regions": regions, "expected": case["semantic_regions"]})
+        if "semantic_industry" in case and semantic.get("industry") != case["semantic_industry"]:
+            problems.append({"semantic_industry": semantic.get("industry"), "expected": case["semantic_industry"]})
+        missing_concepts = [concept for concept in case.get("concepts", []) if concept not in (result.get("concepts") or [])]
+        if missing_concepts:
+            problems.append({"missing_concepts": missing_concepts, "actual": result.get("concepts")})
         table_required = result.get("table_required_dimensions") or result.get("required_dimensions") or []
         missing_dims = [dim for dim in case.get("table_required_dimensions", []) if dim not in table_required]
         if missing_dims:
@@ -442,6 +497,16 @@ async def main() -> None:
             problems.append({"forbidden_table_required_dimensions": forbidden_dims, "actual": table_required})
         if case.get("evidence_workflow_nonempty") and not result.get("evidence_workflow"):
             problems.append({"evidence_workflow": result.get("evidence_workflow")})
+        if "evidence_workflow_required_dimensions" in case:
+            workflow = result.get("evidence_workflow") or []
+            actual_dims = []
+            if workflow:
+                actual_dims = ((workflow[0].get("args_template") or {}).get("required_dimensions") or [])
+            if actual_dims != case["evidence_workflow_required_dimensions"]:
+                problems.append({
+                    "evidence_workflow_required_dimensions": actual_dims,
+                    "expected": case["evidence_workflow_required_dimensions"],
+                })
         if case.get("suggested_workflow_not_richer") and result.get("status") == "planned":
             suggested_count = len(result.get("suggested_workflow") or [])
             evidence_count = len(result.get("evidence_workflow") or [])

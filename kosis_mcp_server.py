@@ -47,14 +47,14 @@ from kosis_analysis.client import (
     _resolve_key,
 )
 from kosis_analysis.metadata import (
+    MetadataCompatibilityScorer,
+    TableMetadataProfile,
     _aggregate_rows_sum_by_group,
     _axis_matches_dimension,
     _build_axis_codebook,
     _compact_text,
     _concept_match_score,
-    _dimension_coverage,
     _fanout_filter_sets,
-    _indicator_evidence,
     _infer_required_dimensions_from_query,
     _normalize_query_table_rows,
     _normalize_required_dimensions,
@@ -3992,6 +3992,11 @@ async def select_table_for_query(
 
     seen: set[tuple[str, str]] = set()
     candidates: list[dict[str, Any]] = []
+    scorer = MetadataCompatibilityScorer(
+        required_dimensions=required,
+        indicator=indicator,
+        reject_if_missing_dimensions=reject_if_missing_dimensions,
+    )
     async with httpx.AsyncClient() as client:
         for row in raw_candidates:
             org_id = str(row.get("기관ID") or "")
@@ -4016,49 +4021,15 @@ async def select_table_for_query(
                     "search_term": row.get("search_term"),
                 })
                 continue
-            axes, _ = _build_axis_codebook(item_rows if isinstance(item_rows, list) else [])
-            table_name = None
-            if isinstance(name_rows, list) and name_rows:
-                table_name = name_rows[0].get("TBL_NM") or name_rows[0].get("tblNm")
-            table_name = table_name or row.get("통계표명")
-            matched, missing, axis_evidence = _dimension_coverage(
-                axes,
-                period_rows if isinstance(period_rows, list) else [],
-                required,
+            profile = TableMetadataProfile.from_rows(
+                org_id=org_id,
+                tbl_id=tbl_id,
+                candidate_row=row,
+                name_rows=name_rows,
+                item_rows=item_rows,
+                period_rows=period_rows,
             )
-            indicator_score, indicator_hits = _indicator_evidence(table_name, axes, indicator)
-            score = indicator_score + len(matched) * 5 - len(missing) * 6
-            status = "selected" if not missing or not reject_if_missing_dimensions else "rejected_missing_dimensions"
-            candidates.append({
-                "status": status,
-                "score": score,
-                "org_id": org_id,
-                "tbl_id": tbl_id,
-                "table_name": table_name,
-                "source": row.get("source"),
-                "search_term": row.get("search_term"),
-                "matched_dimensions": matched,
-                "missing_dimensions": missing,
-                "axis_evidence": axis_evidence,
-                "indicator_evidence": indicator_hits,
-                "axis_summary": [
-                    {
-                        "OBJ_ID": obj_id,
-                        "OBJ_NM": axis.get("OBJ_NM"),
-                        "item_count": len(axis.get("items") or {}),
-                    }
-                    for obj_id, axis in axes.items()
-                ],
-                "periods": [
-                    {
-                        "cadence": prd.get("PRD_SE"),
-                        "start_period": prd.get("STRT_PRD_DE"),
-                        "latest_period": prd.get("END_PRD_DE"),
-                    }
-                    for prd in (period_rows if isinstance(period_rows, list) else [])[:5]
-                ],
-            })
-
+            candidates.append(scorer.evaluate(profile).to_response())
     candidates.sort(key=lambda c: (c.get("status") != "selected", -int(c.get("score") or 0)))
     selected = [c for c in candidates if c.get("status") == "selected"]
     warnings = []
