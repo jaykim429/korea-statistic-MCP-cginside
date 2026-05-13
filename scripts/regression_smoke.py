@@ -405,6 +405,19 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "answer_bottom_3_sme_workers_region",
+        "tool": answer_query,
+        "args": ("중소기업 종사자수가 가장 적은 시도 3곳 알려줘",),
+        "expect": {
+            "status": "executed",
+            "answer_type": "tier_a_top_n",
+            "table_len": 3,
+            "requested_top_n": 3,
+            "answer_contains": "하위 3개",
+            "answer_not_contains": "상위 5개",
+        },
+    },
+    {
         "name": "answer_top_3_sme_business_count_share",
         "tool": answer_query,
         "args": ("중소기업 사업체수 Top 3 비중 합계 알려줘",),
@@ -486,6 +499,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "comparison_end": (comparison.get("종료") or {}).get("시점"),
         "growth_rate": comparison.get("변화율_퍼센트"),
         "table_len": len(table),
+        "requested_top_n": result.get("요청_top_n"),
         "share_pct": calc.get("비중_퍼센트"),
         "sum_regions": calc.get("포함_지역"),
         "composite_region": calc.get("합성지역"),
@@ -551,6 +565,8 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
             problems.append(f"first_period={summary['first_period']}")
     if "table_len" in expect and summary["table_len"] != expect["table_len"]:
         problems.append(f"table_len={summary['table_len']}")
+    if "requested_top_n" in expect and summary["requested_top_n"] != expect["requested_top_n"]:
+        problems.append(f"requested_top_n={summary['requested_top_n']}")
     if "answer_contains" in expect:
         answer = str(summary.get("answer") or "")
         if expect["answer_contains"] not in answer:
