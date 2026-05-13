@@ -116,6 +116,16 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "quick_stat_multidim_population_filters_blocked",
+        "tool": quick_stat,
+        "args": ("2020년 서울 30대 여성 인구",),
+        "expect": {
+            "status": "failed",
+            "machine_status": "unsupported",
+            "dropped_dimensions_contains": ["age", "gender"],
+        },
+    },
+    {
         "name": "life_expectancy_display_rounding",
         "tool": quick_stat,
         "args": ("기대수명", "전국", "latest"),
