@@ -1647,19 +1647,51 @@ class NaturalLanguageAnswerEngine:
 
     async def _answer_search_fallback(self, query: str, route_payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
-        # Fold slot-parsed industry/scale into the search query so the
-        # KOSIS index ranks industry-specific tables higher (#28). The
-        # parser already extracts these into slots; previously they
-        # were thrown away at this layer.
+        # Fold route terms and slot-parsed industry/scale into the
+        # actual KOSIS search keywords so route.search_terms and
+        # 사용된_검색어 stay consistent (#28).
         slots = route_payload.get("slots") or {}
-        enrichment: list[str] = []
+        slot_terms: list[str] = []
+        query_enrichment: list[str] = []
         if isinstance(slots, dict):
             for slot_key in ("industry", "scale", "target"):
                 value = slots.get(slot_key)
-                if isinstance(value, str) and value and value not in query:
-                    enrichment.append(value)
-        enriched_query = (query + " " + " ".join(enrichment)).strip() if enrichment else query
-        search = await search_kosis(enriched_query, 8, True, self.api_key)
+                if isinstance(value, str) and value:
+                    slot_terms.append(value)
+                    if value not in query:
+                        query_enrichment.append(value)
+        enriched_query = (query + " " + " ".join(query_enrichment)).strip() if query_enrichment else query
+
+        route = route_payload.get("route") or {}
+        route_terms = [
+            str(term).strip()
+            for term in (route.get("search_terms") or [])
+            if str(term).strip()
+        ]
+        search_keywords: list[str] = []
+        for term in route_terms:
+            missing_slot_terms = [slot_term for slot_term in slot_terms if slot_term not in term]
+            if missing_slot_terms:
+                search_keywords.append((" ".join([*missing_slot_terms, term])).strip())
+            search_keywords.append(term)
+        if not search_keywords:
+            search_keywords.append(enriched_query)
+
+        deduped_keywords = list(dict.fromkeys(search_keywords))[:6]
+        search = await _search_kosis_keywords(
+            enriched_query,
+            deduped_keywords,
+            8,
+            self.api_key,
+            used_routing=bool(route_terms),
+        )
+        slot_enrichment = None
+        if slot_terms or route_terms:
+            slot_enrichment = {
+                "slot_terms": slot_terms,
+                "route_search_terms": route_terms,
+                "최종검색어": search.get("사용된_검색어", []),
+            }
         intents = route_payload.get("intents") or []
         tool_hints = self._tool_routing_hints(query, intents)
         next_steps = [
@@ -1687,7 +1719,7 @@ class NaturalLanguageAnswerEngine:
             "검증": route_payload["validation"],
             "검색결과": search.get("결과", []),
             "사용된_검색어": search.get("사용된_검색어", []),
-            "검색어_슬롯보강": enrichment or None,
+            "검색어_슬롯보강": slot_enrichment,
             "추천_도구_호출": tool_hints,
             "다음단계": next_steps,
             "route": route_payload["route"],
@@ -3724,34 +3756,22 @@ async def indicator_dependency_map(indicator: str) -> dict:
 
 # ---- Utility ----
 
-@mcp.tool()
-async def search_kosis(
-    query: str, limit: int = 10,
-    use_routing: bool = True,
+async def _search_kosis_keywords(
+    query: str,
+    keywords: list[str],
+    limit: int,
     api_key: Optional[str] = None,
+    used_routing: bool = False,
 ) -> dict:
-    """[🔍] KOSIS 통합검색. Tier B 라우팅 사전으로 검색어를 자동 보강.
-
-    동작:
-      1. use_routing=True (기본)일 때 Tier B 사전에서 추천 검색어 추출
-      2. 추천어가 있으면 각각으로 검색해서 결과 통합
-      3. 추천어 없으면 원본 query로 검색
-
-    예: "치킨집" → Tier B가 "음식점업, 분식 및 김밥 전문점" 추천 → 두 키워드로 검색
-
-    Args:
-        query: 검색어 (자연어 가능)
-        limit: 최대 반환 결과 수
-        use_routing: Tier B 라우팅 사용 여부 (기본 True)
-    """
     key = _resolve_key(api_key)
-    keywords = [query]
-    used_routing = False
-    if use_routing:
-        hints = _routing_hints(query)
-        if hints:
-            keywords = hints[:3]
-            used_routing = True
+    keywords = [
+        keyword.strip()
+        for keyword in keywords
+        if isinstance(keyword, str) and keyword.strip()
+    ]
+    if not keywords:
+        keywords = [query]
+    keywords = list(dict.fromkeys(keywords))
 
     async with httpx.AsyncClient() as client:
         all_results = []
@@ -3814,6 +3834,43 @@ async def search_kosis(
             for r in unique[:limit]
         ],
     }
+
+
+@mcp.tool()
+async def search_kosis(
+    query: str, limit: int = 10,
+    use_routing: bool = True,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🔍] KOSIS 통합검색. Tier B 라우팅 사전으로 검색어를 자동 보강.
+
+    동작:
+      1. use_routing=True (기본)일 때 Tier B 사전에서 추천 검색어 추출
+      2. 추천어가 있으면 각각으로 검색해서 결과 통합
+      3. 추천어 없으면 원본 query로 검색
+
+    예: "치킨집" → Tier B가 "음식점업, 분식 및 김밥 전문점" 추천 → 두 키워드로 검색
+
+    Args:
+        query: 검색어 (자연어 가능)
+        limit: 최대 반환 결과 수
+        use_routing: Tier B 라우팅 사용 여부 (기본 True)
+    """
+    keywords = [query]
+    used_routing = False
+    if use_routing:
+        hints = _routing_hints(query)
+        if hints:
+            keywords = hints[:3]
+            used_routing = True
+
+    return await _search_kosis_keywords(
+        query,
+        keywords,
+        limit,
+        api_key,
+        used_routing=used_routing,
+    )
 
 
 @mcp.tool()

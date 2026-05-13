@@ -129,6 +129,17 @@ TESTS: list[dict[str, Any]] = [
         "expect": {"status": "needs_table_selection", "answer_type": "search_and_plan"},
     },
     {
+        "name": "answer_manufacturing_composition_search_terms",
+        "tool": answer_query,
+        "args": ("제조업 구성비 알려줘",),
+        "expect": {
+            "status": "needs_table_selection",
+            "answer_type": "search_and_plan",
+            "used_search_contains": "제조업 사업체",
+            "slot_enrichment_present": True,
+        },
+    },
+    {
         "name": "answer_housing_seoul_latest",
         "tool": answer_query,
         "args": ("서울 집값 최신 지수 알려줘",),
@@ -339,6 +350,8 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "sum_regions": calc.get("포함_지역"),
         "used_period": result.get("used_period"),
         "period_age_years": result.get("period_age_years"),
+        "used_search_terms": result.get("사용된_검색어") or [],
+        "slot_enrichment": result.get("검색어_슬롯보강"),
     }
 
 
@@ -394,6 +407,12 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         live = (result or {}).get("라이브_수록기간") or {}
         if not isinstance(live, dict) or not live.get("최신_수록시점"):
             problems.append("live_period_missing")
+    if "used_search_contains" in expect:
+        used_terms = list(summary.get("used_search_terms") or [])
+        if expect["used_search_contains"] not in used_terms:
+            problems.append(f"used_search_terms={used_terms}")
+    if expect.get("slot_enrichment_present") and not summary.get("slot_enrichment"):
+        problems.append("slot_enrichment_missing")
     if expect.get("status") == "executed" and summary["used_period"] in (None, ""):
         problems.append("missing_used_period")
     return problems

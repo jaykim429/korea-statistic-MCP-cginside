@@ -373,7 +373,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         item_id="13103134474999",
         unit="십억원",
         verification_status="verified",
-        note="검증 OK (2024년 2549024.6 십억원)",
+        note="검증 OK: KOSIS latest 호출 기준 (2023년 2236329.4 십억원). 데이터 신선도 경고 대상.",
     ),
     "GRDP": QuickStatParam(
         org_id="101", tbl_id="DT_1C81",
