@@ -516,7 +516,7 @@ TESTS: list[dict[str, Any]] = [
         "expect": {
             "machine_status": "planned",
             "intent": "comparison",
-            "required_dimensions_contains": ["regions"],
+            "required_dimensions_contains": ["region"],
             "concepts_contains": ["인구", "서울", "부산"],
             "dimension_path_contains": {"regions": ["서울", "부산"]},
             "indicator_alternatives_min": 3,

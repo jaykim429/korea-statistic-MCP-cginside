@@ -68,7 +68,7 @@ CASES: list[dict[str, Any]] = [
         "query": "서울과 부산 인구 비교",
         "expected_intent": "comparison",
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
-        "required_dimensions": ["regions"],
+        "required_dimensions": ["region"],
         "concepts": ["인구", "서울", "부산"],
         "dimension_checks": {"regions": ["서울", "부산"]},
     },
