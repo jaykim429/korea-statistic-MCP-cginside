@@ -439,6 +439,16 @@ def _parse_month_token(text: str) -> Optional[str]:
                 month = 12
                 year -= 1
             return f"{year}{month:02d}"
+    if "이번달" in compact or "금월" in compact:
+        return f"{datetime.now().year}{datetime.now().month:02d}"
+    if "지난달" in compact or "전월" in compact:
+        now = datetime.now()
+        month = now.month - 1
+        year = now.year
+        if month == 0:
+            month = 12
+            year -= 1
+        return f"{year}{month:02d}"
     return None
 
 
@@ -494,17 +504,32 @@ def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Option
     if not period or period == "latest":
         return None, None
 
+    # Parse finer-grained tokens first even when the target table is annual.
+    # That lets callers surface a precision-downgrade trail for natural
+    # periods such as "이번 분기" instead of treating them as unparseable.
+    quarter = _parse_quarter_token(period)
+    month = None if quarter else _parse_month_token(period)
+
     if period_type == "M":
-        month = _parse_month_token(period)
         if month:
             return month, month
+        if quarter:
+            year, q = int(quarter[:4]), int(quarter[4])
+            start_month = (q - 1) * 3 + 1
+            return f"{year}{start_month:02d}", f"{year}{start_month + 2:02d}"
 
     if period_type == "Q":
-        quarter = _parse_quarter_token(period)
         if quarter:
             return quarter, quarter
+        if month:
+            year, mon = int(month[:4]), int(month[4:])
+            return f"{year}{((mon - 1) // 3) + 1}", f"{year}{((mon - 1) // 3) + 1}"
 
     year = _parse_year_token(period)
+    if not year and quarter:
+        year = quarter[:4]
+    if not year and month:
+        year = month[:4]
     if not year:
         return None, None
     if period_type == "M":
@@ -2466,6 +2491,7 @@ async def _quick_stat_core(
                 "요청_기간": period,
                 "해석된_기간": [start_period, end_period],
                 "권고": verification_warning,
+                "⚠️ 정밀도_다운그레이드": precision_downgrade,
                 "⚠️ 기간_해석": relative_hint,
             }
 
