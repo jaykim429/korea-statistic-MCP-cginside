@@ -1,0 +1,38 @@
+{
+  "profile": "gemma_default",
+  "version": "1.0",
+  "compatible_with": ">=0.6.0",
+  "description": "Recommended KOSIS MCP tool exposure for Gemma chatbot integrations.",
+  "expose": [
+    "plan_query",
+    "select_table_for_query",
+    "resolve_concepts",
+    "explore_table",
+    "query_table",
+    "search_kosis"
+  ],
+  "expert_optional": [
+    "analyze_trend",
+    "chain_full_analysis",
+    "chart_line",
+    "chart_compare_regions",
+    "chart_correlation",
+    "chart_dashboard"
+  ],
+  "hide_by_default": [
+    "answer_query",
+    "quick_stat",
+    "quick_trend",
+    "quick_region_compare",
+    "verify_stat_claims",
+    "decode_error"
+  ],
+  "entrypoint": "plan_query",
+  "rules": [
+    "Call plan_query first for every statistics question.",
+    "Do not present plan_query output as a final answer.",
+    "Use metrics, quarantined_metrics, conflict_decisions, semantic_dimensions, and table_required_dimensions to decide follow-up calls.",
+    "Do not infer missing KOSIS values from model knowledge.",
+    "Report unsupported, missing, or low-coverage metrics explicitly."
+  ]
+}

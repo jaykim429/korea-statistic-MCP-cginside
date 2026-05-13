@@ -43,7 +43,31 @@ class QueryWorkflowPlanner:
     This class extracts intent, dimensions, and the next tool sequence only.
     """
 
-    AVAILABLE_TOOLS = {"plan_query", "search_kosis", "explore_table", "query_table", "select_table_for_query", "resolve_concepts"}
+    GEMMA_DEFAULT_TOOLS = [
+        "plan_query",
+        "select_table_for_query",
+        "resolve_concepts",
+        "explore_table",
+        "query_table",
+        "search_kosis",
+    ]
+    GEMMA_EXPERT_TOOLS = [
+        "analyze_trend",
+        "chain_full_analysis",
+        "chart_line",
+        "chart_compare_regions",
+        "chart_correlation",
+        "chart_dashboard",
+    ]
+    GEMMA_HIDDEN_TOOLS = [
+        "answer_query",
+        "quick_stat",
+        "quick_trend",
+        "quick_region_compare",
+        "verify_stat_claims",
+        "decode_error",
+    ]
+    AVAILABLE_TOOLS = set(GEMMA_DEFAULT_TOOLS)
     EN_REGION_ALIASES = {
         "seoul": "서울", "busan": "부산", "daegu": "대구", "incheon": "인천",
         "gwangju": "광주", "daejeon": "대전", "ulsan": "울산", "sejong": "세종",
@@ -149,6 +173,27 @@ class QueryWorkflowPlanner:
                 "allowed_statuses": ["matched", "weak_match", "not_matched"],
                 "note": "plan_query extracts requested metrics only; KOSIS availability is verified later from metadata.",
             },
+            "mcp_output_contract": self._output_contract(
+                role="planning_only",
+                final_answer_expected=False,
+                follow_up_required=True,
+                metrics=metrics,
+                quarantined_metrics=quarantined_metrics,
+                conflict_decisions=conflict_decisions,
+                analysis_tasks=analysis_tasks,
+            ),
+            "recommended_tool_manifest": self._tool_manifest_profile(),
+            "canonical_fields": {
+                "workflow": "evidence_workflow",
+                "conflicts": "conflict_decisions",
+                "table_dimensions": "table_required_dimensions",
+            },
+            "deprecated_fields": {
+                "suggested_workflow": "Legacy compatibility field. Prefer evidence_workflow.",
+                "consistency_warnings": "Legacy compatibility field. Prefer conflict_decisions.",
+                "router_slots_overridden": "Legacy compatibility field. Prefer conflict_decisions and quarantined_metrics.",
+                "required_dimensions": "Legacy compatibility field. Prefer table_required_dimensions.",
+            },
             "consistency_policy": {
                 "rule": "candidate_normalize_validate_emit",
                 "note": "router_slots는 증거 후보입니다. metrics와 analysis_tasks는 정제·격리된 후보에서만 생성됩니다.",
@@ -234,6 +279,27 @@ class QueryWorkflowPlanner:
                 "resolved_by": "select_table_for_query",
                 "allowed_statuses": ["matched", "weak_match", "not_matched"],
             },
+            "mcp_output_contract": QueryWorkflowPlanner._output_contract(
+                role="clarification_required",
+                final_answer_expected=False,
+                follow_up_required=False,
+                metrics=[],
+                quarantined_metrics=[],
+                conflict_decisions=[],
+                analysis_tasks=[],
+            ),
+            "recommended_tool_manifest": QueryWorkflowPlanner._tool_manifest_profile(),
+            "canonical_fields": {
+                "workflow": "evidence_workflow",
+                "conflicts": "conflict_decisions",
+                "table_dimensions": "table_required_dimensions",
+            },
+            "deprecated_fields": {
+                "suggested_workflow": "Legacy compatibility field. Prefer evidence_workflow.",
+                "consistency_warnings": "Legacy compatibility field. Prefer conflict_decisions.",
+                "router_slots_overridden": "Legacy compatibility field. Prefer conflict_decisions and quarantined_metrics.",
+                "required_dimensions": "Legacy compatibility field. Prefer table_required_dimensions.",
+            },
             "consistency_policy": QueryWorkflowPlanner.CONSISTENCY_POLICY,
             "consistency_warnings": [],
             "router_slots_overridden": {},
@@ -258,6 +324,93 @@ class QueryWorkflowPlanner:
                 "통계 지표나 분석 대상이 충분히 드러나지 않아 실행 레일을 만들지 않았습니다.",
                 "질문을 구체화한 뒤 plan_query를 다시 호출하세요.",
             ],
+        }
+
+    @classmethod
+    def _tool_manifest_profile(cls) -> dict[str, Any]:
+        return {
+            "profile": "gemma_default",
+            "version": "1.0",
+            "compatible_with": ">=0.6.0",
+            "expose": cls.GEMMA_DEFAULT_TOOLS,
+            "expert_optional": cls.GEMMA_EXPERT_TOOLS,
+            "hide_by_default": cls.GEMMA_HIDDEN_TOOLS,
+            "rule": "Gemma should enter statistics workflows through plan_query, then follow the procedural evidence workflow.",
+        }
+
+    @staticmethod
+    def _output_contract(
+        *,
+        role: str,
+        final_answer_expected: bool,
+        follow_up_required: bool,
+        metrics: list[dict[str, Any]],
+        quarantined_metrics: list[dict[str, Any]],
+        conflict_decisions: list[dict[str, Any]],
+        analysis_tasks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        current_signals = QueryWorkflowPlanner._current_failure_signals(
+            metrics=metrics,
+            quarantined_metrics=quarantined_metrics,
+            conflict_decisions=conflict_decisions,
+            analysis_tasks=analysis_tasks,
+        )
+        return {
+            "role": role,
+            "final_answer_expected": final_answer_expected,
+            "follow_up_required": follow_up_required,
+            "machine_readable_status": True,
+            "current_signals": current_signals,
+            "llm_rules": [
+                "Do not present plan_query output as a statistical answer.",
+                "Do not invent values for metrics whose availability is unknown, weak, missing, or unsupported.",
+                "Use metrics, quarantined_metrics, conflict_decisions, and time_request when deciding the next tool call.",
+                "If a follow-up tool returns unsupported or empty rows, report that limitation instead of filling the gap from prior knowledge.",
+            ],
+            "failure_markers": [
+                "needs_clarification",
+                "unsupported",
+                "not_matched",
+                "missing_metrics",
+                "quarantined_metrics",
+                "validation_errors",
+                "coverage_ratio",
+            ],
+        }
+
+    @staticmethod
+    def _current_failure_signals(
+        *,
+        metrics: list[dict[str, Any]],
+        quarantined_metrics: list[dict[str, Any]],
+        conflict_decisions: list[dict[str, Any]],
+        analysis_tasks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        unknown_metrics = [
+            metric.get("name")
+            for metric in metrics
+            if metric.get("availability") in {None, "unknown", "weak_match", "missing", "not_matched"}
+        ]
+        markers: list[str] = []
+        if quarantined_metrics:
+            markers.append("quarantined_metrics")
+        if conflict_decisions:
+            markers.append("conflict_decisions")
+        if unknown_metrics:
+            markers.append("metric_availability_unverified")
+        return {
+            "has_failures": bool(quarantined_metrics),
+            "has_caveats": bool(markers),
+            "markers_present": markers,
+            "quarantined_metrics_count": len(quarantined_metrics),
+            "conflict_decisions_count": len(conflict_decisions),
+            "unknown_metric_count": len(unknown_metrics),
+            "analysis_task_count": len(analysis_tasks),
+            "unknown_metrics": unknown_metrics,
+            "explanation": (
+                "plan_query has not verified metric availability yet; follow-up metadata tools must confirm tables and codes."
+                if unknown_metrics else "No immediate planning caveats detected."
+            ),
         }
 
     @staticmethod
@@ -1142,7 +1295,11 @@ class QueryWorkflowPlanner:
         report_generation = any(fmt in presentation.get("formats", []) for fmt in ("report", "summary"))
         causal = any(term in q_norm for term in ("원인", "이유", "배경", "설명", "해석"))
         return {
-            "final_answer_expected": True,
+            "final_answer_expected": False,
+            "final_answer_condition": "after_evidence_collection_only",
+            "deprecated_fields": {
+                "final_answer_expected": "Use mcp_output_contract.final_answer_expected for plan output. Synthesis is allowed only after evidence collection."
+            },
             "report_generation": report_generation,
             "causal_language": "cautious" if causal else "not_requested",
             "must_disclose": [

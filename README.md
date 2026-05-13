@@ -488,7 +488,7 @@ chart_line("고령인구", region="전국", years=5)
 
 Gemma 챗봇용 절차형 입구로 `plan_query(query)`가 추가되었습니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 즉 `answer_query`의 즉시 답변 경로에서 발생할 수 있는 silent failure를 줄이기 위한 계획 전용 도구입니다.
 
-Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)를 참고하세요. 기본 manifest에서는 `plan_query`, `select_table_for_query`, `resolve_concepts`, `explore_table`, `query_table`, `search_kosis`만 노출하고, `answer_query`·`quick_*`·`chart_*` 계열은 내부/전문가용으로 숨기는 구성을 권장합니다.
+Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)와 [docs/gemma_manifest.default.json](docs/gemma_manifest.default.json)를 참고하세요. 기본 manifest에서는 `plan_query`, `select_table_for_query`, `resolve_concepts`, `explore_table`, `query_table`, `search_kosis`만 노출하고, `answer_query`·`quick_*` 계열은 내부/전문가용으로 숨기는 구성을 권장합니다. `answer_query`를 실수로 호출해도 응답에 `deprecation_warning`, `recommended_replacement`, `llm_guardrails`가 붙어 Gemma가 deprecated shortcut임을 기계적으로 감지할 수 있습니다.
 
 `decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
 

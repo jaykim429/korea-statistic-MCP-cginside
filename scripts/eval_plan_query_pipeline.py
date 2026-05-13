@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kosis_mcp_server import plan_query
+from kosis_mcp_server import _attach_gemma_deprecation_warning, plan_query
 
 
 CASES: list[dict[str, Any]] = [
@@ -60,6 +60,13 @@ CASES: list[dict[str, Any]] = [
         "analysis_mode": "simple_lookup",
         "evidence_bundle": False,
         "analysis_task_count": 0,
+        "contract_role": "planning_only",
+        "final_answer_expected": False,
+        "handoff_final_answer_expected": False,
+        "manifest_exposes": ["plan_query", "query_table"],
+        "manifest_hides": ["answer_query", "quick_stat"],
+        "canonical_workflow": "evidence_workflow",
+        "deprecated_fields": ["suggested_workflow", "consistency_warnings", "router_slots_overridden"],
     },
     {
         "name": "regions_vs_region_separation",
@@ -115,6 +122,48 @@ async def main() -> None:
             if count != case["analysis_task_count"]:
                 problems.append({"analysis_task_count": count, "expected": case["analysis_task_count"]})
 
+        contract = result.get("mcp_output_contract") or {}
+        if "contract_role" in case and contract.get("role") != case["contract_role"]:
+            problems.append({"contract_role": contract.get("role"), "expected": case["contract_role"]})
+        if (
+            "final_answer_expected" in case
+            and contract.get("final_answer_expected") is not case["final_answer_expected"]
+        ):
+            problems.append({
+                "final_answer_expected": contract.get("final_answer_expected"),
+                "expected": case["final_answer_expected"],
+            })
+        if "handoff_final_answer_expected" in case:
+            handoff = result.get("handoff_to_llm") or {}
+            if handoff.get("final_answer_expected") is not case["handoff_final_answer_expected"]:
+                problems.append({
+                    "handoff_final_answer_expected": handoff.get("final_answer_expected"),
+                    "expected": case["handoff_final_answer_expected"],
+                })
+        if "canonical_workflow" in case:
+            canonical = result.get("canonical_fields") or {}
+            if canonical.get("workflow") != case["canonical_workflow"]:
+                problems.append({"canonical_workflow": canonical.get("workflow"), "expected": case["canonical_workflow"]})
+        deprecated = result.get("deprecated_fields") or {}
+        missing_deprecated = [field for field in case.get("deprecated_fields", []) if field not in deprecated]
+        if missing_deprecated:
+            problems.append({"missing_deprecated_fields": missing_deprecated, "actual": deprecated})
+        if contract:
+            current_signals = contract.get("current_signals") or {}
+            if "has_caveats" not in current_signals or "markers_present" not in current_signals:
+                problems.append({"current_signals": current_signals})
+        manifest = result.get("recommended_tool_manifest") or {}
+        expose = manifest.get("expose") or []
+        hide = manifest.get("hide_by_default") or []
+        if manifest and (manifest.get("version") != "1.0" or manifest.get("compatible_with") != ">=0.6.0"):
+            problems.append({"manifest_version": manifest})
+        missing_exposed = [tool for tool in case.get("manifest_exposes", []) if tool not in expose]
+        if missing_exposed:
+            problems.append({"missing_manifest_expose": missing_exposed, "actual": expose})
+        missing_hidden = [tool for tool in case.get("manifest_hides", []) if tool not in hide]
+        if missing_hidden:
+            problems.append({"missing_manifest_hide": missing_hidden, "actual": hide})
+
         rank_tasks = [task for task in result.get("analysis_tasks") or [] if task.get("type") == "rank"]
         if "rank_orders" in case:
             orders = sorted(task.get("order") for task in rank_tasks)
@@ -169,6 +218,21 @@ async def main() -> None:
             "analysis_tasks": result.get("analysis_tasks"),
             "conflict_decisions": result.get("conflict_decisions"),
         })
+
+    warned = _attach_gemma_deprecation_warning({"status": "executed"})
+    warning_problems: list[Any] = []
+    if (warned.get("deprecation_warning") or {}).get("recommended_replacement") != "plan_query":
+        warning_problems.append({"deprecation_warning": warned.get("deprecation_warning")})
+    replacement = warned.get("recommended_replacement") or {}
+    if replacement.get("tool") != "plan_query":
+        warning_problems.append({"recommended_replacement": replacement})
+    if not warned.get("llm_guardrails"):
+        warning_problems.append({"llm_guardrails": warned.get("llm_guardrails")})
+    rows.append({
+        "name": "answer_query_self_announces_deprecation",
+        "status": "PASS" if not warning_problems else "FAIL",
+        "problems": warning_problems,
+    })
 
     print(json.dumps(rows, ensure_ascii=False, indent=2))
     failed = [row for row in rows if row["status"] != "PASS"]
