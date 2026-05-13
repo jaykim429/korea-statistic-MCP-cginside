@@ -2853,6 +2853,10 @@ async def analyze_trend(
             "평균_퍼센트": round(avg_growth, 2),
             "변동성_퍼센트": round(volatility, 2),
             "최근_퍼센트": round(recent_change, 2),
+            "최근_구간": {
+                "시작": times[-2],
+                "끝": times[-1],
+            },
         },
         "극값": {
             "최댓값": {"시점": times[max_idx], "값": values[max_idx]},
@@ -3327,7 +3331,14 @@ async def chart_dashboard(
         summary["R²"] = lr.get("R제곱")
     if "변화율" in trend:
         summary["평균 변화율"] = f"{trend['변화율']['평균_퍼센트']:+.2f}%"
-        summary["최근 변화"] = f"{trend['변화율']['최근_퍼센트']:+.2f}%"
+        recent_window = trend["변화율"].get("최근_구간") or {}
+        recent_start = str(recent_window.get("시작") or "")[:4]
+        recent_end = str(recent_window.get("끝") or "")[:4]
+        recent_label = (
+            f"최근 변화({recent_start}→{recent_end})"
+            if recent_start and recent_end else "최근 변화"
+        )
+        summary[recent_label] = f"{trend['변화율']['최근_퍼센트']:+.2f}%"
     if "극값" in trend:
         summary["최댓값"] = f"{trend['극값']['최댓값']['시점'][:4]}: {trend['극값']['최댓값']['값']}"
     summary["해석"] = trend.get("해석", "")
