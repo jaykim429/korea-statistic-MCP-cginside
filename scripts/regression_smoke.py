@@ -482,6 +482,16 @@ TESTS: list[dict[str, Any]] = [
             "composite_region": "중부권",
         },
     },
+    {
+        "name": "answer_youth_capital_noncapital_trend_partial",
+        "tool": answer_query,
+        "args": ("청년(20-34세) 수도권 vs 비수도권 인구 10년 추이",),
+        "expect": {
+            "status": "executed",
+            "machine_status": "partial",
+            "dropped_dimensions_contains": ["age", "time_series"],
+        },
+    },
 ]
 
 
@@ -503,6 +513,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "code": result.get("코드"),
         "empty_result": result.get("결과") == "데이터 없음",
         "status": result.get("상태"),
+        "machine_status": result.get("status"),
         "answer_type": result.get("답변유형"),
         "value": result.get("값"),
         "unit": result.get("단위"),
@@ -533,6 +544,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "dependency_key": result.get("dependency_key"),
         "target_group": result.get("대상군"),
         "matched_concepts": (result.get("route") or {}).get("matched_concepts") or [],
+        "dropped_dimensions": result.get("dropped_dimensions") or result.get("누락_차원") or [],
         "freshness_warning": result.get("⚠️ 데이터_신선도"),
     }
 
@@ -548,6 +560,8 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append("expected_error_but_succeeded")
     if "status" in expect and summary["status"] != expect["status"]:
         problems.append(f"status={summary['status']}")
+    if "machine_status" in expect and summary["machine_status"] != expect["machine_status"]:
+        problems.append(f"machine_status={summary['machine_status']}")
     if "answer_type" in expect and summary["answer_type"] != expect["answer_type"]:
         problems.append(f"answer_type={summary['answer_type']}")
     if "code" in expect and summary["code"] != expect["code"]:
@@ -562,6 +576,11 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         concepts = list(summary.get("matched_concepts") or [])
         if expect["matched_concepts_contains"] not in concepts:
             problems.append(f"matched_concepts={concepts}")
+    if "dropped_dimensions_contains" in expect:
+        dropped = set(summary.get("dropped_dimensions") or [])
+        missing = [dim for dim in expect["dropped_dimensions_contains"] if dim not in dropped]
+        if missing:
+            problems.append(f"dropped_dimensions={sorted(dropped)}")
     if "region" in expect and summary["region"] != expect["region"]:
         problems.append(f"region={summary['region']}")
     if "period" in expect and str(summary["period"]) != expect["period"]:
