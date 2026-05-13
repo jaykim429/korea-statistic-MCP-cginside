@@ -416,6 +416,28 @@ TESTS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "plan_query_aging_share_growth_ops",
+        "tool": plan_query,
+        "args": ("광역시 중 고령화 비중이 가장 빠른 곳",),
+        "expect": {
+            "machine_status": "planned",
+            "intent": "computed_indicator",
+            "required_dimensions_contains": ["region_group", "age", "time"],
+            "concepts_contains": ["고령인구비중", "광역시", "65세 이상", "share", "growth_rate"],
+            "compute_operations_contains": ["share", "growth_rate"],
+        },
+    },
+    {
+        "name": "plan_query_ambiguous_needs_clarification",
+        "tool": plan_query,
+        "args": ("한국 좀 어때",),
+        "expect": {
+            "machine_status": "needs_clarification",
+            "intent": "unknown",
+            "workflow_tools_len": 0,
+        },
+    },
+    {
         "name": "explore_table_industry_manufacturing_parent",
         "tool": explore_table,
         "args": ("142", "DT_BR_C001", "제조업"),
@@ -622,6 +644,13 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "required_dimensions": result.get("required_dimensions") or [],
         "concepts": result.get("concepts") or [],
         "workflow_tools": [step.get("tool") for step in (result.get("suggested_workflow") or []) if isinstance(step, dict)],
+        "compute_operations": [
+            op
+            for step in (result.get("suggested_workflow") or [])
+            if isinstance(step, dict) and step.get("tool") == "compute_indicator"
+            for op in ((step.get("args") or {}).get("operations") or [(step.get("args") or {}).get("operation")])
+            if op
+        ],
     }
 
 
@@ -665,6 +694,13 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         missing = [tool for tool in expect["workflow_tools_contains"] if tool not in tools]
         if missing:
             problems.append(f"workflow_tools={sorted(tools)}")
+    if "workflow_tools_len" in expect and len(summary.get("workflow_tools") or []) != expect["workflow_tools_len"]:
+        problems.append(f"workflow_tools={summary.get('workflow_tools')}")
+    if "compute_operations_contains" in expect:
+        operations = set(summary.get("compute_operations") or [])
+        missing = [op for op in expect["compute_operations_contains"] if op not in operations]
+        if missing:
+            problems.append(f"compute_operations={sorted(operations)}")
     if "verification_level" in expect and summary["verification_level"] != expect["verification_level"]:
         problems.append(f"verification_level={summary['verification_level']}")
     if "aggregation" in expect and summary["aggregation"] != expect["aggregation"]:
