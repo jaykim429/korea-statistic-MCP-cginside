@@ -21,7 +21,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
@@ -796,6 +796,99 @@ class AnswerStat:
             "통계표": self.table,
             "출처": self.source,
         }
+
+
+@dataclass(frozen=True)
+class AnswerPlan:
+    """Execution decision for answer_query.
+
+    The planner decides *what* should run. The engine still owns the actual
+    KOSIS calls and rendering so this first refactor stays behavior-preserving.
+    """
+    action: str
+    region: str
+    direct_key: Optional[str] = None
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+class AnswerPlanner:
+    """Turn a routed natural-language query into one executable action."""
+
+    def __init__(self, engine: "NaturalLanguageAnswerEngine") -> None:
+        self.engine = engine
+
+    def build(self, query: str, region: str, route_payload: dict[str, Any]) -> AnswerPlan:
+        effective_region = self.engine._effective_region(route_payload, region)
+        direct_key = self.engine._infer_direct_stat_key(query, route_payload)
+
+        if self.engine._is_self_employed_sme_population_question(query):
+            return AnswerPlan("mixed_population", effective_region)
+        if self.engine._is_sme_large_sales_question(query):
+            return AnswerPlan("sme_large_sales", effective_region)
+        if self.engine._is_sme_smallbiz_count_question(query):
+            return AnswerPlan("sme_smallbiz_counts", effective_region)
+        if self.engine._is_sme_employee_average_question(query):
+            return AnswerPlan("sme_employee_average", effective_region)
+        if self.engine._is_dynamic_ratio_question(query):
+            return AnswerPlan("dynamic_ratio", effective_region)
+
+        if self.engine._needs_advanced_analysis_plan(route_payload):
+            intents = route_payload.get("intents") or []
+            if "STAT_CORRELATION" in intents:
+                stat_x, stat_y = self.engine._extract_correlation_pair(query)
+                if stat_x and stat_y:
+                    return AnswerPlan(
+                        "auto_correlate",
+                        effective_region,
+                        params={"stat_x": stat_x, "stat_y": stat_y},
+                    )
+            return AnswerPlan("search_fallback", effective_region)
+
+        if direct_key:
+            composites = self.engine._extract_composite_regions(query)
+            if composites:
+                operation = (
+                    "share"
+                    if self.engine._is_share_ratio_question(query, route_payload)
+                    else "sum"
+                )
+                return AnswerPlan(
+                    "composite_aggregate",
+                    effective_region,
+                    direct_key,
+                    {"composite": composites[0], "operation": operation},
+                )
+
+            if self.engine._is_aggregation_question(query):
+                extras = self.engine._extract_extra_regions(query, effective_region, route_payload)
+                regions = [effective_region] + [r for r in extras if r != effective_region]
+                if len(regions) >= 2:
+                    return AnswerPlan("region_sum", effective_region, direct_key, {"regions": regions})
+
+            if self.engine._is_top_n_question(query, route_payload):
+                return AnswerPlan(
+                    "top_n",
+                    effective_region,
+                    direct_key,
+                    {
+                        "top_n": self.engine._extract_top_n(query) or 5,
+                        "include_share_ratio": self.engine._is_share_ratio_question(query, route_payload),
+                    },
+                )
+
+            if self.engine._is_region_compare_question(query):
+                return AnswerPlan("region_compare", effective_region, direct_key)
+
+            if (
+                self.engine._is_share_ratio_question(query, route_payload)
+                and effective_region != "전국"
+                and not self.engine._is_growth_question(query, route_payload)
+            ):
+                return AnswerPlan("share_ratio", effective_region, direct_key)
+
+            return AnswerPlan("direct", effective_region, direct_key)
+
+        return AnswerPlan("search_fallback", effective_region)
 
 
 class NaturalLanguageAnswerEngine:
@@ -2095,67 +2188,60 @@ class NaturalLanguageAnswerEngine:
         precomputed_route: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         route_payload = precomputed_route or self._route_payload(query)
-        effective_region = self._effective_region(route_payload, region)
-        inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
-        if self._is_self_employed_sme_population_question(query):
-            return await self._answer_self_employed_sme_population_warning(query, effective_region)
-        if self._is_sme_large_sales_question(query):
-            return await self._answer_sme_large_sales(query, effective_region)
-        if self._is_sme_smallbiz_count_question(query):
-            return await self._answer_sme_smallbiz_counts(query, effective_region)
-        if self._is_sme_employee_average_question(query):
-            return await self._answer_sme_employee_average(query, effective_region)
-        if self._is_dynamic_ratio_question(query):
+        plan = AnswerPlanner(self).build(query, region, route_payload)
+        return await self._execute_plan(query, route_payload, plan)
+
+    async def _execute_plan(
+        self,
+        query: str,
+        route_payload: dict[str, Any],
+        plan: AnswerPlan,
+    ) -> dict[str, Any]:
+        params = plan.params
+        direct_key = plan.direct_key
+
+        if plan.action == "mixed_population":
+            return await self._answer_self_employed_sme_population_warning(query, plan.region)
+        if plan.action == "sme_large_sales":
+            return await self._answer_sme_large_sales(query, plan.region)
+        if plan.action == "sme_smallbiz_counts":
+            return await self._answer_sme_smallbiz_counts(query, plan.region)
+        if plan.action == "sme_employee_average":
+            return await self._answer_sme_employee_average(query, plan.region)
+        if plan.action == "dynamic_ratio":
             return await self._answer_dynamic_ratio_advisory(query, route_payload)
-
-        if self._needs_advanced_analysis_plan(route_payload):
-            intents = route_payload.get("intents") or []
-            if "STAT_CORRELATION" in intents:
-                stat_x, stat_y = self._extract_correlation_pair(query)
-                if stat_x and stat_y:
-                    return await self._answer_auto_correlate(
-                        query, stat_x, stat_y, effective_region, route_payload,
-                    )
-            return await self._answer_search_fallback(query, route_payload)
-
-        composites = self._extract_composite_regions(query)
-        if inferred_direct_key and composites:
-            composite = composites[0]
-            operation = "share" if self._is_share_ratio_question(query, route_payload) else "sum"
-            return await self._answer_composite_aggregate(
-                query, inferred_direct_key, composite, operation=operation,
+        if plan.action == "auto_correlate":
+            return await self._answer_auto_correlate(
+                query,
+                params["stat_x"],
+                params["stat_y"],
+                plan.region,
+                route_payload,
             )
-
-        if inferred_direct_key and self._is_aggregation_question(query):
-            extras = self._extract_extra_regions(query, effective_region, route_payload)
-            regions = [effective_region] + [r for r in extras if r != effective_region]
-            if len(regions) >= 2:
-                return await self._answer_region_sum(query, inferred_direct_key, regions)
-
-        if inferred_direct_key and self._is_top_n_question(query, route_payload):
-            top_n = self._extract_top_n(query) or 5
+        if plan.action == "composite_aggregate" and direct_key:
+            return await self._answer_composite_aggregate(
+                query,
+                direct_key,
+                params["composite"],
+                operation=params["operation"],
+            )
+        if plan.action == "region_sum" and direct_key:
+            return await self._answer_region_sum(query, direct_key, params["regions"])
+        if plan.action == "top_n" and direct_key:
             return await self._answer_top_n(
                 query,
-                inferred_direct_key,
-                top_n,
-                include_share_ratio=self._is_share_ratio_question(query, route_payload),
+                direct_key,
+                params["top_n"],
+                include_share_ratio=params["include_share_ratio"],
             )
-
-        if inferred_direct_key and self._is_region_compare_question(query):
-            return await self._answer_region_compare(query, inferred_direct_key)
-
-        if (
-            inferred_direct_key
-            and self._is_share_ratio_question(query, route_payload)
-            and effective_region != "전국"
-            and not self._is_growth_question(query, route_payload)
-        ):
-            return await self._answer_share_ratio(query, effective_region, inferred_direct_key)
-
-        if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
-            route_payload["route"]["direct_stat_key"] = inferred_direct_key
-        if route_payload["route"].get("direct_stat_key"):
-            return await self._answer_direct(query, effective_region, inferred_direct_key, route_payload)
+        if plan.action == "region_compare" and direct_key:
+            return await self._answer_region_compare(query, direct_key)
+        if plan.action == "share_ratio" and direct_key:
+            return await self._answer_share_ratio(query, plan.region, direct_key)
+        if plan.action == "direct" and direct_key:
+            if not route_payload["route"].get("direct_stat_key"):
+                route_payload["route"]["direct_stat_key"] = direct_key
+            return await self._answer_direct(query, plan.region, direct_key, route_payload)
         return await self._answer_search_fallback(query, route_payload)
 
     @staticmethod
