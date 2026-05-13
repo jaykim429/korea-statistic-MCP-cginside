@@ -376,8 +376,49 @@ TESTS: list[dict[str, Any]] = [
         "args": ("101", "DT_1DA7004S", {"ITEM": ["BAD"], "A": ["00"]}, ["2025", "2025"]),
         "expect": {
             "machine_status": "unsupported",
-            "code": "UNVERIFIED_FORMULA",
+            "code": "INVALID_FILTER_CODE",
             "validation_errors_present": True,
+        },
+    },
+    {
+        "name": "query_table_invalid_region_code_suggests_top_level",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["99"]}, ["2025", "2025"]),
+        "expect": {
+            "machine_status": "unsupported",
+            "code": "INVALID_FILTER_CODE",
+            "validation_errors_present": True,
+            "suggested_code_prefix": "00",
+        },
+    },
+    {
+        "name": "query_table_reversed_period_rejected",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["00"]}, ["2024", "2020"]),
+        "expect": {
+            "machine_status": "unsupported",
+            "code": "INVALID_PERIOD_RANGE",
+            "suggested_period_range": ["2020", "2024"],
+        },
+    },
+    {
+        "name": "query_table_out_of_range_future_rejected",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["00"]}, ["2030", "2030"]),
+        "expect": {
+            "machine_status": "unsupported",
+            "code": "PERIOD_NOT_FOUND",
+            "available_period_range": ["2000", "2025"],
+        },
+    },
+    {
+        "name": "query_table_missing_period_defaults_latest",
+        "tool": query_table,
+        "args": ("101", "DT_1DA7004S", {"ITEM": ["T80"], "A": ["00"]}, None),
+        "expect": {
+            "machine_status": "executed",
+            "row_count": 1,
+            "auto_default_period_range": ["2026.04", "2026.04"],
         },
     },
     {
@@ -695,6 +736,10 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "row_count": result.get("row_count"),
         "period_type": result.get("period_type"),
         "validation_errors": result.get("validation_errors") or result.get("검증_오류") or [],
+        "suggested_period_range": result.get("suggested_period_range"),
+        "available_period_range": result.get("available_period_range"),
+        "auto_default_period_range": result.get("auto_default_period_range"),
+        "data_nature": result.get("data_nature"),
         "intent": result.get("intent"),
         "intended_dimensions": result.get("intended_dimensions") or {},
         "required_dimensions": result.get("required_dimensions") or [],
@@ -770,6 +815,20 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
             problems.append(f"indicator_alternatives={alternatives!r}")
     if "query_table_period_range" in expect and summary.get("query_table_period_range") != expect["query_table_period_range"]:
         problems.append(f"query_table_period_range={summary.get('query_table_period_range')}")
+    if "suggested_period_range" in expect and summary.get("suggested_period_range") != expect["suggested_period_range"]:
+        problems.append(f"suggested_period_range={summary.get('suggested_period_range')}")
+    if "available_period_range" in expect and summary.get("available_period_range") != expect["available_period_range"]:
+        problems.append(f"available_period_range={summary.get('available_period_range')}")
+    if "auto_default_period_range" in expect and summary.get("auto_default_period_range") != expect["auto_default_period_range"]:
+        problems.append(f"auto_default_period_range={summary.get('auto_default_period_range')}")
+    if "suggested_code_prefix" in expect:
+        errors = summary.get("validation_errors") or []
+        suggestions = []
+        if errors and isinstance(errors[0], dict):
+            suggestions = errors[0].get("suggested_codes") or []
+        first_code = suggestions[0].get("code") if suggestions and isinstance(suggestions[0], dict) else None
+        if first_code != expect["suggested_code_prefix"]:
+            problems.append(f"suggested_codes_first={first_code!r}")
     if "workflow_tools_contains" in expect:
         tools = set(summary.get("workflow_tools") or [])
         missing = [tool for tool in expect["workflow_tools_contains"] if tool not in tools]

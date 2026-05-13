@@ -72,6 +72,8 @@ STATUS_STAT_NOT_FOUND = "STAT_NOT_FOUND"
 STATUS_PERIOD_NOT_FOUND = "PERIOD_NOT_FOUND"
 STATUS_PERIOD_RANGE_REQUESTED = "PERIOD_RANGE_REQUESTED"
 STATUS_UNVERIFIED_FORMULA = "UNVERIFIED_FORMULA"
+STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
+STATUS_INVALID_PERIOD_RANGE = "INVALID_PERIOD_RANGE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
 STATUS_RUNTIME_ERROR = "RUNTIME_ERROR"
 
@@ -5302,7 +5304,12 @@ def _build_axis_codebook(item_rows: list[dict]) -> tuple[dict[str, dict[str, Any
 def _suggest_axis_codes(axis: dict[str, Any], bad_code: str, limit: int = 8) -> list[dict[str, Any]]:
     items = axis.get("items") or {}
     bad_norm = _compact_text(bad_code)
-    scored: list[tuple[int, str, dict[str, Any]]] = []
+    preferred_order = {
+        "00": 0, "0": 0,
+        "11": 1, "21": 2, "22": 3, "23": 4, "24": 5, "25": 6, "26": 7, "27": 8,
+        "31": 9, "32": 10, "33": 11, "34": 12, "35": 13, "36": 14, "37": 15, "38": 16, "39": 17,
+    }
+    scored: list[tuple[int, int, int, int, str, dict[str, Any]]] = []
     for code, meta in items.items():
         label = str(meta.get("label") or "")
         label_norm = _compact_text(label)
@@ -5313,11 +5320,13 @@ def _suggest_axis_codes(axis: dict[str, Any], bad_code: str, limit: int = 8) -> 
             score = 1
         elif bad_norm and any(part and part in label_norm for part in re.split(r"[^0-9A-Za-z가-힣]+", bad_norm)):
             score = 2
-        scored.append((score, code, meta))
-    scored.sort(key=lambda row: (row[0], len(str(row[2].get("label") or "")), row[1]))
+        parent_rank = 0 if not meta.get("parent") else 1
+        order_rank = preferred_order.get(str(code), 100)
+        scored.append((score, parent_rank, order_rank, len(str(code)), str(code), meta))
+    scored.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
     return [
         {"code": code, "label": meta.get("label"), "unit": meta.get("unit")}
-        for _, code, meta in scored[:limit]
+        for _, _, _, _, code, meta in scored[:limit]
     ]
 
 
@@ -5426,12 +5435,112 @@ def _query_table_params(
     if period_range:
         bounds = [str(p) for p in period_range if str(p or "").strip()]
         if len(bounds) == 1:
-            params["startPrdDe"] = bounds[0]
-            params["endPrdDe"] = bounds[0]
+            params["startPrdDe"] = _api_period_de(bounds[0])
+            params["endPrdDe"] = _api_period_de(bounds[0])
         elif len(bounds) >= 2:
-            params["startPrdDe"] = bounds[0]
-            params["endPrdDe"] = bounds[1]
+            params["startPrdDe"] = _api_period_de(bounds[0])
+            params["endPrdDe"] = _api_period_de(bounds[1])
     return params
+
+
+def _api_period_de(value: Any) -> str:
+    text = str(value or "").strip()
+    monthly = re.fullmatch(r"(\d{4})\.(\d{2})", text)
+    if monthly:
+        return f"{monthly.group(1)}{monthly.group(2)}"
+    return text
+
+
+def _normalize_period_bound(value: Any, *, upper: bool = False) -> Optional[int]:
+    text = re.sub(r"\D", "", str(value or ""))
+    if not text:
+        return None
+    if len(text) == 4:
+        return int(text + ("99" if upper else "00"))
+    return int(text)
+
+
+def _validate_query_period_range(
+    period_range: Optional[list[str]],
+    selected_period: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not period_range:
+        return None
+    bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
+    if not bounds:
+        return None
+    if len(bounds) == 1:
+        bounds = [bounds[0], bounds[0]]
+    start, end = bounds[0], bounds[1]
+    start_num = _normalize_period_bound(start, upper=False)
+    end_num = _normalize_period_bound(end, upper=True)
+    if start_num is not None and end_num is not None and start_num > end_num:
+        return {
+            "code": STATUS_INVALID_PERIOD_RANGE,
+            "error": "period_range start is later than end.",
+            "오류": "period_range 시작 시점이 종료 시점보다 큽니다.",
+            "period_range_received": [start, end],
+            "suggested_period_range": [end, start],
+        }
+    if not selected_period:
+        return None
+    available_start = selected_period.get("STRT_PRD_DE")
+    available_end = selected_period.get("END_PRD_DE")
+    available_start_num = _normalize_period_bound(available_start, upper=False)
+    available_end_num = _normalize_period_bound(available_end, upper=True)
+    if (
+        start_num is not None
+        and end_num is not None
+        and available_start_num is not None
+        and available_end_num is not None
+        and (end_num < available_start_num or start_num > available_end_num)
+    ):
+        return {
+            "code": STATUS_PERIOD_NOT_FOUND,
+            "error": "Requested period is outside the table's recorded period range.",
+            "오류": "요청 시점이 통계표 수록 범위 밖입니다.",
+            "period_range_received": [start, end],
+            "available_period_range": [str(available_start), str(available_end)],
+        }
+    return None
+
+
+def _query_table_data_nature(
+    table_name: Optional[str],
+    period_range: Optional[list[str]],
+    latest_period: Optional[str],
+) -> dict[str, Any]:
+    name = str(table_name or "")
+    requested_end = None
+    if period_range:
+        bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
+        if bounds:
+            requested_end = bounds[-1]
+    requested_num = _normalize_period_bound(requested_end, upper=True)
+    latest_num = _normalize_period_bound(latest_period, upper=True)
+    projection_by_name = any(term in name for term in ("추계", "장래", "전망", "예측"))
+    current_year = datetime.now().year
+    requested_year = int(str(requested_num)[:4]) if requested_num is not None else None
+    latest_year = int(str(latest_num)[:4]) if latest_num is not None else None
+    projection_by_requested_future = requested_year is not None and requested_year > current_year
+    projection_by_future_series = latest_year is not None and latest_year > current_year + 1
+    if projection_by_name or projection_by_requested_future or projection_by_future_series:
+        horizon = None
+        if requested_year is not None:
+            horizon = requested_year - current_year
+        return {
+            "data_nature": "projection",
+            "period_nature": "future_projection" if horizon is not None and horizon > 0 else "projection_series",
+            "projection_horizon_years": horizon if horizon is not None and horizon > 0 else None,
+            "data_quality_note": "통계표명 또는 요청 시점 기준으로 추계/전망 성격의 데이터입니다. 실측값처럼 단정하지 말고 추계 기준임을 표시하세요.",
+            "추계_안내": "이 데이터는 추계/전망 성격일 수 있습니다. 사용자 응답에 기준을 함께 표시하세요.",
+        }
+    return {
+        "data_nature": "observed",
+        "period_nature": "observed_or_reported",
+        "projection_horizon_years": None,
+        "data_quality_note": None,
+    }
 
 
 def _normalize_query_table_rows(
@@ -5558,8 +5667,8 @@ async def query_table(
             return {
                 "상태": "failed",
                 "status": "unsupported",
-                "코드": STATUS_UNVERIFIED_FORMULA,
-                "code": STATUS_UNVERIFIED_FORMULA,
+                "코드": STATUS_INVALID_FILTER_CODE,
+                "code": STATUS_INVALID_FILTER_CODE,
                 "error": "filters validation failed",
                 "오류": "filters 검증 실패",
                 "검증_오류": errors,
@@ -5580,6 +5689,27 @@ async def query_table(
             end_period = str(selected_period.get("END_PRD_DE"))
             effective_period_range = [end_period, end_period]
             auto_default_period_range = effective_period_range
+        period_error = _validate_query_period_range(effective_period_range, selected_period)
+        if period_error:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": period_error["code"],
+                "code": period_error["code"],
+                "error": period_error["error"],
+                "오류": period_error["오류"],
+                "filters_used": normalized_filters,
+                "period_range": effective_period_range,
+                "period_range_received": period_error.get("period_range_received"),
+                "suggested_period_range": period_error.get("suggested_period_range"),
+                "available_period_range": period_error.get("available_period_range"),
+                "period_metadata": {
+                    "cadence": selected_period.get("PRD_SE") if selected_period else None,
+                    "start_period": selected_period.get("STRT_PRD_DE") if selected_period else None,
+                    "latest_period": selected_period.get("END_PRD_DE") if selected_period else None,
+                } if selected_period else None,
+                "metadata_source": metadata_source,
+            }
 
         params = _query_table_params(
             org_id,
@@ -5612,7 +5742,9 @@ async def query_table(
         table_name_eng = name_rows[0].get("TBL_NM_ENG") or name_rows[0].get("tblNmEng")
     latest_period = selected_period
     normalized_rows = _normalize_query_table_rows(rows, normalized_filters, axes, axis_order)
-    return {
+    latest_period_value = str(latest_period.get("END_PRD_DE")) if latest_period and latest_period.get("END_PRD_DE") else None
+    nature = _query_table_data_nature(table_name, effective_period_range, latest_period_value)
+    result = {
         "상태": "executed",
         "status": "executed",
         "verification_level": "explored_raw",
@@ -5654,6 +5786,8 @@ async def query_table(
             "confidence describes mapping and call-condition verification, not statistical data quality.",
         ],
     }
+    result.update({key: value for key, value in nature.items() if value is not None})
+    return result
 
 
 @mcp.tool()
