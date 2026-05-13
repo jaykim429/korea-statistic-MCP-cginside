@@ -21,7 +21,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
@@ -70,6 +70,7 @@ STATUS_EXECUTED = "EXECUTED"
 STATUS_NEEDS_TABLE_SELECTION = "NEEDS_TABLE_SELECTION"
 STATUS_STAT_NOT_FOUND = "STAT_NOT_FOUND"
 STATUS_PERIOD_NOT_FOUND = "PERIOD_NOT_FOUND"
+STATUS_PERIOD_RANGE_REQUESTED = "PERIOD_RANGE_REQUESTED"
 STATUS_UNVERIFIED_FORMULA = "UNVERIFIED_FORMULA"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
 STATUS_RUNTIME_ERROR = "RUNTIME_ERROR"
@@ -98,6 +99,14 @@ FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
         "required_stats": ["종사자 수", "사업체 수"],
         "checks": ["기업체 기준과 사업체 기준 혼합 여부", "동일 기준시점", "동일 대상 범위"],
         "caution": "사업체 수와 기업 수는 집계 단위가 다르므로 평균 산식에 섞으면 안 됩니다.",
+    },
+    "unemployment_rate": {
+        "canonical": "실업률",
+        "aliases": ["실업률", "청년 실업률", "고령층 실업률", "여성 실업률", "남성 실업률"],
+        "formula": "실업자 수 / 경제활동인구 * 100",
+        "required_stats": ["실업자 수", "경제활동인구"],
+        "checks": ["대상군(연령·성별) 일치", "경제활동인구 분모", "동일 기준시점"],
+        "caution": "청년·여성 등 부분군 실업률은 분자와 분모를 같은 대상군으로 제한해야 합니다.",
     },
     "closure_rate": {
         "canonical": "폐업률",
@@ -308,25 +317,64 @@ def _resolve_classification_term(
     Returns the full row (including ITM_ID for use as objL*/itmId in
     quick_stat) or None when no match is found. Pass obj_id to narrow
     to a specific classification axis (e.g. an industry axis vs a region
-    axis on the same table). Matching is whitespace-stripped substring
-    so the caller does not need exact KOSIS phrasing."""
+    axis on the same table). Prefer exact normalized labels after removing
+    KOSIS code/range adornments (e.g. "C.제조업(10~34)" -> "제조업")
+    before falling back to substring matches."""
     if not term:
         return None
     normalized = re.sub(r"\s+", "", term).lower()
+
+    def normalize_label(value: Any) -> str:
+        return re.sub(r"\s+", "", str(value or "")).lower()
+
+    def canonical_label(value: Any) -> str:
+        label = normalize_label(value)
+        label = re.sub(r"^[a-z]\.", "", label)
+        label = re.sub(r"^\d+[.)]?", "", label)
+        label = re.sub(r"\([^)]*\)", "", label)
+        return label.strip()
+
+    def is_parent(row: dict) -> bool:
+        return not str(row.get("UP_ITM_ID") or "").strip()
+
+    def score(row: dict) -> Optional[tuple[int, int, int, str]]:
+        itm_id = normalize_label(row.get("ITM_ID"))
+        label = normalize_label(row.get("ITM_NM"))
+        canonical = canonical_label(row.get("ITM_NM"))
+        if not label and not itm_id:
+            return None
+
+        parent_bonus = 0 if is_parent(row) else 1
+        if itm_id == normalized:
+            rank = 0
+        elif canonical == normalized:
+            rank = 1
+        elif label == normalized:
+            rank = 2
+        elif canonical.startswith(normalized):
+            rank = 3
+        elif label.startswith(normalized):
+            rank = 4
+        elif normalized in canonical:
+            rank = 5
+        elif normalized in label:
+            rank = 6
+        else:
+            return None
+        return (rank, parent_bonus, len(canonical or label), label)
+
     candidates = classifications
     if obj_id:
         candidates = [c for c in classifications if str(c.get("OBJ_ID") or "") == str(obj_id)]
-    matches: list[dict] = []
+    matches: list[tuple[tuple[int, int, int, str], dict]] = []
     for row in candidates:
-        nm = re.sub(r"\s+", "", str(row.get("ITM_NM") or "")).lower()
-        if not nm:
-            continue
-        if nm == normalized or normalized in nm:
-            matches.append(row)
+        row_score = score(row)
+        if row_score is not None:
+            matches.append((row_score, row))
     if not matches:
         return None
-    matches.sort(key=lambda r: len(str(r.get("ITM_NM") or "")))
-    return matches[0]
+    matches.sort(key=lambda pair: pair[0])
+    return matches[0][1]
 
 
 def _format_number(v: Any) -> str:
@@ -335,6 +383,15 @@ def _format_number(v: Any) -> str:
         if n == int(n):
             return f"{int(n):,}"
         return f"{n:,.3f}".rstrip("0").rstrip(".")
+    except (ValueError, TypeError):
+        return str(v)
+
+
+def _format_display_number(v: Any, decimals: Optional[int] = None) -> str:
+    if decimals is None:
+        return _format_number(v)
+    try:
+        return f"{float(v):,.{decimals}f}"
     except (ValueError, TypeError):
         return str(v)
 
@@ -357,6 +414,26 @@ def _parse_year_token(text: str) -> Optional[str]:
     if any(t in text for t in ("올해", "금년")):
         return str(year_now)
     return None
+
+
+def _is_latest_period_text(text: Any) -> bool:
+    if text is None:
+        return True
+    compact = re.sub(r"\s+", "", str(text)).lower()
+    return compact in {
+        "",
+        "latest",
+        "최근",
+        "최신",
+        "가장최근",
+        "제일최근",
+        "최근값",
+        "최신값",
+        "최신치",
+        "최근시점",
+        "최신시점",
+        "현재",
+    }
 
 
 def _relative_year(compact_text: str) -> Optional[int]:
@@ -400,6 +477,16 @@ def _parse_month_token(text: str) -> Optional[str]:
                 month = 12
                 year -= 1
             return f"{year}{month:02d}"
+    if "이번달" in compact or "금월" in compact:
+        return f"{datetime.now().year}{datetime.now().month:02d}"
+    if "지난달" in compact or "전월" in compact:
+        now = datetime.now()
+        month = now.month - 1
+        year = now.year
+        if month == 0:
+            month = 12
+            year -= 1
+        return f"{year}{month:02d}"
     return None
 
 
@@ -452,20 +539,35 @@ def _detect_half_year_request(text: str) -> Optional[str]:
 
 def _period_bounds(period: str, period_type: str) -> tuple[Optional[str], Optional[str]]:
     """Convert natural period text into KOSIS start/end period codes."""
-    if not period or period == "latest":
+    if _is_latest_period_text(period):
         return None, None
 
+    # Parse finer-grained tokens first even when the target table is annual.
+    # That lets callers surface a precision-downgrade trail for natural
+    # periods such as "이번 분기" instead of treating them as unparseable.
+    quarter = _parse_quarter_token(period)
+    month = None if quarter else _parse_month_token(period)
+
     if period_type == "M":
-        month = _parse_month_token(period)
         if month:
             return month, month
+        if quarter:
+            year, q = int(quarter[:4]), int(quarter[4])
+            start_month = (q - 1) * 3 + 1
+            return f"{year}{start_month:02d}", f"{year}{start_month + 2:02d}"
 
     if period_type == "Q":
-        quarter = _parse_quarter_token(period)
         if quarter:
             return quarter, quarter
+        if month:
+            year, mon = int(month[:4]), int(month[4:])
+            return f"{year}{((mon - 1) // 3) + 1}", f"{year}{((mon - 1) // 3) + 1}"
 
     year = _parse_year_token(period)
+    if not year and quarter:
+        year = quarter[:4]
+    if not year and month:
+        year = month[:4]
     if not year:
         return None, None
     if period_type == "M":
@@ -512,14 +614,45 @@ def _extract_year_range(text: str) -> tuple[Optional[str], Optional[str]]:
     """
     if not text:
         return None, None
-    cur = datetime.now().year
-    years = [y for y in re.findall(r"(19\d{2}|20\d{2})", text) if int(y) <= cur + 1]
+    years = re.findall(r"(19\d{2}|20\d{2})", text)
     if len(years) < 2:
         return None, None
     start, end = years[0], years[1]
     if start == end:
         return None, None
     return start, end
+
+
+def _extract_open_start_year(text: str) -> Optional[str]:
+    """Extract a single start year from open-ended range phrases.
+
+    "2020년부터", "2020년 이후", "since 2020" ask for a series, not a
+    single period. Two-year ranges are handled by _extract_year_range.
+    """
+    if not text:
+        return None
+    years = re.findall(r"(19\d{2}|20\d{2})", str(text))
+    if len(years) != 1:
+        return None
+    compact = re.sub(r"\s+", "", str(text))
+    year = years[0]
+    if re.search(rf"{year}년?(?:부터|이후|이래|이뒤)", compact):
+        return year
+    if re.search(rf"(?:since|from){year}", compact, re.IGNORECASE):
+        return year
+    return None
+
+
+def _periods_per_year(period_type: str) -> int:
+    if period_type == "M":
+        return 12
+    if period_type == "Q":
+        return 4
+    return 1
+
+
+def _latest_count_for_years(years: int, period_type: str) -> int:
+    return max(1, int(years or 1)) * _periods_per_year(period_type)
 
 
 def _default_period_type(param: QuickStatParam) -> str:
@@ -665,6 +798,99 @@ class AnswerStat:
         }
 
 
+@dataclass(frozen=True)
+class AnswerPlan:
+    """Execution decision for answer_query.
+
+    The planner decides *what* should run. The engine still owns the actual
+    KOSIS calls and rendering so this first refactor stays behavior-preserving.
+    """
+    action: str
+    region: str
+    direct_key: Optional[str] = None
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+class AnswerPlanner:
+    """Turn a routed natural-language query into one executable action."""
+
+    def __init__(self, engine: "NaturalLanguageAnswerEngine") -> None:
+        self.engine = engine
+
+    def build(self, query: str, region: str, route_payload: dict[str, Any]) -> AnswerPlan:
+        effective_region = self.engine._effective_region(route_payload, region)
+        direct_key = self.engine._infer_direct_stat_key(query, route_payload)
+
+        if self.engine._is_self_employed_sme_population_question(query):
+            return AnswerPlan("mixed_population", effective_region)
+        if self.engine._is_sme_large_sales_question(query):
+            return AnswerPlan("sme_large_sales", effective_region)
+        if self.engine._is_sme_smallbiz_count_question(query):
+            return AnswerPlan("sme_smallbiz_counts", effective_region)
+        if self.engine._is_sme_employee_average_question(query):
+            return AnswerPlan("sme_employee_average", effective_region)
+        if self.engine._is_dynamic_ratio_question(query):
+            return AnswerPlan("dynamic_ratio", effective_region)
+
+        if self.engine._needs_advanced_analysis_plan(route_payload):
+            intents = route_payload.get("intents") or []
+            if "STAT_CORRELATION" in intents:
+                stat_x, stat_y = self.engine._extract_correlation_pair(query)
+                if stat_x and stat_y:
+                    return AnswerPlan(
+                        "auto_correlate",
+                        effective_region,
+                        params={"stat_x": stat_x, "stat_y": stat_y},
+                    )
+            return AnswerPlan("search_fallback", effective_region)
+
+        if direct_key:
+            composites = self.engine._extract_composite_regions(query)
+            if composites:
+                operation = (
+                    "share"
+                    if self.engine._is_share_ratio_question(query, route_payload)
+                    else "sum"
+                )
+                return AnswerPlan(
+                    "composite_aggregate",
+                    effective_region,
+                    direct_key,
+                    {"composite": composites[0], "operation": operation},
+                )
+
+            if self.engine._is_aggregation_question(query):
+                extras = self.engine._extract_extra_regions(query, effective_region, route_payload)
+                regions = [effective_region] + [r for r in extras if r != effective_region]
+                if len(regions) >= 2:
+                    return AnswerPlan("region_sum", effective_region, direct_key, {"regions": regions})
+
+            if self.engine._is_top_n_question(query, route_payload):
+                return AnswerPlan(
+                    "top_n",
+                    effective_region,
+                    direct_key,
+                    {
+                        "top_n": self.engine._extract_top_n(query) or 5,
+                        "include_share_ratio": self.engine._is_share_ratio_question(query, route_payload),
+                    },
+                )
+
+            if self.engine._is_region_compare_question(query):
+                return AnswerPlan("region_compare", effective_region, direct_key)
+
+            if (
+                self.engine._is_share_ratio_question(query, route_payload)
+                and effective_region != "전국"
+                and not self.engine._is_growth_question(query, route_payload)
+            ):
+                return AnswerPlan("share_ratio", effective_region, direct_key)
+
+            return AnswerPlan("direct", effective_region, direct_key)
+
+        return AnswerPlan("search_fallback", effective_region)
+
+
 class NaturalLanguageAnswerEngine:
     """자연어 질문을 실제 실행 가능한 답변 또는 안전한 후보 답변으로 변환."""
 
@@ -779,10 +1005,16 @@ class NaturalLanguageAnswerEngine:
             r"하위(\d+)",
             r"가장많은(\d+)[곳개]",
             r"가장적은(\d+)[곳개]",
+            r"가장많은(?:시도|지역)(\d+)[곳개]",
+            r"가장적은(?:시도|지역)(\d+)[곳개]",
             r"많은(\d+)[곳개]",
             r"적은(\d+)[곳개]",
+            r"많은(?:시도|지역)(\d+)[곳개]",
+            r"적은(?:시도|지역)(\d+)[곳개]",
+            r"(?:시도|지역)(\d+)[곳개]",
             r"(\d+)개시도",
             r"(\d+)개지역",
+            r"(\d+)[곳개]",
             r"(\d+)위까지",
             r"1위부터(\d+)위",
             r"순위(\d+)",
@@ -1042,6 +1274,22 @@ class NaturalLanguageAnswerEngine:
             and any(term in q for term in ("비교", "비중", "차이", "전체매출"))
         )
 
+    def _mixed_self_employed_business_key(self, query: str) -> Optional[tuple[str, str]]:
+        q = self._norm(query)
+        has_self_employed = any(term in q for term in ("자영업자", "자영업", "개인사업자"))
+        has_business_count = any(term in q for term in ("사업체", "사업체수", "기업수", "업체수", "업체"))
+        asks_jointly = any(term in q for term in ("비교", "차이", "비중", "대비", "같이", "함께", "와", "과"))
+        if not (has_self_employed and has_business_count and asks_jointly):
+            return None
+        if "중소기업" in q:
+            return "중소기업_사업체수", "중소기업 사업체 수"
+        if "소상공인" in q:
+            return "소상공인_사업체수", "소상공인 사업체 수"
+        return "전체사업체수", "총 사업체 수"
+
+    def _is_self_employed_sme_population_question(self, query: str) -> bool:
+        return self._mixed_self_employed_business_key(query) is not None
+
     @staticmethod
     def _needs_advanced_analysis_plan(route_payload: dict[str, Any]) -> bool:
         advanced = {"STAT_CORRELATION", "STAT_REGRESSION", "POLICY_EFFECT_ANALYSIS"}
@@ -1103,6 +1351,50 @@ class NaturalLanguageAnswerEngine:
             ],
             "추천_시각화": ["bar_chart"],
             "검증_주의": self._validation_notes(route_payload),
+            "route": route_payload["route"],
+            "출처": "통계청 KOSIS",
+        }
+
+    async def _answer_self_employed_sme_population_warning(self, query: str, region: str) -> dict[str, Any]:
+        route_payload = self._route_payload(query)
+        business_key, business_label = self._mixed_self_employed_business_key(query) or (
+            "중소기업_사업체수",
+            "중소기업 사업체 수",
+        )
+        try:
+            business = await self._latest_stat(business_key, business_label, region)
+            self_employed = await self._latest_stat("자영업자수", "자영업자 수", region)
+        except RuntimeError:
+            return await self._answer_search_fallback(query, route_payload)
+
+        notes = self._validation_notes(route_payload)
+        notes.append(
+            f"이 질의는 자영업자(종사상지위별 취업자)와 {business_label}(사업체 단위)를 함께 언급합니다. "
+            "두 모집단은 단위와 작성 기준이 달라 비율·차이를 자동 계산하지 않았습니다."
+        )
+        if not self._same_period([business, self_employed]):
+            notes.append(f"시점 불일치: {business_label} {business.period}, 자영업자 수 {self_employed.period}")
+
+        return {
+            "상태": "executed",
+            "코드": STATUS_EXECUTED,
+            "답변유형": "tier_a_population_mixed_comparison",
+            "질문": query,
+            "answer": (
+                f"{region} 기준 {business_label}와 자영업자 수를 각각 조회했습니다. "
+                "두 지표는 모집단이 달라 직접 비율이나 차이로 계산하지 않았습니다."
+            ),
+            "표": [business.to_row(), self_employed.to_row()],
+            "모집단_주의": {
+                business_key: "사업체 단위 사업체 수",
+                "자영업자수": "종사상지위별 취업자 중 자영업자",
+                "자동계산": "차이·비율 계산 안 함",
+            },
+            "추천_후속": [
+                "자영업자 수만 조회하려면 quick_stat('자영업자수', region='전국', period='latest')",
+                "사업체 단위 비교가 필요하면 같은 사업체조사 계열 통계표를 선택",
+            ],
+            "검증_주의": notes,
             "route": route_payload["route"],
             "출처": "통계청 KOSIS",
         }
@@ -1230,13 +1522,30 @@ class NaturalLanguageAnswerEngine:
         if any(term in q for term in ("추이", "최근", "시계열", "그래프", "선그래프", "분석")):
             years_match = re.search(r"최근\s*(\d+)\s*년", query)
             years = int(years_match.group(1)) if years_match else 5
-            trend = await quick_trend(direct_key, region, years, self.api_key)
+            open_start_year = _extract_open_start_year(query)
+            trend = await _quick_trend_core(
+                direct_key,
+                region,
+                years,
+                self.api_key,
+                start_year=open_start_year,
+            )
             if "오류" in trend:
                 return await self._answer_search_fallback(query, route_payload)
-            answer = (
-                f"{region}의 {trend.get('통계명', direct_key)} 최근 {len(trend.get('시계열', []))}개 시점 "
-                f"자료를 조회했습니다."
-            )
+            if open_start_year:
+                answer = (
+                    f"{region}의 {trend.get('통계명', direct_key)} {open_start_year}년부터 최신까지 "
+                    f"{len(trend.get('시계열', []))}개 시점 자료를 조회했습니다."
+                )
+            else:
+                answer = (
+                    f"{region}의 {trend.get('통계명', direct_key)} 최근 {len(trend.get('시계열', []))}개 시점 "
+                    f"자료를 조회했습니다."
+                )
+            notes = list(route_payload["validation"].get("warnings", []))
+            period_interpretation = trend.get("⚠️ 기간_해석")
+            if period_interpretation:
+                notes.append(period_interpretation)
             result: dict[str, Any] = {
                 "상태": "executed",
                 "코드": STATUS_EXECUTED,
@@ -1249,13 +1558,43 @@ class NaturalLanguageAnswerEngine:
                 "데이터수": len(trend.get("시계열", [])),
                 "통계표": trend.get("통계표"),
                 "추천_시각화": ["line_chart"],
-                "검증_주의": route_payload["validation"].get("warnings", []),
+                "검증_주의": notes,
                 "route": route_payload["route"],
                 "출처": "통계청 KOSIS",
             }
             if "분석" in q:
                 result["분석"] = await analyze_trend(direct_key, region, max(years, 5), self.api_key)
             return result
+
+        open_start_year = _extract_open_start_year(query)
+        if open_start_year:
+            trend = await _quick_trend_core(
+                direct_key,
+                region,
+                5,
+                self.api_key,
+                start_year=open_start_year,
+            )
+            if "오류" not in trend:
+                return {
+                    "상태": "executed",
+                    "코드": STATUS_EXECUTED,
+                    "답변유형": "tier_a_trend",
+                    "질문": query,
+                    "answer": (
+                        f"{region}의 {trend.get('통계명', direct_key)} {open_start_year}년부터 최신까지 "
+                        f"{len(trend.get('시계열', []))}개 시점 자료를 조회했습니다."
+                    ),
+                    "표": trend.get("시계열", []),
+                    "단위": trend.get("단위"),
+                    "지역": region,
+                    "데이터수": len(trend.get("시계열", [])),
+                    "통계표": trend.get("통계표"),
+                    "추천_시각화": ["line_chart"],
+                    "검증_주의": route_payload["validation"].get("warnings", []),
+                    "route": route_payload["route"],
+                    "출처": "통계청 KOSIS",
+                }
 
         period = self._period_argument(query, route_payload)
         stat = await quick_stat(direct_key, region, period, self.api_key)
@@ -1332,6 +1671,7 @@ class NaturalLanguageAnswerEngine:
         query: str,
         direct_key: str,
         top_n: int,
+        include_share_ratio: bool = False,
     ) -> dict[str, Any]:
         route_payload = self._route_payload(query)
         comparison = await quick_region_compare(direct_key, api_key=self.api_key)
@@ -1347,15 +1687,18 @@ class NaturalLanguageAnswerEngine:
         unit = comparison.get("단위", "")
         period = comparison.get("시점")
         direction = "많은" if descending else "적은"
+        rank_label = "상위" if descending else "하위"
         if selected:
             leader = selected[0]
             answer = (
-                f"{period} 기준 {comparison.get('통계명', direct_key)} 상위 {len(selected)}개 지역 중 "
+                f"{period} 기준 {comparison.get('통계명', direct_key)} {rank_label} {len(selected)}개 지역 중 "
                 f"가장 {direction} 지역은 {leader['지역']}({leader['값']}{unit})입니다."
             )
         else:
             answer = "상위/하위 비교 데이터를 조회하지 못했습니다."
-        return {
+
+        notes = self._validation_notes(route_payload)
+        payload: dict[str, Any] = {
             "상태": "executed",
             "코드": STATUS_EXECUTED,
             "답변유형": "tier_a_top_n",
@@ -1366,10 +1709,56 @@ class NaturalLanguageAnswerEngine:
             "요청_top_n": top_n,
             "정렬": "내림차순" if descending else "오름차순",
             "추천_시각화": ["bar_chart"],
-            "검증_주의": route_payload["validation"].get("warnings", []),
+            "검증_주의": notes,
             "route": route_payload["route"],
             "출처": "통계청 KOSIS",
         }
+        if not include_share_ratio or not selected:
+            return payload
+
+        try:
+            subtotal = sum(
+                self._to_float(row.get("원값", row.get("값")))
+                for row in selected
+            )
+        except (TypeError, ValueError):
+            return payload
+
+        whole = await quick_stat(direct_key, "전국", str(period or "latest"), self.api_key)
+        if "오류" in whole or "값" not in whole:
+            return payload
+        try:
+            whole_value = self._to_float(whole["값"])
+        except (KeyError, ValueError):
+            return payload
+        if not whole_value:
+            return payload
+
+        whole_period = str(whole.get("시점", ""))
+        if period and whole_period and str(period) != whole_period:
+            notes.append(f"분자 시점 {period} ↔ 분모 시점 {whole_period} 불일치")
+        share = subtotal / whole_value * 100
+        stat_label = comparison.get("통계명", direct_key)
+        payload.update({
+            "답변유형": "tier_a_top_n_share_ratio",
+            "answer": (
+                f"{period} 기준 {stat_label} {rank_label} {len(selected)}개 지역"
+                f"({'+'.join(row['지역'] for row in selected)}) 합계는 "
+                f"{_format_number(subtotal)}{unit}로, 전국({_format_number(whole_value)}{unit}) 대비 "
+                f"약 {share:.2f}%입니다."
+            ),
+            "계산": {
+                "분자": _format_number(subtotal),
+                "분모": _format_number(whole_value),
+                "비중_퍼센트": round(share, 2),
+                "포함_지역": [row["지역"] for row in selected],
+                "산식": f"({' + '.join(row['지역'] for row in selected)}) / 전국 * 100",
+                "동일시점_여부": str(period or "") == whole_period,
+            },
+            "추천_시각화": ["bar_chart", "pie_chart"],
+            "검증_주의": notes,
+        })
+        return payload
 
     async def _answer_share_ratio(
         self,
@@ -1560,7 +1949,20 @@ class NaturalLanguageAnswerEngine:
         else:
             indicator = "생존율"
         formula_spec = await indicator_dependency_map(indicator)
-        search = await search_kosis(f"{indicator} {query}", 8, True, self.api_key)
+        dynamic_terms = [
+            f"{indicator} {query}",
+            f"{indicator} 업종별",
+            f"{indicator} 산업별",
+            f"기업생멸행정통계 {indicator}",
+            f"신생기업 {indicator}",
+        ]
+        search = await _search_kosis_keywords(
+            f"{indicator} {query}",
+            dynamic_terms,
+            8,
+            self.api_key,
+            used_routing=True,
+        )
         return {
             "상태": "needs_table_selection",
             "코드": STATUS_NEEDS_TABLE_SELECTION,
@@ -1584,19 +1986,51 @@ class NaturalLanguageAnswerEngine:
 
     async def _answer_search_fallback(self, query: str, route_payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
-        # Fold slot-parsed industry/scale into the search query so the
-        # KOSIS index ranks industry-specific tables higher (#28). The
-        # parser already extracts these into slots; previously they
-        # were thrown away at this layer.
+        # Fold route terms and slot-parsed industry/scale into the
+        # actual KOSIS search keywords so route.search_terms and
+        # 사용된_검색어 stay consistent (#28).
         slots = route_payload.get("slots") or {}
-        enrichment: list[str] = []
+        slot_terms: list[str] = []
+        query_enrichment: list[str] = []
         if isinstance(slots, dict):
             for slot_key in ("industry", "scale", "target"):
                 value = slots.get(slot_key)
-                if isinstance(value, str) and value and value not in query:
-                    enrichment.append(value)
-        enriched_query = (query + " " + " ".join(enrichment)).strip() if enrichment else query
-        search = await search_kosis(enriched_query, 8, True, self.api_key)
+                if isinstance(value, str) and value:
+                    slot_terms.append(value)
+                    if value not in query:
+                        query_enrichment.append(value)
+        enriched_query = (query + " " + " ".join(query_enrichment)).strip() if query_enrichment else query
+
+        route = route_payload.get("route") or {}
+        route_terms = [
+            str(term).strip()
+            for term in (route.get("search_terms") or [])
+            if str(term).strip()
+        ]
+        search_keywords: list[str] = []
+        for term in route_terms:
+            missing_slot_terms = [slot_term for slot_term in slot_terms if slot_term not in term]
+            if missing_slot_terms:
+                search_keywords.append((" ".join([*missing_slot_terms, term])).strip())
+            search_keywords.append(term)
+        if not search_keywords:
+            search_keywords.append(enriched_query)
+
+        deduped_keywords = list(dict.fromkeys(search_keywords))[:6]
+        search = await _search_kosis_keywords(
+            enriched_query,
+            deduped_keywords,
+            8,
+            self.api_key,
+            used_routing=bool(route_terms),
+        )
+        slot_enrichment = None
+        if slot_terms or route_terms:
+            slot_enrichment = {
+                "slot_terms": slot_terms,
+                "route_search_terms": route_terms,
+                "최종검색어": search.get("사용된_검색어", []),
+            }
         intents = route_payload.get("intents") or []
         tool_hints = self._tool_routing_hints(query, intents)
         next_steps = [
@@ -1624,7 +2058,7 @@ class NaturalLanguageAnswerEngine:
             "검증": route_payload["validation"],
             "검색결과": search.get("결과", []),
             "사용된_검색어": search.get("사용된_검색어", []),
-            "검색어_슬롯보강": enrichment or None,
+            "검색어_슬롯보강": slot_enrichment,
             "추천_도구_호출": tool_hints,
             "다음단계": next_steps,
             "route": route_payload["route"],
@@ -1754,60 +2188,60 @@ class NaturalLanguageAnswerEngine:
         precomputed_route: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         route_payload = precomputed_route or self._route_payload(query)
-        effective_region = self._effective_region(route_payload, region)
-        inferred_direct_key = self._infer_direct_stat_key(query, route_payload)
-        if self._is_sme_large_sales_question(query):
-            return await self._answer_sme_large_sales(query, effective_region)
-        if self._is_sme_smallbiz_count_question(query):
-            return await self._answer_sme_smallbiz_counts(query, effective_region)
-        if self._is_sme_employee_average_question(query):
-            return await self._answer_sme_employee_average(query, effective_region)
-        if self._is_dynamic_ratio_question(query):
+        plan = AnswerPlanner(self).build(query, region, route_payload)
+        return await self._execute_plan(query, route_payload, plan)
+
+    async def _execute_plan(
+        self,
+        query: str,
+        route_payload: dict[str, Any],
+        plan: AnswerPlan,
+    ) -> dict[str, Any]:
+        params = plan.params
+        direct_key = plan.direct_key
+
+        if plan.action == "mixed_population":
+            return await self._answer_self_employed_sme_population_warning(query, plan.region)
+        if plan.action == "sme_large_sales":
+            return await self._answer_sme_large_sales(query, plan.region)
+        if plan.action == "sme_smallbiz_counts":
+            return await self._answer_sme_smallbiz_counts(query, plan.region)
+        if plan.action == "sme_employee_average":
+            return await self._answer_sme_employee_average(query, plan.region)
+        if plan.action == "dynamic_ratio":
             return await self._answer_dynamic_ratio_advisory(query, route_payload)
-
-        if self._needs_advanced_analysis_plan(route_payload):
-            intents = route_payload.get("intents") or []
-            if "STAT_CORRELATION" in intents:
-                stat_x, stat_y = self._extract_correlation_pair(query)
-                if stat_x and stat_y:
-                    return await self._answer_auto_correlate(
-                        query, stat_x, stat_y, effective_region, route_payload,
-                    )
-            return await self._answer_search_fallback(query, route_payload)
-
-        composites = self._extract_composite_regions(query)
-        if inferred_direct_key and composites:
-            composite = composites[0]
-            operation = "share" if self._is_share_ratio_question(query, route_payload) else "sum"
-            return await self._answer_composite_aggregate(
-                query, inferred_direct_key, composite, operation=operation,
+        if plan.action == "auto_correlate":
+            return await self._answer_auto_correlate(
+                query,
+                params["stat_x"],
+                params["stat_y"],
+                plan.region,
+                route_payload,
             )
-
-        if inferred_direct_key and self._is_aggregation_question(query):
-            extras = self._extract_extra_regions(query, effective_region, route_payload)
-            regions = [effective_region] + [r for r in extras if r != effective_region]
-            if len(regions) >= 2:
-                return await self._answer_region_sum(query, inferred_direct_key, regions)
-
-        if inferred_direct_key and self._is_top_n_question(query, route_payload):
-            top_n = self._extract_top_n(query) or 5
-            return await self._answer_top_n(query, inferred_direct_key, top_n)
-
-        if inferred_direct_key and self._is_region_compare_question(query):
-            return await self._answer_region_compare(query, inferred_direct_key)
-
-        if (
-            inferred_direct_key
-            and self._is_share_ratio_question(query, route_payload)
-            and effective_region != "전국"
-            and not self._is_growth_question(query, route_payload)
-        ):
-            return await self._answer_share_ratio(query, effective_region, inferred_direct_key)
-
-        if inferred_direct_key and not route_payload["route"].get("direct_stat_key"):
-            route_payload["route"]["direct_stat_key"] = inferred_direct_key
-        if route_payload["route"].get("direct_stat_key"):
-            return await self._answer_direct(query, effective_region, inferred_direct_key, route_payload)
+        if plan.action == "composite_aggregate" and direct_key:
+            return await self._answer_composite_aggregate(
+                query,
+                direct_key,
+                params["composite"],
+                operation=params["operation"],
+            )
+        if plan.action == "region_sum" and direct_key:
+            return await self._answer_region_sum(query, direct_key, params["regions"])
+        if plan.action == "top_n" and direct_key:
+            return await self._answer_top_n(
+                query,
+                direct_key,
+                params["top_n"],
+                include_share_ratio=params["include_share_ratio"],
+            )
+        if plan.action == "region_compare" and direct_key:
+            return await self._answer_region_compare(query, direct_key)
+        if plan.action == "share_ratio" and direct_key:
+            return await self._answer_share_ratio(query, plan.region, direct_key)
+        if plan.action == "direct" and direct_key:
+            if not route_payload["route"].get("direct_stat_key"):
+                route_payload["route"]["direct_stat_key"] = direct_key
+            return await self._answer_direct(query, plan.region, direct_key, route_payload)
         return await self._answer_search_fallback(query, route_payload)
 
     @staticmethod
@@ -1846,11 +2280,13 @@ class NaturalLanguageAnswerEngine:
 
     _INTENT_FULFILLMENT: dict[str, frozenset[str]] = {
         "STAT_RANKING": frozenset({
-            "tier_a_top_n", "tier_a_region_comparison", "tier_a_region_sum",
+            "tier_a_top_n", "tier_a_top_n_share_ratio",
+            "tier_a_region_comparison", "tier_a_region_sum",
         }),
         "STAT_SHARE_RATIO": frozenset({
             "tier_a_share_ratio", "tier_a_composite_comparison",
             "tier_a_composite", "tier_a_composite_share_ratio",
+            "tier_a_top_n_share_ratio",
         }),
         "STAT_GROWTH_RATE": frozenset({
             "tier_a_growth_rate", "tier_a_trend",
@@ -1888,7 +2324,9 @@ class NaturalLanguageAnswerEngine:
                     "단일값/요약에 그쳤을 수 있으니 시도별 비교나 비중 계산을 별도 요청 필요"
                 )
 
-        if cls._is_aggregation_question(query) and answer_type != "tier_a_region_sum":
+        if cls._is_aggregation_question(query) and answer_type not in {
+            "tier_a_region_sum", "tier_a_composite_share_ratio", "tier_a_top_n_share_ratio",
+        }:
             warnings.append(
                 f"합계/합산 키워드 감지됐으나 응답 유형은 {answer_type or '미지정'} — "
                 "두 번째 지역을 인식하지 못해 단일 지역 값으로 폴백했을 수 있음"
@@ -1952,7 +2390,7 @@ class NaturalLanguageAnswerEngine:
         - YYYY.QQ patterns left alone (quarter labels already humane)
         - Collapses 년년 / 월월 artifacts the substitutions can leave.
         - Appends human-readable unit conversion in parentheses after
-          KOSIS canonical units (천명, 억원, 십억원, 백만달러)."""
+          KOSIS canonical units (천명, 명, 개, 대, 건, 억원, 십억원, 천달러)."""
         if not text:
             return text
         def fix_josa(m: re.Match) -> str:
@@ -1967,7 +2405,7 @@ class NaturalLanguageAnswerEngine:
         text = re.sub(r"년년", "년", text)
         text = re.sub(r"월월", "월", text)
         text = re.sub(
-            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|억원|십억원|천달러)(?!\s*\()",
+            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|십억원|천달러|억원|명|개|대|건)(?!\s*\()",
             cls._append_humanized_unit,
             text,
         )
@@ -1986,6 +2424,12 @@ class NaturalLanguageAnswerEngine:
                 return f"약 {people / 1e8:.2f}억 명"
             if people >= 1e4:
                 return f"약 {round(people / 1e4):,}만 명"
+            return None
+        if unit in {"명", "개", "대", "건"}:
+            if value >= 1e8:
+                return f"약 {value / 1e8:.2f}억 {unit}"
+            if value >= 1e5:
+                return f"약 {round(value / 1e4):,}만 {unit}"
             return None
         if unit == "억원":
             if value >= 1e4:
@@ -2386,10 +2830,31 @@ async def _quick_stat_core(
         region = canonical
 
         period_type = _default_period_type(param)
-        start_period, end_period = _period_bounds(period, period_type)
-        precision_downgrade = _detect_precision_downgrade(period, period_type)
-        half_year_advisory = _detect_half_year_request(period)
-        if period != "latest" and not start_period:
+        effective_period = "latest" if _is_latest_period_text(period) else period
+        latest_alias = str(period) if str(period) != "latest" and effective_period == "latest" else None
+        range_start = _extract_open_start_year(effective_period)
+        if effective_period != "latest" and range_start:
+            years_hint = max(1, datetime.now().year - int(range_start) + 1)
+            return {
+                "상태": "failed",
+                "코드": STATUS_PERIOD_RANGE_REQUESTED,
+                "오류": f'기간 "{period}"은 단일 시점이 아니라 열린 범위 요청입니다.',
+                "answer": (
+                    f"'{period}'은 {range_start}년부터 최신까지의 시계열 요청으로 해석됩니다. "
+                    "quick_stat은 단일값 도구이므로 최신값으로 대체하지 않고 중단했습니다."
+                ),
+                "통계표": param.tbl_nm,
+                "요청_기간": period,
+                "해석된_시작시점": range_start,
+                "추천_도구_호출": [
+                    f"quick_trend('{query}', region='{region}', years={years_hint})",
+                    f"answer_query('{range_start}년부터 {query} 추이')",
+                ],
+            }
+        start_period, end_period = _period_bounds(effective_period, period_type)
+        precision_downgrade = _detect_precision_downgrade(effective_period, period_type)
+        half_year_advisory = _detect_half_year_request(effective_period)
+        if effective_period != "latest" and not start_period:
             return {
                 "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
                 "통계표": param.tbl_nm,
@@ -2428,6 +2893,7 @@ async def _quick_stat_core(
                 "요청_기간": period,
                 "해석된_기간": [start_period, end_period],
                 "권고": verification_warning,
+                "⚠️ 정밀도_다운그레이드": precision_downgrade,
                 "⚠️ 기간_해석": relative_hint,
             }
 
@@ -2438,7 +2904,7 @@ async def _quick_stat_core(
         age = NaturalLanguageAnswerEngine._period_age_years(used_period)
         answer_text = NaturalLanguageAnswerEngine._polish_answer_text(
             f"{period_label} {region}의 {param.description}은(는) "
-            f"{_format_number(row.get('DT'))} {param.unit}입니다."
+            f"{_format_display_number(row.get('DT'), param.display_decimals)} {param.unit}입니다."
         )
         result = {
             "answer": answer_text,
@@ -2452,7 +2918,7 @@ async def _quick_stat_core(
         if age is not None and age >= 1.0:
             result["⚠️ 데이터_신선도"] = (
                 f"사용 시점 {used_period} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음. "
-                "check_stat_availability로 통계표의 수록기간을 확인하세요."
+                f"수록기간 메타는 explore_table('{param.org_id}', '{param.tbl_id}')로 확인하세요."
             )
         if verification_warning:
             result["⚠️ 검증_상태"] = verification_warning
@@ -2460,6 +2926,8 @@ async def _quick_stat_core(
             result["⚠️ 정밀도_다운그레이드"] = precision_downgrade
         if half_year_advisory:
             result["⚠️ 상하반기"] = half_year_advisory
+        if latest_alias:
+            result["⚠️ 기간_해석"] = f"'{latest_alias}' → latest로 해석"
         # Population-mismatch warning previously fired only through
         # answer_query's _finalize_response. Direct quick_stat callers
         # were getting silent label substitution — close that gap so
@@ -2545,6 +3013,8 @@ async def quick_trend(
 async def _quick_trend_core(
     query: str, region: str = "전국", years: int = 10,
     api_key: Optional[str] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> dict:
     key = _resolve_key(api_key)
     param = _lookup_quick(query)
@@ -2561,16 +3031,26 @@ async def _quick_trend_core(
         return {"오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.', "지원_지역": ["전국"]}
     region = canonical
 
+    period_type = _default_period_type(param)
+    latest_count = _latest_count_for_years(years, period_type)
+    start_period = end_period = None
+    if start_year:
+        start_period, _ = _period_bounds(start_year, period_type)
+        _, end_period = _period_bounds(end_year or str(datetime.now().year), period_type)
+
     async with httpx.AsyncClient() as client:
         data = await _fetch_series(
             client,
             key,
             param,
             region_code,
-            period_type=_default_period_type(param),
-            latest_n=years,
+            period_type=period_type,
+            start_year=start_period,
+            end_year=end_period,
+            latest_n=None if start_period else latest_count,
         )
 
+    data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
     series = [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data]
     used_period = str(series[-1]["시점"]) if series else ""
     age = NaturalLanguageAnswerEngine._period_age_years(used_period)
@@ -2580,7 +3060,18 @@ async def _quick_trend_core(
         "데이터수": len(data), "통계표": param.tbl_nm,
         "used_period": used_period,
         "period_age_years": age,
+        "수록주기": period_type,
+        "요청_기간_년": years,
+        "요청_시점수": latest_count if not start_period else None,
     }
+    if start_period:
+        result["요청_시작시점"] = start_period
+        result["요청_종료시점"] = end_period
+    elif period_type in {"M", "Q"}:
+        unit_label = "개월" if period_type == "M" else "분기"
+        result["⚠️ 기간_해석"] = (
+            f"years={years} → {period_type} 주기 통계이므로 최근 {latest_count}개 {unit_label} 시점 조회"
+        )
     if age is not None and age >= 1.0:
         result["⚠️ 데이터_신선도"] = (
             f"시계열 최신 시점 {used_period} (약 {age:.1f}년 경과) — "
@@ -2623,8 +3114,9 @@ async def _quick_region_compare_core(
         }
 
     period_type = _default_period_type(param)
-    start_period, end_period = _period_bounds(period, period_type)
-    if period != "latest" and not start_period:
+    effective_period = "latest" if _is_latest_period_text(period) else period
+    start_period, end_period = _period_bounds(effective_period, period_type)
+    if effective_period != "latest" and not start_period:
         return {
             "오류": f'기간 "{period}"을(를) 해석할 수 없습니다.',
             "통계표": param.tbl_nm,
@@ -2814,6 +3306,10 @@ async def analyze_trend(
             "평균_퍼센트": round(avg_growth, 2),
             "변동성_퍼센트": round(volatility, 2),
             "최근_퍼센트": round(recent_change, 2),
+            "최근_구간": {
+                "시작": times[-2],
+                "끝": times[-1],
+            },
         },
         "극값": {
             "최댓값": {"시점": times[max_idx], "값": values[max_idx]},
@@ -3287,10 +3783,23 @@ async def chart_dashboard(
         summary["기울기/년"] = lr.get("기울기_연간")
         summary["R²"] = lr.get("R제곱")
     if "변화율" in trend:
+        analysis_period = str(trend.get("기간") or "")
+        summary["분석기간"] = f"{analysis_period} · {trend.get('데이터수')}개 시점"
         summary["평균 변화율"] = f"{trend['변화율']['평균_퍼센트']:+.2f}%"
-        summary["최근 변화"] = f"{trend['변화율']['최근_퍼센트']:+.2f}%"
+        recent_window = trend["변화율"].get("최근_구간") or {}
+        recent_start = str(recent_window.get("시작") or "")
+        recent_end = str(recent_window.get("끝") or "")
+        recent_label = (
+            "최근 변화"
+            if recent_start and recent_end else "최근 변화"
+        )
+        recent_value = f"{trend['변화율']['최근_퍼센트']:+.2f}%"
+        if recent_start and recent_end:
+            recent_value = f"{recent_start}→{recent_end}: {recent_value}"
+        summary[recent_label] = recent_value
     if "극값" in trend:
-        summary["최댓값"] = f"{trend['극값']['최댓값']['시점'][:4]}: {trend['극값']['최댓값']['값']}"
+        max_point = trend["극값"]["최댓값"]
+        summary["분석기간 내 최댓값"] = f"{max_point['시점']}: {max_point['값']}"
     summary["해석"] = trend.get("해석", "")
 
     svg = chart_dashboard_svg(
@@ -3309,7 +3818,8 @@ async def chart_dashboard(
             type="text",
             text=(
                 f"{param.description} 대시보드 — 시계열 {len(timeseries)}개 + "
-                f"예측 {len(forecast_pts)}년 + 지역 비교 {len(items)}개"
+                f"예측 {len(forecast_pts)}년 + 지역 비교 {len(items)}개. "
+                f"추세·요약 분석기간: {trend.get('기간', '확인 불가')}"
             ),
         ),
     ]
@@ -3474,7 +3984,72 @@ async def stat_time_compare(
     start_period/end_period를 생략하면 최근 N개 시계열의 첫 시점과 마지막
     시점을 비교한다.
     """
-    series_result = await quick_trend(query, region, years, api_key)
+    explicit_periods = bool(start_period and end_period)
+    if explicit_periods:
+        key = _resolve_key(api_key)
+        param = _lookup_quick(query)
+        if not param:
+            return {
+                "상태": "failed",
+                "코드": STATUS_STAT_NOT_FOUND,
+                "오류": f'"{query}" 사전 매핑 없음',
+                "질문": query,
+            }
+
+        canonical = _canonical_region(region) or region
+        region_code = None
+        if param.region_scheme:
+            region_code = param.region_scheme.get(canonical)
+            if not region_code:
+                return {
+                    "상태": "failed",
+                    "코드": STATUS_PERIOD_NOT_FOUND,
+                    "오류": f'지역 "{region}" 미지원',
+                    "지원_지역": list(param.region_scheme.keys()),
+                    "질문": query,
+                }
+        elif canonical != "전국":
+            return {
+                "상태": "failed",
+                "코드": STATUS_PERIOD_NOT_FOUND,
+                "오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.',
+                "지원_지역": ["전국"],
+                "질문": query,
+            }
+
+        period_type = _default_period_type(param)
+        start_bounds = _period_bounds(str(start_period or ""), period_type)
+        end_bounds = _period_bounds(str(end_period or ""), period_type)
+        fetch_start = start_bounds[0] or str(start_period or "")
+        fetch_end = end_bounds[1] or str(end_period or "")
+        fetch_low, fetch_high = sorted([fetch_start, fetch_end])
+
+        async with httpx.AsyncClient() as client:
+            data = await _fetch_series(
+                client,
+                key,
+                param,
+                region_code,
+                period_type=period_type,
+                start_year=fetch_low,
+                end_year=fetch_high,
+            )
+        if not data:
+            fallback = await _quick_trend_core(query, canonical, max(years, 5), api_key)
+            data = [
+                {"PRD_DE": row.get("시점"), "DT": row.get("값")}
+                for row in (fallback.get("시계열") or [])
+            ]
+        series_result = {
+            "통계명": param.description,
+            "지역": canonical,
+            "단위": param.unit,
+            "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data],
+            "통계표": param.tbl_nm,
+        }
+        region = canonical
+    else:
+        series_result = await quick_trend(query, region, years, api_key)
     if "오류" in series_result:
         return {
             "상태": "failed",
@@ -3510,6 +4085,8 @@ async def stat_time_compare(
             "상태": "failed",
             "코드": STATUS_PERIOD_NOT_FOUND,
             "오류": "요청한 비교 시점을 시계열에서 찾지 못했습니다.",
+            "요청_시작": start_period,
+            "요청_종료": end_period,
             "가능_시점": times,
             "질문": query,
         }
@@ -3553,10 +4130,18 @@ async def stat_time_compare(
 async def indicator_dependency_map(indicator: str) -> dict:
     """[🧭] 비중·증가율·폐업률 등 산식형 지표의 필요 통계와 검증 포인트 안내."""
     q = _compact_text(indicator)
+    subgroup_terms = [
+        ("청년", "청년"),
+        ("청소년", "청소년"),
+        ("고령", "고령층"),
+        ("노인", "고령층"),
+        ("여성", "여성"),
+        ("남성", "남성"),
+    ]
     for key, spec in FORMULA_DEPENDENCIES.items():
         aliases = [spec["canonical"], *spec.get("aliases", [])]
         if any(_compact_text(alias) in q or q in _compact_text(alias) for alias in aliases):
-            return {
+            result = {
                 "상태": "mapped",
                 "코드": STATUS_EXECUTED,
                 "입력": indicator,
@@ -3567,6 +4152,19 @@ async def indicator_dependency_map(indicator: str) -> dict:
                 "검증_포인트": spec["checks"],
                 "주의": spec["caution"],
             }
+            subgroup = next((label for term, label in subgroup_terms if term in indicator), None)
+            if subgroup and key == "unemployment_rate":
+                result["대상군"] = subgroup
+                result["부분군_적용"] = (
+                    f"{subgroup} 실업률은 같은 산식을 쓰되, 분자=실업자 수와 "
+                    f"분모=경제활동인구를 모두 {subgroup} 대상군으로 제한해야 합니다."
+                )
+                result["추천_검색어"] = [
+                    f"{subgroup} 실업률",
+                    f"{subgroup} 실업자",
+                    f"{subgroup} 경제활동인구",
+                ]
+            return result
 
     route_payload = _route_query(indicator).to_agent_payload()
     return {
@@ -3582,34 +4180,22 @@ async def indicator_dependency_map(indicator: str) -> dict:
 
 # ---- Utility ----
 
-@mcp.tool()
-async def search_kosis(
-    query: str, limit: int = 10,
-    use_routing: bool = True,
+async def _search_kosis_keywords(
+    query: str,
+    keywords: list[str],
+    limit: int,
     api_key: Optional[str] = None,
+    used_routing: bool = False,
 ) -> dict:
-    """[🔍] KOSIS 통합검색. Tier B 라우팅 사전으로 검색어를 자동 보강.
-
-    동작:
-      1. use_routing=True (기본)일 때 Tier B 사전에서 추천 검색어 추출
-      2. 추천어가 있으면 각각으로 검색해서 결과 통합
-      3. 추천어 없으면 원본 query로 검색
-
-    예: "치킨집" → Tier B가 "음식점업, 분식 및 김밥 전문점" 추천 → 두 키워드로 검색
-
-    Args:
-        query: 검색어 (자연어 가능)
-        limit: 최대 반환 결과 수
-        use_routing: Tier B 라우팅 사용 여부 (기본 True)
-    """
     key = _resolve_key(api_key)
-    keywords = [query]
-    used_routing = False
-    if use_routing:
-        hints = _routing_hints(query)
-        if hints:
-            keywords = hints[:3]
-            used_routing = True
+    keywords = [
+        keyword.strip()
+        for keyword in keywords
+        if isinstance(keyword, str) and keyword.strip()
+    ]
+    if not keywords:
+        keywords = [query]
+    keywords = list(dict.fromkeys(keywords))
 
     async with httpx.AsyncClient() as client:
         all_results = []
@@ -3672,6 +4258,43 @@ async def search_kosis(
             for r in unique[:limit]
         ],
     }
+
+
+@mcp.tool()
+async def search_kosis(
+    query: str, limit: int = 10,
+    use_routing: bool = True,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🔍] KOSIS 통합검색. Tier B 라우팅 사전으로 검색어를 자동 보강.
+
+    동작:
+      1. use_routing=True (기본)일 때 Tier B 사전에서 추천 검색어 추출
+      2. 추천어가 있으면 각각으로 검색해서 결과 통합
+      3. 추천어 없으면 원본 query로 검색
+
+    예: "치킨집" → Tier B가 "음식점업, 분식 및 김밥 전문점" 추천 → 두 키워드로 검색
+
+    Args:
+        query: 검색어 (자연어 가능)
+        limit: 최대 반환 결과 수
+        use_routing: Tier B 라우팅 사용 여부 (기본 True)
+    """
+    keywords = [query]
+    used_routing = False
+    if use_routing:
+        hints = _routing_hints(query)
+        if hints:
+            keywords = hints[:3]
+            used_routing = True
+
+    return await _search_kosis_keywords(
+        query,
+        keywords,
+        limit,
+        api_key,
+        used_routing=used_routing,
+    )
 
 
 @mcp.tool()
@@ -3851,6 +4474,33 @@ async def explore_table(
             safe_fetch("SOURCE"),
         )
 
+    meta_errors = {
+        meta_type: rows.get("오류")
+        for meta_type, rows in (
+            ("TBL", name_rows),
+            ("ITM", item_rows),
+            ("PRD", period_rows),
+            ("SOURCE", source_rows),
+        )
+        if isinstance(rows, dict) and rows.get("오류")
+    }
+    meta_counts = {
+        "TBL": len(name_rows) if isinstance(name_rows, list) else 0,
+        "ITM": len(item_rows) if isinstance(item_rows, list) else 0,
+        "PRD": len(period_rows) if isinstance(period_rows, list) else 0,
+        "SOURCE": len(source_rows) if isinstance(source_rows, list) else 0,
+    }
+    if not meta_errors and not any(meta_counts.values()):
+        return {
+            "상태": "failed",
+            "코드": STATUS_STAT_NOT_FOUND,
+            "오류": "KOSIS 메타 API가 해당 org_id/tbl_id에 대해 어떤 메타도 반환하지 않았습니다.",
+            "기관ID": org_id,
+            "통계표ID": tbl_id,
+            "조회_결과": meta_counts,
+            "권고": "기관ID와 통계표ID를 다시 확인하거나 search_kosis로 통계표를 재검색하세요.",
+        }
+
     classifications: dict[str, dict[str, Any]] = {}
     if isinstance(item_rows, list):
         for row in item_rows:
@@ -3910,6 +4560,23 @@ async def explore_table(
             "전화": first.get("DEPT_PHONE") or first.get("deptPhone"),
         }
 
+    item_list = item_rows if isinstance(item_rows, list) else []
+    items_with_units = sum(1 for row in item_list if row.get("UNIT_NM"))
+    items_with_english = sum(1 for row in item_list if row.get("ITM_NM_ENG"))
+    metadata_coverage = {
+        "통계표명": bool(table_name),
+        "통계표명_영문": bool(table_name_eng),
+        "수록기간": bool(period_summary),
+        "출처": bool(contact),
+        "분류축_개수": len(classifications),
+        "항목_개수": len(item_list),
+        "단위_있는_항목": items_with_units,
+        "영문라벨_있는_항목": items_with_english,
+        "조회_결과": meta_counts,
+    }
+    if meta_errors:
+        metadata_coverage["조회_실패"] = meta_errors
+
     result: dict[str, Any] = {
         "통계표ID": tbl_id,
         "기관ID": org_id,
@@ -3920,6 +4587,7 @@ async def explore_table(
         "period_age_years": period_age,
         "출처": contact,
         "분류축": classifications,
+        "메타_완성도": metadata_coverage,
         "출처_KOSIS_API": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD/SOURCE",
     }
 
@@ -3927,6 +4595,22 @@ async def explore_table(
         result["⚠️ 데이터_신선도"] = (
             f"이 통계표의 최신 시점은 {used_period} (약 {period_age:.1f}년 경과)"
         )
+
+    if not industry_term:
+        industry_axes = [
+            {"OBJ_ID": obj_id, "OBJ_NM": axis.get("OBJ_NM")}
+            for obj_id, axis in classifications.items()
+            if any(token in str(axis.get("OBJ_NM") or "") for token in ("산업", "업종", "분류"))
+        ]
+        if industry_axes:
+            result["industry_term_안내"] = {
+                "안내": (
+                    "industry_term을 함께 주면 해당 산업·업종 표현을 이 통계표의 ITM_ID로 "
+                    "매핑해 resolved_industry 블록에 표시합니다."
+                ),
+                "감지된_분류축": industry_axes,
+                "예시_호출": f"explore_table('{org_id}', '{tbl_id}', industry_term='제조업')",
+            }
 
     if industry_term:
         match = _resolve_classification_term(industry_term, item_rows if isinstance(item_rows, list) else [])

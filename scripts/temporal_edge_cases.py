@@ -48,6 +48,18 @@ CASES: list[dict[str, Any]] = [
         "expect": {"success": True, "region_count": 17, "period": "202603"},
     },
     {
+        "name": "quick_population_this_quarter_parsed",
+        "tool": quick_stat,
+        "args": ("인구", "전국", "이번 분기"),
+        "expect": {"status": "failed", "code": "PERIOD_NOT_FOUND"},
+    },
+    {
+        "name": "quick_housing_previous_quarter_range",
+        "tool": quick_stat,
+        "args": ("주택매매가격지수", "전국", "지난 분기"),
+        "expect": {"success": True, "period": "202603"},
+    },
+    {
         "name": "answer_sme_sales_yoy",
         "tool": answer_query,
         "args": ("중소기업 매출액 전년 대비 증가율 알려줘",),
@@ -122,7 +134,7 @@ def check(summary: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append("expected_success_but_failed")
     if expect.get("error") and not summary.get("error"):
         problems.append("expected_error_but_succeeded")
-    for key in ("status", "answer_type", "region", "period", "region_count", "compare_start", "compare_end"):
+    for key in ("status", "code", "answer_type", "region", "period", "region_count", "compare_start", "compare_end"):
         if key in expect and str(summary.get(key)) != str(expect[key]):
             problems.append(f"{key}={summary.get(key)}")
     if "min_table_rows" in expect and (summary.get("table_rows") or 0) < expect["min_table_rows"]:
