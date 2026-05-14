@@ -47,8 +47,12 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
    KOSIS 표 메타 축 매칭용 표현입니다. 후속 표 선택에는 `table_required_dimensions`
    를 사용합니다.
 6. `query_table`에는 메타데이터 기반 도구가 반환한 코드만 넣습니다.
-7. 산식은 `compute_indicator`가 생기기 전까지 챗봇이 수행하되, `analysis_tasks`
-   와 `mcp_output_contract.llm_rules`를 따라 근거와 한계를 함께 표시합니다.
+7. 산식은 `compute_indicator`에 위임합니다. `query_table.rows`를 그대로
+   `input_rows`로 넘기고, 허용된 enum(`per_capita`, `share`, `ratio`,
+   `growth_rate`, `cagr`, `yoy_pct`, `yoy_diff`, `sum_additive_rows`)만
+   사용합니다. 단위 변환·가법성 판단은 caller가 책임지며 응답 markers
+   (`denominator_zero`, `period_or_group_mismatch`, `additivity_caller_asserted`,
+   `partial_computation`)로 한계를 표시합니다.
 
 ## 응답 계약
 

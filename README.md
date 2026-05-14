@@ -371,7 +371,7 @@ Gemma 4 26B처럼 로컬 LLM을 MCP 클라이언트로 쓸 때는 답을 한 번
 2. `select_table_for_query` — 필요한 분류축을 만족하는 통계표 후보를 KOSIS 메타데이터 기반으로 고릅니다.
 3. `resolve_concepts` — "서울", "30대", "여성", "광역시" 같은 개념을 선택된 표의 코드 후보로 바꿉니다.
 4. `query_table` — `explore_table` 메타로 검증된 `{OBJ_ID: [ITM_ID...]}` 필터를 받아 raw rows를 반환합니다. 합산·평균·비율·해석은 하지 않고 `aggregation: "none"`을 명시합니다.
-5. `compute_indicator` — 계획된 다음 단계입니다. `per_capita`, `share`, `ratio`, `growth_rate` 같은 허용된 산식 enum만 계산하는 역할이며 후속 PR에서 추가될 예정입니다.
+5. `compute_indicator` — `query_table.rows`를 받아 허용된 산식 enum(`per_capita`, `share`, `ratio`, `growth_rate`, `cagr`, `yoy_pct`, `yoy_diff`, `sum_additive_rows`)만 계산합니다. 단위 변환·가법성 판단·지표 정의는 caller(LLM) 책임이며, 응답 markers(`denominator_zero`, `period_or_group_mismatch`, `additivity_caller_asserted` 등)로 한계를 드러냅니다.
 
 기존 고속 경로도 유지됩니다:
 
