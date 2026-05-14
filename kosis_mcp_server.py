@@ -4000,8 +4000,10 @@ def _candidate_indicator_score(candidate: dict[str, Any]) -> int:
 
 def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]]) -> None:
     for candidate in candidates:
+        indicator_score = _candidate_indicator_score(candidate)
         features = {
-            "indicator_score": _candidate_indicator_score(candidate),
+            "indicator_score": indicator_score,
+            "indicator_score_band": indicator_score // 3,
             "latest_period_year": _candidate_latest_period_year(candidate),
             "cadence_diversity": _candidate_cadence_diversity(candidate),
             "item_count": _candidate_item_count(candidate),
@@ -4013,8 +4015,9 @@ def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
     features = candidate.get("ranking_features") or {}
     return (
         candidate.get("status") != "selected",
-        -int(features.get("indicator_score") or 0),
+        -int(features.get("indicator_score_band") or 0),
         -int(features.get("latest_period_year") or 0),
+        -int(features.get("indicator_score") or 0),
         -int(features.get("cadence_diversity") or 0),
         -int(features.get("item_count") or 0),
         -int(candidate.get("score") or 0),
@@ -4025,6 +4028,7 @@ def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
 def _table_selection_reasons(selected: dict[str, Any], selected_candidates: list[dict[str, Any]]) -> list[str]:
     features = selected.get("ranking_features") or {}
     indicator_score = int(features.get("indicator_score") or 0)
+    indicator_score_band = int(features.get("indicator_score_band") or 0)
     latest_year = int(features.get("latest_period_year") or 0)
     cadence_count = int(features.get("cadence_diversity") or 0)
     item_count = int(features.get("item_count") or 0)
@@ -4032,13 +4036,20 @@ def _table_selection_reasons(selected: dict[str, Any], selected_candidates: list
         candidate for candidate in selected_candidates
         if int((candidate.get("ranking_features") or {}).get("indicator_score") or 0) == indicator_score
     ]
+    near_tied_indicator = [
+        candidate for candidate in selected_candidates
+        if int((candidate.get("ranking_features") or {}).get("indicator_score_band") or 0) == indicator_score_band
+    ]
     freshest_tied = max(
-        (int((candidate.get("ranking_features") or {}).get("latest_period_year") or 0) for candidate in tied_indicator),
+        (int((candidate.get("ranking_features") or {}).get("latest_period_year") or 0) for candidate in near_tied_indicator),
         default=0,
     )
-    reasons = [f"indicator_score={indicator_score} (tied with {max(0, len(tied_indicator) - 1)} others)"]
+    reasons = [
+        f"indicator_score={indicator_score} (exact-tied with {max(0, len(tied_indicator) - 1)} others)",
+        f"indicator_score_band={indicator_score_band} (near-tied with {max(0, len(near_tied_indicator) - 1)} others)",
+    ]
     if latest_year:
-        suffix = "freshest among tied" if latest_year >= freshest_tied else "not freshest among tied"
+        suffix = "freshest among near-tied candidates" if latest_year >= freshest_tied else "not freshest among near-tied candidates"
         reasons.append(f"latest_period_year={latest_year} ({suffix})")
     if cadence_count:
         reasons.append(f"cadence_diversity={cadence_count}")
@@ -4067,6 +4078,14 @@ def _indicator_meta_match_score(raw: str, label: Any, field_name: str) -> int:
     text = _compact_text(str(label or ""))
     if not target or not text:
         return 0
+    raw_text = str(raw or "").strip()
+    label_text = str(label or "")
+    if re.fullmatch(r"[A-Za-z]{2,6}", raw_text):
+        acronym = re.escape(raw_text)
+        if re.search(rf"\(\s*{acronym}\s*\)", label_text, re.IGNORECASE):
+            return 98 if field_name == "ITM_NM" else 78
+        if re.search(rf"(?<![A-Za-z가-힣]){acronym}(?![A-Za-z가-힣])", label_text, re.IGNORECASE):
+            return 96 if field_name == "ITM_NM" else 76
     if target == text:
         return 100
     if target in text:
@@ -4080,6 +4099,7 @@ async def _normalize_indicator_from_kosis_meta(
     user_input: Any,
     api_key: Optional[str] = None,
     *,
+    search_queries: Optional[list[str]] = None,
     search_limit: int = 6,
     table_limit: int = 4,
 ) -> dict[str, Any]:
@@ -4105,23 +4125,41 @@ async def _normalize_indicator_from_kosis_meta(
             }
         raise
 
-    try:
-        search_payload = await search_kosis(raw, limit=search_limit, use_routing=False, api_key=key)
-    except Exception as exc:
+    query_inputs = [
+        term.strip()
+        for term in [raw, *(search_queries or [])]
+        if isinstance(term, str) and term.strip()
+    ]
+    query_inputs = list(dict.fromkeys(query_inputs))[:4]
+    rows: list[dict[str, Any]] = []
+    search_failures: list[dict[str, Any]] = []
+    for query_input in query_inputs:
+        try:
+            search_payload = await search_kosis(query_input, limit=search_limit, use_routing=False, api_key=key)
+            for result_rank, result_row in enumerate(_search_result_rows(search_payload)[:table_limit]):
+                rows.append({
+                    **result_row,
+                    "_normalization_query": query_input,
+                    "_normalization_query_rank": query_inputs.index(query_input),
+                    "_normalization_result_rank": result_rank,
+                })
+        except Exception as exc:
+            search_failures.append({"query": query_input, "error": str(exc)})
+    if not rows and search_failures:
         return {
             **base,
             "source": "metadata_unavailable",
             "status": "search_failed",
-            "reason": str(exc),
+            "reason": search_failures[0]["error"],
+            "search_failures": search_failures,
         }
-
-    rows = _search_result_rows(search_payload)
     matches: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=8.0) as client:
-        for row in rows[:table_limit]:
+        for row in rows:
             org_id = _row_first(row, ["기관ID", "湲곌?ID", "ORG_ID", "org_id"])
             tbl_id = _row_first(row, ["통계표ID", "?듦퀎?쏧D", "TBL_ID", "tbl_id"])
             table_name = _row_first(row, ["통계표명", "?듦퀎?쒕챸", "TBL_NM", "table_name"])
+            query_used = str(row.get("_normalization_query") or raw)
             if not org_id or not tbl_id:
                 continue
             try:
@@ -4134,18 +4172,33 @@ async def _normalize_indicator_from_kosis_meta(
                 label = item.get("ITM_NM") or item.get("label")
                 label_en = item.get("ITM_NM_ENG") or item.get("label_en")
                 scored = [
-                    ("ITM_NM", label, _indicator_meta_match_score(raw, label, "ITM_NM")),
-                    ("ITM_NM_ENG", label_en, _indicator_meta_match_score(raw, label_en, "ITM_NM_ENG")),
+                    ("ITM_NM", label, max(
+                        _indicator_meta_match_score(raw, label, "ITM_NM"),
+                        _indicator_meta_match_score(query_used, label, "ITM_NM"),
+                    )),
+                    ("ITM_NM_ENG", label_en, max(
+                        _indicator_meta_match_score(raw, label_en, "ITM_NM_ENG"),
+                        _indicator_meta_match_score(query_used, label_en, "ITM_NM_ENG"),
+                    )),
                 ]
                 field_name, matched_value, score = max(scored, key=lambda part: part[2])
                 if score <= 0:
                     continue
+                table_name_score = max(
+                    _indicator_meta_match_score(raw, table_name, "TBL_NM"),
+                    _indicator_meta_match_score(query_used, table_name, "TBL_NM"),
+                )
+                adjusted_score = score + min(5, table_name_score // 20)
                 matches.append({
                     "canonical_name": str(label or matched_value),
-                    "score": score,
+                    "score": adjusted_score,
+                    "raw_match_score": score,
                     "matched_field": field_name,
                     "matched_value": matched_value,
-                    "match_evidence": f"{field_name} contains {raw!r}",
+                    "match_evidence": f"{field_name} contains {query_used!r}",
+                    "normalization_query": query_used,
+                    "normalization_query_rank": row.get("_normalization_query_rank"),
+                    "normalization_result_rank": row.get("_normalization_result_rank"),
                     "org_id": str(org_id),
                     "tbl_id": str(tbl_id),
                     "table_name": table_name,
@@ -4158,14 +4211,23 @@ async def _normalize_indicator_from_kosis_meta(
             **base,
             "candidate_count": 0,
             "search_result_count": len(rows),
+            "search_queries_used": query_inputs,
         }
-    matches.sort(key=lambda item: (-int(item["score"]), len(_compact_text(item["canonical_name"])), item["canonical_name"]))
+    matches.sort(key=lambda item: (
+        -int(item["score"]),
+        0 if re.search(rf"\(\s*{re.escape(raw)}\s*\)", str(item["canonical_name"]), re.IGNORECASE) else 1,
+        int(item.get("normalization_query_rank") or 0),
+        int(item.get("normalization_result_rank") or 0),
+        len(_compact_text(item["canonical_name"])),
+        item["canonical_name"],
+    ))
     best = matches[0]
     alternatives = [
         {
             "name": item["canonical_name"],
             "match_evidence": item["match_evidence"],
             "score": item["score"],
+            "normalization_query": item.get("normalization_query"),
             "tbl_id": item["tbl_id"],
             "itm_id": item.get("itm_id"),
         }
@@ -4178,6 +4240,7 @@ async def _normalize_indicator_from_kosis_meta(
         "match_evidence": best["match_evidence"],
         "matched_field": best["matched_field"],
         "matched_value": best["matched_value"],
+        "normalization_query": best.get("normalization_query"),
         "alternatives": alternatives,
         "org_id": best["org_id"],
         "tbl_id": best["tbl_id"],
@@ -4186,6 +4249,7 @@ async def _normalize_indicator_from_kosis_meta(
         "unit": best.get("unit"),
         "candidate_count": len(matches),
         "search_result_count": len(rows),
+        "search_queries_used": query_inputs,
     }
 
 
@@ -4271,6 +4335,10 @@ async def _enrich_plan_with_metadata(
 
     route = plan.get("route") or {}
     route_concepts = route.get("matched_concepts") or []
+    route_search_terms = [
+        term for term in (route.get("search_terms") or [])
+        if isinstance(term, str) and term.strip()
+    ]
     initial_metric_count = len(metrics)
     blocked_metric_keys = {
         _metric_name_key(item.get("name"))
@@ -4280,7 +4348,14 @@ async def _enrich_plan_with_metadata(
     for concept in route_concepts:
         if not isinstance(concept, str) or not concept.strip():
             continue
-        normalization = await normalize_once(concept)
+        if route_search_terms:
+            normalization = await _normalize_indicator_from_kosis_meta(
+                concept,
+                api_key=api_key,
+                search_queries=route_search_terms,
+            )
+        else:
+            normalization = await normalize_once(concept)
         metric_name = normalization.get("normalized") if normalization.get("source") == "kosis_meta_match" else concept
         if not metric_name:
             continue
@@ -4804,11 +4879,12 @@ async def select_table_for_query(
         "alternatives": candidates[:limit],
         "rejected": [c for c in candidates if c.get("status") != "selected"][:limit],
         "ranking_criteria": [
-            {"order": 1, "field": "indicator_score", "applied": True},
+            {"order": 1, "field": "indicator_score_band", "applied": True},
             {"order": 2, "field": "latest_period_year", "applied": True},
-            {"order": 3, "field": "cadence_diversity", "applied": True},
-            {"order": 4, "field": "item_count", "applied": True},
-            {"order": 5, "field": "score", "applied": True},
+            {"order": 3, "field": "indicator_score", "applied": True},
+            {"order": 4, "field": "cadence_diversity", "applied": True},
+            {"order": 5, "field": "item_count", "applied": True},
+            {"order": 6, "field": "score", "applied": True},
         ],
         "warnings": warnings,
         "mcp_output_contract": _mcp_tool_output_contract(

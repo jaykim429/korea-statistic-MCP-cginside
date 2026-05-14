@@ -394,7 +394,7 @@ async def test_missing_api_key_returns_structured_payload() -> None:
     assert result["mcp_output_contract"]["current_signals"]["has_failures"] is True, result
 
 
-async def test_select_table_prefers_fresh_candidate_on_indicator_tie() -> None:
+async def test_select_table_prefers_fresh_candidate_on_indicator_near_tie() -> None:
     original_search = kosis_mcp_server.search_kosis
     original_fetch_meta = kosis_mcp_server._fetch_meta
 
@@ -409,9 +409,11 @@ async def test_select_table_prefers_fresh_candidate_on_indicator_tie() -> None:
 
     async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
         if kind == "TBL":
-            return [{"TBL_NM": "소비자물가지수"}]
+            name = "소비자물가지수 오래된 표" if tbl_id == "OLD" else "소비자물가지수 최신 표"
+            return [{"TBL_NM": name}]
         if kind == "ITM":
-            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": "소비자물가지수"}]
+            label = "소비자물가지수" if tbl_id == "OLD" else "전체"
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": label}]
         if kind == "PRD":
             latest = "2023" if tbl_id == "NEW" else "2015"
             return [{"PRD_SE": "Y", "STRT_PRD_DE": "2010", "END_PRD_DE": latest}]
@@ -430,9 +432,79 @@ async def test_select_table_prefers_fresh_candidate_on_indicator_tie() -> None:
         kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
 
     assert result["selected"]["tbl_id"] == "NEW", result
+    assert result["selected"]["ranking_features"]["indicator_score"] == 3, result
+    assert result["alternatives"][1]["ranking_features"]["indicator_score"] == 5, result
     assert result["selected"]["ranking_features"]["latest_period_year"] == 2023, result
     assert result["ranking_criteria"][1]["field"] == "latest_period_year", result
     assert any("freshest" in reason for reason in result["selected"]["selection_reasons"]), result
+
+
+async def test_indicator_normalization_prefers_parenthetical_acronym() -> None:
+    original_search = kosis_mcp_server.search_kosis
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_search(term: str, limit: int = 10, use_routing: bool = True, api_key: Any = None) -> dict[str, Any]:
+        return {
+            "결과": [
+                {"통계표명": "GDP 디플레이터", "통계표ID": "DEF", "기관ID": "101"},
+                {"통계표명": "국내총생산", "통계표ID": "GDP", "기관ID": "101"},
+            ],
+            "Tier_A_직접_매핑": None,
+        }
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "ITM" and tbl_id == "DEF":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "D1", "ITM_NM": "GDP디플레이터"}]
+        if kind == "ITM" and tbl_id == "GDP":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "G1", "ITM_NM": "국내총생산(GDP)"}]
+        return []
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server._normalize_indicator_from_kosis_meta("GDP", api_key="dummy")
+    finally:
+        kosis_mcp_server.search_kosis = original_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["normalized"] == "국내총생산(GDP)", result
+    assert result["matched_field"] == "ITM_NM", result
+    assert result["alternatives"][0]["name"] == "GDP디플레이터", result
+
+
+async def test_indicator_normalization_uses_route_search_terms() -> None:
+    original_search = kosis_mcp_server.search_kosis
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_search(term: str, limit: int = 10, use_routing: bool = True, api_key: Any = None) -> dict[str, Any]:
+        if term == "월평균임금":
+            rows = [{"통계표명": "임금 현황", "통계표ID": "AVG", "기관ID": "101"}]
+        else:
+            rows = [{"통계표명": "임금 형태", "통계표ID": "TYPE", "기관ID": "101"}]
+        return {"결과": rows, "Tier_A_직접_매핑": None}
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "ITM" and tbl_id == "TYPE":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": "월급제"}]
+        if kind == "ITM" and tbl_id == "AVG":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "A1", "ITM_NM": "월평균임금"}]
+        return []
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server._normalize_indicator_from_kosis_meta(
+            "월급",
+            api_key="dummy",
+            search_queries=["월평균임금"],
+        )
+    finally:
+        kosis_mcp_server.search_kosis = original_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["normalized"] == "월평균임금", result
+    assert result["normalization_query"] == "월평균임금", result
+    assert result["alternatives"][0]["name"] == "월급제", result
 
 
 async def test_plan_query_indicator_normalization_from_kosis_meta() -> None:
@@ -612,7 +684,9 @@ async def main() -> None:
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
         ("quick_schema_no_unsupported", lambda: test_quick_tool_schemas_do_not_require_unsupported()),
         ("missing_key_structured", lambda: test_missing_api_key_returns_structured_payload()),
-        ("select_table_freshness_tiebreak", lambda: test_select_table_prefers_fresh_candidate_on_indicator_tie()),
+        ("select_table_freshness_near_tiebreak", lambda: test_select_table_prefers_fresh_candidate_on_indicator_near_tie()),
+        ("indicator_normalization_parenthetical_acronym", lambda: test_indicator_normalization_prefers_parenthetical_acronym()),
+        ("indicator_normalization_route_terms", lambda: test_indicator_normalization_uses_route_search_terms()),
         ("plan_indicator_normalization", lambda: test_plan_query_indicator_normalization_from_kosis_meta()),
         ("plan_change_inference_log", lambda: test_plan_query_change_implication_inference_log()),
         ("resolve_ambiguity_reason", lambda: test_resolve_concepts_ambiguity_best_selection_reason()),
