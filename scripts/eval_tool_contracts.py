@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import sys
+from pathlib import Path
+from typing import Any
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import kosis_mcp_server
+from kosis_analysis.metadata import (
+    MetadataCompatibilityScorer,
+    TableMetadataProfile,
+    _fanout_coverage_report,
+)
+
+
+def test_fanout_partial_coverage() -> None:
+    fanout_filters = [
+        {"A": ["00"], "ITEM": ["T1"]},
+        {"A": ["11"], "ITEM": ["T1"]},
+        {"A": ["21"], "ITEM": ["T1"]},
+    ]
+    row_groups = [
+        [{"DT": "1"}],
+        [],
+        [],
+    ]
+    report = _fanout_coverage_report(fanout_filters, row_groups)
+    assert report["call_count"] == 3, report
+    assert report["successful_calls"] == 1, report
+    assert report["empty_results"] == 2, report
+    assert report["coverage_ratio"] == 0.3333, report
+    assert report["partial_coverage"] is True, report
+    assert report["missing_codes_by_axis"]["A"] == ["11", "21"], report
+
+
+def test_indicator_evidence_required_when_indicator_supplied() -> None:
+    profile = TableMetadataProfile.from_rows(
+        "101",
+        "TBL_FAKE",
+        {"통계표명": "지가변동률"},
+        [{"TBL_NM": "지가변동률"}],
+        [
+            {"OBJ_ID": "A", "OBJ_NM": "지역별", "ITM_ID": "00", "ITM_NM": "전국"},
+        ],
+        [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}],
+    )
+    result = MetadataCompatibilityScorer(["region"], indicator="행복지수").evaluate(profile).to_response()
+    assert result["status"] == "not_matched_indicator", result
+    assert result["compatibility"]["verification_level"] == "not_matched", result
+    assert result["compatibility"]["not_matched_reason"] == "indicator_evidence_empty", result
+
+
+def test_indicator_evidence_not_required_for_axis_only_exploration() -> None:
+    profile = TableMetadataProfile.from_rows(
+        "101",
+        "TBL_FAKE",
+        {"통계표명": "지역 통계"},
+        [{"TBL_NM": "지역 통계"}],
+        [
+            {"OBJ_ID": "A", "OBJ_NM": "지역별", "ITM_ID": "00", "ITM_NM": "전국"},
+        ],
+        [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}],
+    )
+    result = MetadataCompatibilityScorer(["region"], indicator=None).evaluate(profile).to_response()
+    assert result["status"] == "selected", result
+
+
+async def test_search_kosis_preserves_original_query() -> None:
+    calls: list[str] = []
+    original_hints = kosis_mcp_server._routing_hints
+    original_call = kosis_mcp_server._kosis_call
+
+    def fake_hints(query: str) -> list[str]:
+        assert query == "청년 실업률"
+        return ["청년 고용률", "청년 취업자"]
+
+    async def fake_call(client: Any, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        calls.append(str(params.get("searchNm")))
+        return []
+
+    try:
+        kosis_mcp_server._routing_hints = fake_hints  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_kosis("청년 실업률", use_routing=True, api_key="dummy")
+    finally:
+        kosis_mcp_server._routing_hints = original_hints  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    assert calls[:3] == ["청년 실업률", "청년 고용률", "청년 취업자"], calls
+    assert result["search_terms_used"][:3] == ["청년 실업률", "청년 고용률", "청년 취업자"], result
+    assert result["original_query_preserved"] is True, result
+
+
+async def main() -> None:
+    tests = [
+        ("fanout_partial_coverage", lambda: test_fanout_partial_coverage()),
+        ("indicator_evidence_required", lambda: test_indicator_evidence_required_when_indicator_supplied()),
+        ("axis_only_exploration", lambda: test_indicator_evidence_not_required_for_axis_only_exploration()),
+        ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
+    ]
+    passed = 0
+    for name, fn in tests:
+        result = fn()
+        if asyncio.iscoroutine(result):
+            await result
+        print(f"{name}: PASS")
+        passed += 1
+    print(f"SUMMARY {passed}/{len(tests)} PASS")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

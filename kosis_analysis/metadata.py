@@ -323,7 +323,14 @@ class MetadataCompatibilityResult:
                 "missing_dimensions": self.missing_dimensions,
                 "indicator_score": self.indicator_score,
                 "verification_level": (
-                    "metadata_verified" if not self.missing_dimensions else "metadata_partial"
+                    "not_matched"
+                    if self.status == "not_matched_indicator"
+                    else "metadata_verified" if not self.missing_dimensions else "metadata_partial"
+                ),
+                "not_matched_reason": (
+                    "indicator_evidence_empty"
+                    if self.status == "not_matched_indicator"
+                    else None
                 ),
             },
         }
@@ -346,11 +353,12 @@ class MetadataCompatibilityScorer:
         matched, missing, axis_evidence = profile.dimension_coverage(self.required_dimensions)
         indicator_score, indicator_hits = profile.indicator_evidence(self.indicator)
         score = indicator_score + len(matched) * 5 - len(missing) * 6
-        status = (
-            "selected"
-            if not missing or not self.reject_if_missing_dimensions
-            else "rejected_missing_dimensions"
-        )
+        if self.indicator and indicator_score <= 0:
+            status = "not_matched_indicator"
+        elif missing and self.reject_if_missing_dimensions:
+            status = "rejected_missing_dimensions"
+        else:
+            status = "selected"
         return MetadataCompatibilityResult(
             profile=profile,
             status=status,
@@ -573,6 +581,56 @@ def _fanout_filter_sets(filters: dict[str, list[str]]) -> list[dict[str, list[st
         {axis: [code] for axis, code in zip(axes, combo)}
         for combo in product(*code_groups)
     ]
+
+
+def _fanout_coverage_report(
+    fanout_filters: list[dict[str, list[str]]],
+    row_groups: list[Any],
+) -> dict[str, Any]:
+    """Summarize whether each fan-out request returned data.
+
+    The report is intentionally based only on requested filter sets and returned
+    row counts, not on any domain-specific code list. That makes partial
+    coverage visible for every table/dimension combination without hardcoding.
+    """
+    call_details: list[dict[str, Any]] = []
+    missing_filter_sets: list[dict[str, list[str]]] = []
+    missing_codes_by_axis: dict[str, list[str]] = {}
+    successful_calls = 0
+
+    for filter_set, group in zip(fanout_filters, row_groups):
+        row_count = len(group) if isinstance(group, list) else 0
+        status = "returned_rows" if row_count > 0 else "empty_result"
+        if row_count > 0:
+            successful_calls += 1
+        else:
+            missing_filter_sets.append(filter_set)
+            for axis, codes in filter_set.items():
+                bucket = missing_codes_by_axis.setdefault(axis, [])
+                for code in codes:
+                    if code not in bucket:
+                        bucket.append(code)
+        call_details.append({
+            "filters": filter_set,
+            "row_count": row_count,
+            "status": status,
+        })
+
+    call_count = len(fanout_filters)
+    empty_results = max(0, call_count - successful_calls)
+    coverage_ratio = (successful_calls / call_count) if call_count else 1.0
+    partial_coverage = call_count > 1 and 0 < successful_calls < call_count
+    return {
+        "call_count": call_count,
+        "successful_calls": successful_calls,
+        "empty_results": empty_results,
+        "coverage_ratio": round(coverage_ratio, 4),
+        "partial_coverage": partial_coverage,
+        "complete_miss": bool(call_count and successful_calls == 0),
+        "missing_filter_sets": missing_filter_sets,
+        "missing_codes_by_axis": missing_codes_by_axis,
+        "call_details": call_details,
+    }
 
 
 def _to_number(value: Any) -> Optional[float]:

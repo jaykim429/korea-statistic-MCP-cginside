@@ -54,6 +54,7 @@ from kosis_analysis.metadata import (
     _build_axis_codebook,
     _compact_text,
     _concept_match_score,
+    _fanout_coverage_report,
     _fanout_filter_sets,
     _infer_required_dimensions_from_query,
     _normalize_query_table_rows,
@@ -149,6 +150,56 @@ def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]
         "If this response is partial, unsupported, or a search plan, report that limitation instead of filling gaps from model knowledge.",
     ])
     return result
+
+
+def _mcp_tool_output_contract(
+    *,
+    role: str,
+    final_answer_expected: bool,
+    markers: Optional[list[str]] = None,
+    explanation: Optional[str] = None,
+    extra_signals: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Machine-readable contract shared by non-planner MCP tool outputs."""
+    clean_markers = list(dict.fromkeys(markers or []))
+    has_failures = any(marker in {
+        "unsupported",
+        "not_matched",
+        "missing_metrics",
+        "validation_errors",
+        "partial_fanout_coverage",
+        "empty_rows",
+    } for marker in clean_markers)
+    current_signals = {
+        "has_failures": has_failures,
+        "has_caveats": bool(clean_markers),
+        "markers_present": clean_markers,
+        "explanation": explanation or (
+            "Tool output contains caveats; inspect markers before synthesizing."
+            if clean_markers else "No immediate tool-output caveats detected."
+        ),
+    }
+    if extra_signals:
+        current_signals.update(extra_signals)
+    return {
+        "role": role,
+        "final_answer_expected": final_answer_expected,
+        "machine_readable_status": True,
+        "current_signals": current_signals,
+        "llm_rules": [
+            "Do not hide unsupported, not_matched, empty_rows, validation_errors, or partial_fanout_coverage markers.",
+            "If coverage_ratio is below 1.0, disclose partial coverage before using the returned rows.",
+            "Do not fill missing rows from model knowledge.",
+        ],
+        "failure_markers": [
+            "unsupported",
+            "not_matched",
+            "validation_errors",
+            "partial_fanout_coverage",
+            "empty_rows",
+            "coverage_ratio",
+        ],
+    }
 
 FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
     "share_ratio": {
@@ -3725,6 +3776,8 @@ async def _search_kosis_keywords(
         "입력": query,
         "라우팅_사용": used_routing,
         "사용된_검색어": keywords,
+        "search_terms_used": keywords,
+        "original_query_preserved": bool(keywords and keywords[0] == query),
         "결과수": len(unique),
         "Tier_A_직접_매핑": tier_a_hint,
         "결과": [
@@ -3766,7 +3819,7 @@ async def search_kosis(
     if use_routing:
         hints = _routing_hints(query)
         if hints:
-            keywords = hints[:3]
+            keywords = [query, *hints[:3]]
             used_routing = True
 
     return await _search_kosis_keywords(
@@ -4037,6 +4090,11 @@ async def select_table_for_query(
         warnings.append(
             "required_dimensions is empty; table selection can only use search/routing evidence and cannot verify axis coverage."
         )
+    selection_markers: list[str] = []
+    if not selected:
+        selection_markers.append("not_matched")
+    if any(c.get("status") == "not_matched_indicator" for c in candidates):
+        selection_markers.append("indicator_evidence_empty")
     return {
         "상태": "selected" if selected else "needs_table_selection",
         "status": "selected" if selected else "needs_table_selection",
@@ -4051,6 +4109,23 @@ async def select_table_for_query(
         "alternatives": candidates[:limit],
         "rejected": [c for c in candidates if c.get("status") != "selected"][:limit],
         "warnings": warnings,
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="table_selection",
+            final_answer_expected=False,
+            markers=selection_markers,
+            explanation=(
+                "No candidate satisfied both metadata dimensions and indicator evidence."
+                if not selected else
+                "Some candidates were rejected because indicator evidence was empty."
+                if "indicator_evidence_empty" in selection_markers else
+                "A metadata-compatible table candidate was selected."
+            ),
+            extra_signals={
+                "selected_count": len(selected),
+                "candidate_count": len(candidates),
+                "indicator_required": bool(indicator),
+            },
+        ),
         "주의": [
             "select_table_for_query는 표 후보와 축 충족 여부만 판단합니다.",
             "required_dimensions가 비어 있으면 축 충족 검증이 약해집니다. 가능하면 LLM이 필요한 차원을 명시하세요.",
@@ -4354,12 +4429,12 @@ async def query_table(
                 )
                 for filter_set in fanout_filters
             ])
-            rows = [row for group in row_groups for row in (group if isinstance(group, list) else [])]
             for filter_set, group in zip(fanout_filters, row_groups):
                 if isinstance(group, list):
                     normalized_rows_from_fanout.extend(
                         _normalize_query_table_rows(group, filter_set, axes, axis_order)
                     )
+            fanout_report = _fanout_coverage_report(fanout_filters, row_groups)
         except Exception as exc:
             return {
                 "상태": "failed",
@@ -4395,6 +4470,11 @@ async def query_table(
         "비율·지수·평균·증감률 지표는 합산하면 통계적으로 의미가 없을 수 있습니다."
         if aggregation == "sum_by_group" else None
     )
+    contract_markers: list[str] = []
+    if fanout_report.get("partial_coverage"):
+        contract_markers.append("partial_fanout_coverage")
+    if not normalized_rows:
+        contract_markers.append("empty_rows")
     result = {
         "상태": "executed",
         "status": "executed",
@@ -4421,7 +4501,7 @@ async def query_table(
         "auto_default_period_range": auto_default_period_range,
         "fanout": {
             "enabled": any(len(codes) > 1 for codes in normalized_filters.values()),
-            "call_count": len(_fanout_filter_sets(normalized_filters)),
+            **fanout_report,
             "reason": "KOSIS multi-code parameters can fail with code 21, so the server uses verified single-code calls.",
         },
         "rows": normalized_rows,
@@ -4449,6 +4529,23 @@ async def query_table(
             *( [aggregation_warning] if aggregation_warning else [] ),
             "confidence describes mapping and call-condition verification, not statistical data quality.",
         ],
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="raw_extraction",
+            final_answer_expected=False,
+            markers=contract_markers,
+            explanation=(
+                "Some fan-out calls returned no rows; disclose partial coverage before using the data."
+                if "partial_fanout_coverage" in contract_markers else
+                "No rows were returned for the verified filters and period."
+                if "empty_rows" in contract_markers else
+                "Raw rows returned for the verified filters and period."
+            ),
+            extra_signals={
+                "coverage_ratio": fanout_report.get("coverage_ratio"),
+                "successful_calls": fanout_report.get("successful_calls"),
+                "empty_results": fanout_report.get("empty_results"),
+            },
+        ),
     }
     result.update({key: value for key, value in nature.items() if value is not None})
     return result
