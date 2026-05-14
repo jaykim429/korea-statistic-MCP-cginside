@@ -310,6 +310,46 @@ async def test_compute_indicator_share_uses_input_total() -> None:
     assert result["mcp_output_contract"]["current_signals"]["additivity_caller_asserted"] is True, result
 
 
+async def test_compute_indicator_share_groups_input_total_by_period() -> None:
+    rows = [
+        _make_row("2023", "10", "11", "서울"),
+        _make_row("2023", "30", "21", "부산"),
+        _make_row("2024", "20", "11", "서울"),
+        _make_row("2024", "20", "21", "부산"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="share", input_rows=rows)
+    assert result["status"] == "ok", result
+    values = {
+        (row["period"], row["dimensions"]["A"]["code"]): row["value"]
+        for row in result["results"]
+    }
+    assert values[("2023", "11")] == 25.0, result
+    assert values[("2023", "21")] == 75.0, result
+    assert values[("2024", "11")] == 50.0, result
+    assert values[("2024", "21")] == 50.0, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "share_total_grouped_by_period" in markers, markers
+    assert result["computation_metadata"]["share_denominator_grouping"]["grouping"] == "period", result
+
+
+async def test_compute_indicator_duplicate_denominator_key_is_not_silent() -> None:
+    numerator = [_make_row("2023", "100", "11", "서울")]
+    denominator = [
+        _make_row("2023", "10", "11", "서울", item_code="POP", item_label="인구"),
+        _make_row("2023", "20", "11", "서울", item_code="POP", item_label="인구"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(
+        operation="ratio",
+        input_rows=numerator,
+        denominator_rows=denominator,
+        match_keys=["A"],
+    )
+    assert result["status"] == "invalid_input", result
+    assert any(item["reason"] == "duplicate_denominator_key" for item in result["unmatched"]), result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "duplicate_denominator_key" in markers, markers
+
+
 async def test_compute_indicator_yoy_pct_matches_intra_year() -> None:
     rows = [
         _make_row("202301", "100", "11", "서울"),
@@ -772,6 +812,44 @@ async def test_query_table_period_error_has_contract_and_format_guidance() -> No
     assert "period_type_mismatch" in markers, markers
 
 
+async def test_query_table_rejects_unparsed_period_text() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "yearly table"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "item", "ITM_ID": "T1", "ITM_NM": "metric"},
+                {"OBJ_ID": "A", "OBJ_NM": "region", "ITM_ID": "11", "ITM_NM": "Seoul"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}]
+        return []
+
+    async def fake_call(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        raise AssertionError("raw KOSIS call should not run for invalid period format")
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_FAKE",
+            filters={"ITEM": ["T1"], "A": ["11"]},
+            period_range=["작년", "작년"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    assert result["code"] == "INVALID_PERIOD_FORMAT", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "invalid_period_format" in markers, markers
+
+
 async def test_query_table_projection_data_marker() -> None:
     original_fetch_meta = kosis_mcp_server._fetch_meta
     original_call = kosis_mcp_server._kosis_call
@@ -809,6 +887,49 @@ async def test_query_table_projection_data_marker() -> None:
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "projection_data" in markers, markers
     assert result["mcp_output_contract"]["current_signals"]["data_nature"] == "projection", result
+
+
+async def test_query_table_aggregation_dropped_rows_are_marked() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "aggregation table"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "item", "ITM_ID": "T1", "ITM_NM": "metric"},
+                {"OBJ_ID": "A", "OBJ_NM": "region", "ITM_ID": "11", "ITM_NM": "Seoul"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}]
+        return []
+
+    async def fake_call(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        return [
+            {"PRD_DE": "2024", "DT": "10", "ITM_ID": "T1", "C1": "11"},
+            {"PRD_DE": "2024", "DT": "-", "ITM_ID": "T1", "C1": "11"},
+        ]
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_AGG",
+            filters={"ITEM": ["T1"], "A": ["11"]},
+            period_range=["2024", "2024"],
+            aggregation="sum_by_group",
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "aggregation_dropped_rows" in markers, markers
+    assert "non_numeric_aggregation_input" in markers, markers
+    assert result["aggregation_report"]["dropped_row_count"] == 1, result
 
 
 async def test_query_table_fanout_limit_rejects_before_raw_call() -> None:
@@ -891,6 +1012,8 @@ async def main() -> None:
         ("compute_per_capita_denominator_zero", lambda: test_compute_indicator_per_capita_with_denominator_zero()),
         ("compute_unit_transformation", lambda: test_compute_indicator_unit_transformation_requires_caller_label()),
         ("compute_share_input_total", lambda: test_compute_indicator_share_uses_input_total()),
+        ("compute_share_period_grouping", lambda: test_compute_indicator_share_groups_input_total_by_period()),
+        ("compute_duplicate_denominator", lambda: test_compute_indicator_duplicate_denominator_key_is_not_silent()),
         ("compute_yoy_pct_intra_year", lambda: test_compute_indicator_yoy_pct_matches_intra_year()),
         ("compute_unknown_operation", lambda: test_compute_indicator_unknown_operation_is_rejected()),
         ("compute_korean_operation_alias", lambda: test_compute_indicator_korean_operation_alias()),
@@ -911,7 +1034,9 @@ async def main() -> None:
         ("answer_query_deprecated_contract", lambda: test_answer_query_deprecated_contract()),
         ("query_table_invalid_filter_contract", lambda: test_query_table_invalid_filter_has_contract()),
         ("query_table_period_error_contract", lambda: test_query_table_period_error_has_contract_and_format_guidance()),
+        ("query_table_invalid_period_format", lambda: test_query_table_rejects_unparsed_period_text()),
         ("query_table_projection_marker", lambda: test_query_table_projection_data_marker()),
+        ("query_table_aggregation_dropped_rows", lambda: test_query_table_aggregation_dropped_rows_are_marked()),
         ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
     ]

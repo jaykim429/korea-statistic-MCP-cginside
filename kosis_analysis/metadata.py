@@ -654,7 +654,7 @@ def _aggregate_rows_sum_by_group(
     rows: list[dict[str, Any]],
     filters: dict[str, list[str]],
     group_by: Optional[list[str]],
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     preserve = set(group_by or [])
     preserve.add("ITEM")
     aggregated_axes = [
@@ -663,6 +663,7 @@ def _aggregate_rows_sum_by_group(
         if axis != "ITEM" and len(codes) > 1 and axis not in preserve
     ]
     buckets: dict[tuple[Any, ...], dict[str, Any]] = {}
+    dropped_rows: list[dict[str, Any]] = []
     for row in rows:
         dimensions = row.get("dimensions") or {}
         preserved_dimensions = {
@@ -680,6 +681,12 @@ def _aggregate_rows_sum_by_group(
         )
         number = _to_number(row.get("value"))
         if number is None:
+            dropped_rows.append({
+                "period": row.get("period"),
+                "value": row.get("value"),
+                "dimensions": dimensions,
+                "reason": "non_numeric_value",
+            })
             continue
         bucket = buckets.setdefault(key, {
             "period": row.get("period"),
@@ -704,4 +711,11 @@ def _aggregate_rows_sum_by_group(
     for row in result:
         value = row["value"]
         row["value"] = int(value) if float(value).is_integer() else value
-    return result, aggregated_axes
+    report = {
+        "input_row_count": len(rows),
+        "output_row_count": len(result),
+        "dropped_row_count": len(dropped_rows),
+        "dropped_rows": dropped_rows[:20],
+        "dropped_rows_truncated": len(dropped_rows) > 20,
+    }
+    return result, aggregated_axes, report

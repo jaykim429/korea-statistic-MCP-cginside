@@ -238,6 +238,9 @@ def _mcp_tool_output_contract(
         "fanout_call_failed",
         "period_not_found",
         "period_type_mismatch",
+        "invalid_period_format",
+        "duplicate_denominator_key",
+        "non_numeric_aggregation_input",
         "runtime_error",
         "metadata_failed",
         "empty_rows",
@@ -280,6 +283,9 @@ def _mcp_tool_output_contract(
             "fanout_call_failed",
             "period_not_found",
             "period_type_mismatch",
+            "invalid_period_format",
+            "duplicate_denominator_key",
+            "non_numeric_aggregation_input",
             "empty_rows",
             "partial_fulfillment",
             "coverage_ratio",
@@ -423,6 +429,43 @@ def _period_error_guidance(
             "compatible": False,
             "auto_aggregation_not_supported": True,
         },
+    }
+
+
+def _period_range_format_error(
+    period_range: Optional[list[str]],
+    selected_period: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not period_range:
+        return None
+    bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
+    if not bounds:
+        return None
+    if len(bounds) == 1:
+        bounds = [bounds[0], bounds[0]]
+    invalid_bounds = [
+        bound for bound in bounds[:2]
+        if not _is_latest_period_text(bound) and _normalize_period_bound(bound) is None
+    ]
+    if not invalid_bounds:
+        return None
+    guidance = _period_error_guidance(
+        {
+            "code": "INVALID_PERIOD_FORMAT",
+            "period_range_received": bounds[:2],
+        },
+        selected_period,
+        period_range,
+    )
+    latest = selected_period.get("END_PRD_DE") if selected_period else None
+    if latest and all(_is_latest_period_text(bound) for bound in bounds[:2]):
+        guidance["suggested_period_range"] = [str(latest), str(latest)]
+    return {
+        "code": "INVALID_PERIOD_FORMAT",
+        "error": "period_range contains values that are not KOSIS period codes.",
+        "오류": "period_range에 KOSIS 시점 코드로 해석할 수 없는 값이 포함되어 있습니다.",
+        "period_range_received": bounds[:2],
+        **guidance,
     }
 
 FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
@@ -5398,6 +5441,46 @@ async def query_table(
             end_period = str(selected_period.get("END_PRD_DE"))
             effective_period_range = [end_period, end_period]
             auto_default_period_range = effective_period_range
+        if effective_period_range and selected_period and selected_period.get("END_PRD_DE"):
+            requested_bounds = [str(p).strip() for p in effective_period_range if str(p or "").strip()]
+            if requested_bounds and all(_is_latest_period_text(bound) for bound in requested_bounds):
+                end_period = str(selected_period.get("END_PRD_DE"))
+                effective_period_range = [end_period, end_period]
+                auto_default_period_range = effective_period_range
+        period_format_error = _period_range_format_error(effective_period_range, selected_period)
+        if period_format_error:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": period_format_error["code"],
+                "code": period_format_error["code"],
+                "error": period_format_error["error"],
+                "오류": period_format_error["오류"],
+                "filters_used": normalized_filters,
+                "period_range": effective_period_range,
+                "period_range_received": period_format_error.get("period_range_received"),
+                "suggested_period_range": period_format_error.get("suggested_period_range"),
+                "period_format_examples": period_format_error.get("period_format_examples"),
+                "period_type_check": period_format_error.get("period_type_check"),
+                "period_metadata": {
+                    "cadence": selected_period.get("PRD_SE") if selected_period else None,
+                    "start_period": selected_period.get("STRT_PRD_DE") if selected_period else None,
+                    "latest_period": selected_period.get("END_PRD_DE") if selected_period else None,
+                } if selected_period else None,
+                "metadata_source": metadata_source,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_data_query",
+                    final_answer_expected=False,
+                    markers=["invalid_input", "invalid_period_format"],
+                    explanation="period_range must use KOSIS period codes or be normalized by the caller before query_table.",
+                    extra_signals={
+                        "period_range_received": period_format_error.get("period_range_received"),
+                        "suggested_period_range": period_format_error.get("suggested_period_range"),
+                        "period_format_examples": period_format_error.get("period_format_examples"),
+                        "period_type_check": period_format_error.get("period_type_check"),
+                    },
+                ),
+            }
         period_error = _validate_query_period_range(effective_period_range, selected_period)
         if period_error:
             period_guidance = _period_error_guidance(period_error, selected_period, effective_period_range)
@@ -5538,8 +5621,9 @@ async def query_table(
     latest_period = selected_period
     normalized_rows = normalized_rows_from_fanout
     aggregated_axes: list[str] = []
+    aggregation_report: Optional[dict[str, Any]] = None
     if aggregation == "sum_by_group":
-        normalized_rows, aggregated_axes = _aggregate_rows_sum_by_group(
+        normalized_rows, aggregated_axes, aggregation_report = _aggregate_rows_sum_by_group(
             normalized_rows,
             normalized_filters,
             group_by,
@@ -5563,6 +5647,11 @@ async def query_table(
         contract_markers.append("empty_rows")
     if nature.get("data_nature") == "projection":
         contract_markers.append("projection_data")
+    if latest_period is None:
+        contract_markers.append("period_metadata_missing")
+    if aggregation_report and aggregation_report.get("dropped_row_count"):
+        contract_markers.append("aggregation_dropped_rows")
+        contract_markers.append("non_numeric_aggregation_input")
     result = {
         "상태": "executed",
         "status": "executed",
@@ -5571,6 +5660,7 @@ async def query_table(
         "aggregation": aggregation,
         "group_by": group_by or None,
         "aggregated_axes": aggregated_axes,
+        "aggregation_report": aggregation_report,
         "aggregation_assumption": aggregation_assumption,
         "aggregation_warning": aggregation_warning,
         "기관ID": org_id,
@@ -5625,6 +5715,10 @@ async def query_table(
             final_answer_expected=False,
             markers=contract_markers,
             explanation=(
+                "One or more fan-out calls failed; disclose the failed call details before using the data."
+                if "fanout_call_failed" in contract_markers else
+                "Some rows were dropped during aggregation because their values were non-numeric."
+                if "aggregation_dropped_rows" in contract_markers else
                 "Some fan-out calls returned no rows; disclose partial coverage before using the data."
                 if "partial_fanout_coverage" in contract_markers else
                 "No rows were returned for the verified filters and period."
@@ -5639,6 +5733,8 @@ async def query_table(
                 "data_nature": nature.get("data_nature"),
                 "period_nature": nature.get("period_nature"),
                 "projection_horizon_years": nature.get("projection_horizon_years"),
+                "period_metadata_available": latest_period is not None,
+                "aggregation_report": aggregation_report,
             },
         ),
     }
@@ -5790,6 +5886,7 @@ async def compute_indicator(
         "results": [r.to_dict() for r in outcome.results],
         "unmatched": outcome.unmatched,
         "validation_errors": outcome.validation_errors,
+        "computation_metadata": outcome.extra,
         "mcp_output_contract": _mcp_tool_output_contract(
             role="indicator_computation",
             final_answer_expected=False,
@@ -5803,6 +5900,7 @@ async def compute_indicator(
                 "unmatched_count": len(outcome.unmatched),
                 "additivity_caller_asserted": additivity_caller_asserted,
                 "unit_caller_resolution_required": "unit_caller_resolution_required" in markers,
+                "computation_metadata": outcome.extra,
             },
         ),
         "주의": [

@@ -441,12 +441,22 @@ class _RatioLike(IndicatorOperation):
         self,
         rows: list[dict[str, Any]],
         match_keys: list[str],
-    ) -> dict[tuple, dict[str, Any]]:
+    ) -> tuple[dict[tuple, dict[str, Any]], list[dict[str, Any]], set[tuple]]:
         index: dict[tuple, dict[str, Any]] = {}
+        duplicates: list[dict[str, Any]] = []
+        duplicate_keys: set[tuple] = set()
         for row in rows:
             key = (str(row.get("period") or ""), _dimension_codes(row, match_keys))
+            if key in index:
+                duplicate_keys.add(key)
+                duplicates.append({
+                    "period": key[0],
+                    "group_codes": list(key[1]),
+                    "reason": "duplicate_denominator_key",
+                })
+                continue
             index[key] = row
-        return index
+        return index, duplicates, duplicate_keys
 
     def compute(
         self,
@@ -463,10 +473,24 @@ class _RatioLike(IndicatorOperation):
         axes = _normalize_match_keys(rows, match_keys)
 
         if denominator_rows:
-            index = self._denominator_index(denominator_rows, axes)
+            index, duplicate_denominators, duplicate_keys = self._denominator_index(denominator_rows, axes)
+            if duplicate_denominators:
+                outcome.unmatched.extend(duplicate_denominators)
+                outcome.validation_errors.append(
+                    "denominator_rows contains duplicate rows for the same period and match_keys."
+                )
+                if "duplicate_denominator_key" not in outcome.markers:
+                    outcome.markers.append("duplicate_denominator_key")
             for row in rows:
                 period = str(row.get("period") or "")
                 key = (period, _dimension_codes(row, axes))
+                if key in duplicate_keys:
+                    outcome.unmatched.append({
+                        "period": period,
+                        "group_codes": list(key[1]),
+                        "reason": "duplicate_denominator_key",
+                    })
+                    continue
                 denom_row = index.get(key)
                 if denom_row is None:
                     outcome.unmatched.append({
@@ -516,9 +540,9 @@ class _RatioLike(IndicatorOperation):
                     },
                 ))
         elif self.name == "share":
-            # Share without an explicit denominator divides by the sum of inputs.
-            total = 0.0
+            # Share without an explicit denominator divides by structurally comparable input totals.
             usable: list[tuple[float, dict[str, Any]]] = []
+            totals_by_period: dict[str, float] = defaultdict(float)
             for row in rows:
                 v = _to_number(row.get("value"))
                 if v is None:
@@ -527,14 +551,35 @@ class _RatioLike(IndicatorOperation):
                         "reason": "non_numeric_value",
                     })
                     continue
-                total += v
+                period = str(row.get("period") or "")
+                totals_by_period[period] += v
                 usable.append((v, row))
-            if total == 0:
+            if not usable:
+                outcome.status = "invalid_input"
+                outcome.validation_errors.append("share requires at least one numeric input row.")
+                outcome.markers.append("invalid_input")
+                return outcome
+            zero_periods = [period for period, total in totals_by_period.items() if total == 0]
+            if len(zero_periods) == len(totals_by_period):
                 outcome.markers.append("denominator_zero")
                 outcome.status = "invalid_input"
                 outcome.validation_errors.append("share total is zero; cannot divide.")
                 return outcome
+            periods = sorted(totals_by_period.keys())
+            denominator_grouping = "period" if len(periods) > 1 else "all_input_rows"
+            if denominator_grouping == "period":
+                outcome.markers.append("share_total_grouped_by_period")
             for v, row in usable:
+                period = str(row.get("period") or "")
+                total = totals_by_period.get(period, 0.0)
+                if total == 0:
+                    outcome.unmatched.append({
+                        "period": period,
+                        "reason": "denominator_zero",
+                    })
+                    if "denominator_zero" not in outcome.markers:
+                        outcome.markers.append("denominator_zero")
+                    continue
                 value = v / total * 100
                 unit_payload = self._unit_payload(
                     row,
@@ -559,10 +604,17 @@ class _RatioLike(IndicatorOperation):
                         "denominator_total": total,
                         "denominator_source": "input_rows_total_sum",
                         "denominator_label": "input_rows_total_sum",
+                        "denominator_grouping": denominator_grouping,
+                        "denominator_group_key": period if denominator_grouping == "period" else None,
                         "additivity_caller_asserted": True,
                     },
                 ))
             outcome.markers.append("share_total_from_input_rows")
+            outcome.extra["share_denominator_grouping"] = {
+                "grouping": denominator_grouping,
+                "periods": periods,
+                "totals_by_period": dict(totals_by_period),
+            }
         else:
             outcome.status = "invalid_input"
             outcome.validation_errors.append(
