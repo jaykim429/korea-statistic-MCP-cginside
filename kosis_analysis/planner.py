@@ -580,7 +580,7 @@ class QueryWorkflowPlanner:
         secondary = slots.get("secondary_indicators") if isinstance(slots, dict) else None
         if isinstance(secondary, list) and secondary:
             return True
-        return any(token in query for token in (",", "·", "/"))
+        return QueryWorkflowPlanner.MULTI_INDICATOR_SPLIT_RE.search(str(query or "")) is not None
 
     def _time_conflict_decisions(
         self,
@@ -883,7 +883,7 @@ class QueryWorkflowPlanner:
                 add(item, "router_slots.secondary_indicators")
 
         if not self._explicit_multi_metric_query(query, slots):
-            return candidates
+            return []
 
         segments = [
             segment.strip()
@@ -1256,6 +1256,11 @@ class QueryWorkflowPlanner:
             value = dimensions.get(key)
             if isinstance(value, str):
                 concepts.append(value)
+        indicator_candidates = dimensions.get("indicator_candidates")
+        if isinstance(indicator_candidates, list):
+            for candidate in indicator_candidates:
+                if isinstance(candidate, dict) and isinstance(candidate.get("name"), str):
+                    concepts.append(candidate["name"])
         regions = dimensions.get("regions")
         if isinstance(regions, list):
             concepts.extend(str(region) for region in regions if region)

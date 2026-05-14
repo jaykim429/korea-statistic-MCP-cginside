@@ -674,6 +674,17 @@ async def test_plan_query_extracts_multiple_indicators() -> None:
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "multi_metric_request" in markers, markers
     assert result["mcp_output_contract"]["current_signals"]["marker_guidance"]["multi_metric_request"], result
+    for name in ("경제성장률", "인구", "합계출산율"):
+        assert name in result.get("concepts", []), result
+
+    result_with_connector = await kosis_mcp_server.plan_query("경제성장률 및 인구 변화율")
+    connector_metric_names = [metric.get("name") for metric in result_with_connector.get("metrics") or []]
+    assert "경제성장률" in connector_metric_names, result_with_connector
+    assert "인구" in connector_metric_names, result_with_connector
+    assert "multi_metric_request" in result_with_connector["mcp_output_contract"]["current_signals"]["markers_present"], result_with_connector
+
+    single = await kosis_mcp_server.plan_query("반도체 수출액 알려줘")
+    assert "indicator_candidates" not in single.get("intended_dimensions", {}), single
 
 
 async def test_plan_query_change_implication_inference_log() -> None:
