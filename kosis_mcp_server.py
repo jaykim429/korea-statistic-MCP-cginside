@@ -235,6 +235,9 @@ def _mcp_tool_output_contract(
         "partial_fanout_coverage",
         "complete_fanout_miss",
         "max_fanout_exceeded",
+        "fanout_call_failed",
+        "period_not_found",
+        "period_type_mismatch",
         "runtime_error",
         "metadata_failed",
         "empty_rows",
@@ -274,6 +277,9 @@ def _mcp_tool_output_contract(
             "partial_fanout_coverage",
             "complete_fanout_miss",
             "max_fanout_exceeded",
+            "fanout_call_failed",
+            "period_not_found",
+            "period_type_mismatch",
             "empty_rows",
             "partial_fulfillment",
             "coverage_ratio",
@@ -306,6 +312,118 @@ def _missing_api_key_response(tool: str, **context: Any) -> dict[str, Any]:
 
 def _is_missing_key_error(exc: Exception) -> bool:
     return "KOSIS_API_KEY" in str(exc)
+
+
+def _period_format_examples(period_type: Optional[str]) -> dict[str, Any]:
+    api_type = _api_period_type(period_type)
+    examples: dict[str, Any] = {
+        "table_cadence": period_type,
+        "api_period_type": api_type,
+    }
+    if api_type == "M":
+        examples.update({
+            "accepted_period_codes": ["202401", "202402"],
+            "year_range_example": {"input": "2024", "period_range": ["202401", "202412"]},
+            "quarter_range_example": {"input": "2024-Q1", "period_range": ["202401", "202403"]},
+        })
+    elif api_type == "Q":
+        examples.update({
+            "accepted_period_codes": ["20241", "20242"],
+            "display_aliases": ["2024Q1", "2024-Q1"],
+        })
+    elif api_type == "Y":
+        examples.update({
+            "accepted_period_codes": ["2024", "2025"],
+        })
+    elif api_type == "H":
+        examples.update({
+            "accepted_period_codes": ["20241", "20242"],
+            "display_aliases": ["2024H1", "2024H2"],
+        })
+    else:
+        examples.update({"accepted_period_codes": []})
+    return examples
+
+
+def _quarter_month_bounds(value: Any) -> Optional[tuple[str, str]]:
+    text = re.sub(r"\s+", "", str(value or "")).upper()
+    match = re.search(r"(19\d{2}|20\d{2})[-_/]?Q([1-4])", text)
+    if match:
+        year, quarter_text = match.group(1), match.group(2)
+    else:
+        quarter = _parse_quarter_token(str(value or ""))
+        if not quarter:
+            return None
+        year, quarter_text = quarter[:4], quarter[4:]
+    quarter_no = int(quarter_text)
+    start_month = (quarter_no - 1) * 3 + 1
+    return f"{year}{start_month:02d}", f"{year}{start_month + 2:02d}"
+
+
+def _suggest_period_range_for_cadence(
+    period_range: Optional[list[str]],
+    period_type: Optional[str],
+) -> Optional[list[str]]:
+    if not period_range:
+        return None
+    api_type = _api_period_type(period_type)
+    bounds = [str(p).strip() for p in period_range if str(p or "").strip()]
+    if not bounds:
+        return None
+    if len(bounds) == 1:
+        bounds = [bounds[0], bounds[0]]
+    if api_type == "M":
+        start_quarter = _quarter_month_bounds(bounds[0])
+        end_quarter = _quarter_month_bounds(bounds[1])
+        if start_quarter or end_quarter:
+            start = (start_quarter or end_quarter)[0]
+            end = (end_quarter or start_quarter)[1]
+            return [start, end]
+        start_year = re.fullmatch(r"(19\d{2}|20\d{2})", bounds[0])
+        end_year = re.fullmatch(r"(19\d{2}|20\d{2})", bounds[1])
+        if start_year and end_year:
+            return [f"{start_year.group(1)}01", f"{end_year.group(1)}12"]
+    if api_type == "Q":
+        start_quarter = _parse_quarter_token(bounds[0])
+        end_quarter = _parse_quarter_token(bounds[1])
+        if start_quarter or end_quarter:
+            return [start_quarter or end_quarter, end_quarter or start_quarter]
+    return None
+
+
+def _period_error_markers(period_error: dict[str, Any], selected_period: Optional[dict[str, Any]]) -> list[str]:
+    markers = ["invalid_input"]
+    if period_error.get("code") == STATUS_PERIOD_NOT_FOUND:
+        markers.append("period_not_found")
+    if period_error.get("code") == STATUS_INVALID_PERIOD_RANGE:
+        markers.append("validation_errors")
+    requested = " ".join(str(v) for v in period_error.get("period_range_received") or [])
+    api_type = _api_period_type(_period_type(selected_period))
+    if api_type == "M" and _quarter_month_bounds(requested):
+        markers.append("period_type_mismatch")
+    return markers
+
+
+def _period_error_guidance(
+    period_error: dict[str, Any],
+    selected_period: Optional[dict[str, Any]],
+    effective_period_range: Optional[list[str]],
+) -> dict[str, Any]:
+    examples = _period_format_examples(_period_type(selected_period))
+    suggested = period_error.get("suggested_period_range") or _suggest_period_range_for_cadence(
+        effective_period_range,
+        _period_type(selected_period),
+    )
+    return {
+        "suggested_period_range": suggested,
+        "period_format_examples": examples,
+        "period_type_check": {
+            "table_supports": [_api_period_type(_period_type(selected_period))] if selected_period else [],
+            "requested_period_range": effective_period_range,
+            "compatible": False,
+            "auto_aggregation_not_supported": True,
+        },
+    }
 
 FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
     "share_ratio": {
@@ -4187,12 +4305,16 @@ async def _normalize_indicator_from_kosis_meta(
                 table_name_score = max(
                     _indicator_meta_match_score(raw, table_name, "TBL_NM"),
                     _indicator_meta_match_score(query_used, table_name, "TBL_NM"),
+                    _indicator_meta_match_score(str(label or ""), table_name, "TBL_NM"),
                 )
-                adjusted_score = score + min(5, table_name_score // 20)
+                adjusted_score = score + min(12, table_name_score // 8)
+                if score < 100 and table_name_score <= 0 and len(_compact_text(raw)) <= 4:
+                    adjusted_score -= 8
                 matches.append({
                     "canonical_name": str(label or matched_value),
                     "score": adjusted_score,
                     "raw_match_score": score,
+                    "table_name_relevance_score": table_name_score,
                     "matched_field": field_name,
                     "matched_value": matched_value,
                     "match_evidence": f"{field_name} contains {query_used!r}",
@@ -4227,6 +4349,7 @@ async def _normalize_indicator_from_kosis_meta(
             "name": item["canonical_name"],
             "match_evidence": item["match_evidence"],
             "score": item["score"],
+            "table_name_relevance_score": item.get("table_name_relevance_score"),
             "normalization_query": item.get("normalization_query"),
             "tbl_id": item["tbl_id"],
             "itm_id": item.get("itm_id"),
@@ -4240,6 +4363,7 @@ async def _normalize_indicator_from_kosis_meta(
         "match_evidence": best["match_evidence"],
         "matched_field": best["matched_field"],
         "matched_value": best["matched_value"],
+        "table_name_relevance_score": best.get("table_name_relevance_score"),
         "normalization_query": best.get("normalization_query"),
         "alternatives": alternatives,
         "org_id": best["org_id"],
@@ -4255,6 +4379,44 @@ async def _normalize_indicator_from_kosis_meta(
 
 def _metric_name_key(value: Any) -> str:
     return re.sub(r"[\s_]+", "", _compact_text(str(value or "")))
+
+
+def _replace_metric_references(plan: dict[str, Any], raw_value: Any, normalized_value: Any) -> None:
+    raw_key = _metric_name_key(raw_value)
+    normalized = str(normalized_value or "")
+    if not raw_key or not normalized:
+        return
+    scalar_keys = {
+        "indicator",
+        "metric",
+        "kept_metric",
+        "primary",
+        "used",
+    }
+    list_keys = {
+        "metrics",
+        "concepts",
+    }
+
+    def visit(node: Any, parent_key: Optional[str] = None) -> Any:
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                if key in scalar_keys and isinstance(value, str) and _metric_name_key(value) == raw_key:
+                    node[key] = normalized
+                else:
+                    node[key] = visit(value, key)
+            return node
+        if isinstance(node, list):
+            updated = []
+            for value in node:
+                if parent_key in list_keys and isinstance(value, str) and _metric_name_key(value) == raw_key:
+                    updated.append(normalized)
+                else:
+                    updated.append(visit(value, parent_key))
+            return updated
+        return node
+
+    visit(plan)
 
 
 def _plan_contract_add_markers(plan: dict[str, Any], markers: list[str]) -> None:
@@ -4322,6 +4484,7 @@ async def _enrich_plan_with_metadata(
             if normalized_name != raw_indicator:
                 dimensions["indicator"] = normalized_name
                 markers.append("indicator_normalized")
+                _replace_metric_references(plan, raw_indicator, normalized_name)
                 for idx, concept in enumerate(list(concepts)):
                     if _metric_name_key(concept) == _metric_name_key(raw_indicator):
                         concepts[idx] = normalized_name
@@ -4393,7 +4556,7 @@ async def _enrich_plan_with_metadata(
     if not isinstance(analysis_tasks, list):
         analysis_tasks = []
         plan["analysis_tasks"] = analysis_tasks
-    if evidence and not any(task.get("type") in {"growth_rate", "change_compare", "yoy_pct_or_growth_rate"} for task in analysis_tasks if isinstance(task, dict)):
+    if metrics and evidence and not any(task.get("type") in {"growth_rate", "change_compare", "yoy_pct_or_growth_rate"} for task in analysis_tasks if isinstance(task, dict)):
         analysis_tasks.append({
             "type": "yoy_pct_or_growth_rate",
             "auto_inferred": True,
@@ -4491,6 +4654,12 @@ async def resolve_concepts(
             "status": "unsupported",
             "error": "org_id and tbl_id are required.",
             "오류": "org_id와 tbl_id가 필요합니다.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="concept_resolution",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="resolve_concepts requires org_id and tbl_id before metadata lookup.",
+            ),
         }
     if not isinstance(concepts, list) or not concepts:
         return {
@@ -4498,6 +4667,13 @@ async def resolve_concepts(
             "status": "unsupported",
             "error": "concepts must be a non-empty list.",
             "오류": "concepts는 비어 있지 않은 리스트여야 합니다.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="concept_resolution",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="resolve_concepts cannot resolve an empty concepts list.",
+                extra_signals={"concept_count": 0},
+            ),
         }
 
     try:
@@ -4527,6 +4703,13 @@ async def resolve_concepts(
                 "오류": f"메타 조회 실패: {exc}",
                 "org_id": org_id,
                 "tbl_id": tbl_id,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="concept_resolution",
+                    final_answer_expected=False,
+                    markers=["metadata_failed", "not_matched"],
+                    explanation="resolve_concepts could not load table metadata; caller should verify org_id/tbl_id or search again.",
+                    extra_signals={"org_id": org_id, "tbl_id": tbl_id},
+                ),
             }
     if not isinstance(item_rows, list) or not item_rows:
         return {
@@ -4538,6 +4721,13 @@ async def resolve_concepts(
             "오류": "분류축 메타가 없습니다.",
             "org_id": org_id,
             "tbl_id": tbl_id,
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="concept_resolution",
+                final_answer_expected=False,
+                markers=["metadata_failed", "not_matched"],
+                explanation="No classification metadata is available, so concepts cannot be resolved for this table.",
+                extra_signals={"org_id": org_id, "tbl_id": tbl_id},
+            ),
         }
 
     axes, axis_order = _build_axis_codebook(item_rows)
@@ -5074,6 +5264,12 @@ async def query_table(
             "status": "unsupported",
             "error": "org_id and tbl_id are required.",
             "오류": "org_id와 tbl_id가 필요합니다.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_data_query",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="query_table requires org_id and tbl_id before metadata lookup.",
+            ),
         }
     if aggregation not in {"none", "sum_by_group"}:
         return {
@@ -5084,6 +5280,13 @@ async def query_table(
             "error": "aggregation must be one of: none, sum_by_group.",
             "오류": "aggregation은 none 또는 sum_by_group만 지원합니다.",
             "allowed_aggregations": ["none", "sum_by_group"],
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_data_query",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="aggregation must be one of the supported query_table modes.",
+                extra_signals={"allowed_aggregations": ["none", "sum_by_group"]},
+            ),
         }
 
     try:
@@ -5118,6 +5321,13 @@ async def query_table(
                 "통계표ID": tbl_id,
                 "org_id": org_id,
                 "tbl_id": tbl_id,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_data_query",
+                    final_answer_expected=False,
+                    markers=["metadata_failed", "not_matched"],
+                    explanation="query_table could not load table metadata; caller should verify org_id/tbl_id or search again.",
+                    extra_signals={"org_id": org_id, "tbl_id": tbl_id},
+                ),
             }
 
         if not isinstance(item_rows, list) or not item_rows:
@@ -5132,6 +5342,13 @@ async def query_table(
                 "통계표ID": tbl_id,
                 "org_id": org_id,
                 "tbl_id": tbl_id,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_data_query",
+                    final_answer_expected=False,
+                    markers=["metadata_failed", "not_matched"],
+                    explanation="No classification metadata is available, so raw extraction cannot be verified.",
+                    extra_signals={"org_id": org_id, "tbl_id": tbl_id},
+                ),
             }
 
         axes, axis_order = _build_axis_codebook(item_rows)
@@ -5145,6 +5362,10 @@ async def query_table(
             "url": _kosis_view_url(org_id, tbl_id),
         }
         if errors or normalized_filters is None:
+            available_axes = [
+                {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM")}
+                for obj_id in axis_order
+            ]
             return {
                 "상태": "failed",
                 "status": "unsupported",
@@ -5154,11 +5375,18 @@ async def query_table(
                 "오류": "filters 검증 실패",
                 "검증_오류": errors,
                 "validation_errors": errors,
-                "available_axes": [
-                    {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM")}
-                    for obj_id in axis_order
-                ],
+                "available_axes": available_axes,
                 "metadata_source": metadata_source,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_data_query",
+                    final_answer_expected=False,
+                    markers=["invalid_input", "validation_errors"],
+                    explanation="query_table filters failed metadata validation; caller must correct axes or item codes before retrying.",
+                    extra_signals={
+                        "validation_error_count": len(errors),
+                        "available_axes": available_axes,
+                    },
+                ),
             }
 
         selected_period = _pick_query_table_period_row(period_rows, period_range) if isinstance(period_rows, list) else None
@@ -5172,6 +5400,8 @@ async def query_table(
             auto_default_period_range = effective_period_range
         period_error = _validate_query_period_range(effective_period_range, selected_period)
         if period_error:
+            period_guidance = _period_error_guidance(period_error, selected_period, effective_period_range)
+            period_markers = _period_error_markers(period_error, selected_period)
             return {
                 "상태": "failed",
                 "status": "unsupported",
@@ -5182,14 +5412,29 @@ async def query_table(
                 "filters_used": normalized_filters,
                 "period_range": effective_period_range,
                 "period_range_received": period_error.get("period_range_received"),
-                "suggested_period_range": period_error.get("suggested_period_range"),
+                "suggested_period_range": period_guidance.get("suggested_period_range"),
                 "available_period_range": period_error.get("available_period_range"),
+                "period_format_examples": period_guidance.get("period_format_examples"),
+                "period_type_check": period_guidance.get("period_type_check"),
                 "period_metadata": {
                     "cadence": selected_period.get("PRD_SE") if selected_period else None,
                     "start_period": selected_period.get("STRT_PRD_DE") if selected_period else None,
                     "latest_period": selected_period.get("END_PRD_DE") if selected_period else None,
                 } if selected_period else None,
                 "metadata_source": metadata_source,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_data_query",
+                    final_answer_expected=False,
+                    markers=period_markers,
+                    explanation="Requested period is not directly compatible with the table period metadata; caller must adjust period_range before retrying.",
+                    extra_signals={
+                        "period_range_received": period_error.get("period_range_received"),
+                        "suggested_period_range": period_guidance.get("suggested_period_range"),
+                        "available_period_range": period_error.get("available_period_range"),
+                        "period_format_examples": period_guidance.get("period_format_examples"),
+                        "period_type_check": period_guidance.get("period_type_check"),
+                    },
+                ),
             }
 
         normalized_rows_from_fanout: list[dict[str, Any]] = []
@@ -5276,6 +5521,13 @@ async def query_table(
                 "filters_used": normalized_filters,
                 "aggregation": aggregation,
                 "metadata_source": metadata_source,
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_extraction",
+                    final_answer_expected=False,
+                    markers=["runtime_error"],
+                    explanation="query_table failed during raw KOSIS extraction; caller must not infer missing rows.",
+                    extra_signals={"aggregation": aggregation},
+                ),
             }
 
     table_name = None
@@ -5309,6 +5561,8 @@ async def query_table(
         contract_markers.append("fanout_call_failed")
     if not normalized_rows:
         contract_markers.append("empty_rows")
+    if nature.get("data_nature") == "projection":
+        contract_markers.append("projection_data")
     result = {
         "상태": "executed",
         "status": "executed",
@@ -5382,6 +5636,9 @@ async def query_table(
                 "successful_calls": fanout_report.get("successful_calls"),
                 "failed_calls": fanout_report.get("failed_calls"),
                 "empty_results": fanout_report.get("empty_results"),
+                "data_nature": nature.get("data_nature"),
+                "period_nature": nature.get("period_nature"),
+                "projection_horizon_years": nature.get("projection_horizon_years"),
             },
         ),
     }
@@ -5514,6 +5771,14 @@ async def compute_indicator(
         f"compute_indicator({operation}) produced {len(outcome.results)} value(s)"
         + (f"; {len(outcome.unmatched)} unmatched/skipped." if outcome.unmatched else ".")
     )
+    additivity_caller_asserted = (
+        op.aggregation_caller_asserted
+        or "share_total_from_input_rows" in markers
+        or any(
+            bool(result.inputs.get("additivity_caller_asserted"))
+            for result in outcome.results
+        )
+    )
     return {
         "status": outcome.status,
         "상태": outcome.status,
@@ -5536,7 +5801,7 @@ async def compute_indicator(
                 "operation_alias_used": operation_alias_used,
                 "result_count": len(outcome.results),
                 "unmatched_count": len(outcome.unmatched),
-                "additivity_caller_asserted": op.aggregation_caller_asserted,
+                "additivity_caller_asserted": additivity_caller_asserted,
                 "unit_caller_resolution_required": "unit_caller_resolution_required" in markers,
             },
         ),

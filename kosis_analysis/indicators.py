@@ -223,6 +223,18 @@ class GrowthRate(_PairOverPeriodOperation):
         outcome = ComputationOutcome(status="ok")
         for key, group_rows in self._groups(rows, group_by).items():
             ordered = sorted(group_rows, key=lambda r: str(r.get("period") or ""))
+            if len(ordered) < 2:
+                outcome.unmatched.append({
+                    "reason": "insufficient_periods",
+                    "group_codes": list(key),
+                    "row_count": len(ordered),
+                })
+                outcome.validation_errors.append(
+                    "growth_rate requires at least 2 rows per group."
+                )
+                if "insufficient_periods" not in outcome.markers:
+                    outcome.markers.append("insufficient_periods")
+                continue
             for i in range(1, len(ordered)):
                 prev_row = ordered[i - 1]
                 cur_row = ordered[i]

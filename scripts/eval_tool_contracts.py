@@ -235,6 +235,17 @@ async def test_compute_indicator_growth_rate() -> None:
     assert contract["current_signals"]["result_count"] == 2, contract
 
 
+async def test_compute_indicator_growth_rate_single_row_has_reason() -> None:
+    result = await kosis_mcp_server.compute_indicator(
+        operation="growth_rate",
+        input_rows=[_make_row("2023", "100", "11", "서울")],
+    )
+    assert result["status"] == "invalid_input", result
+    assert result["validation_errors"], result
+    assert "at least 2 rows" in result["validation_errors"][0], result
+    assert result["unmatched"][0]["reason"] == "insufficient_periods", result
+
+
 async def test_compute_indicator_per_capita_with_denominator_zero() -> None:
     numerator = [
         _make_row("2023", "1000", "11", "서울", unit="명"),
@@ -296,6 +307,7 @@ async def test_compute_indicator_share_uses_input_total() -> None:
     assert {r["value"] for r in result["results"]} == {25.0, 75.0}, result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "share_total_from_input_rows" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["additivity_caller_asserted"] is True, result
 
 
 async def test_compute_indicator_yoy_pct_matches_intra_year() -> None:
@@ -507,6 +519,39 @@ async def test_indicator_normalization_uses_route_search_terms() -> None:
     assert result["alternatives"][0]["name"] == "월급제", result
 
 
+async def test_indicator_normalization_prefers_relevant_table_name() -> None:
+    original_search = kosis_mcp_server.search_kosis
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_search(term: str, limit: int = 10, use_routing: bool = True, api_key: Any = None) -> dict[str, Any]:
+        return {
+            "결과": [
+                {"통계표명": "연도별 전력수급 실적", "통계표ID": "POWER", "기관ID": "101"},
+                {"통계표명": "경제성장률(불변가격)", "통계표ID": "GROWTH", "기관ID": "101"},
+            ],
+            "Tier_A_직접_매핑": None,
+        }
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "ITM" and tbl_id == "POWER":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "P1", "ITM_NM": "경제성장률"}]
+        if kind == "ITM" and tbl_id == "GROWTH":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "G1", "ITM_NM": "경제성장률(기준년가격 GDP)"}]
+        return []
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server._normalize_indicator_from_kosis_meta("성장률", api_key="dummy")
+    finally:
+        kosis_mcp_server.search_kosis = original_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["tbl_id"] == "GROWTH", result
+    assert result["table_name_relevance_score"] > 0, result
+    assert result["alternatives"][0]["tbl_id"] == "POWER", result
+
+
 async def test_plan_query_indicator_normalization_from_kosis_meta() -> None:
     original_normalize = kosis_mcp_server._normalize_indicator_from_kosis_meta
 
@@ -535,6 +580,37 @@ async def test_plan_query_indicator_normalization_from_kosis_meta() -> None:
     assert result["metrics"][0]["name"] == "국내총생산(GDP)", result
 
 
+async def test_plan_query_normalized_metric_references_are_synced() -> None:
+    original_normalize = kosis_mcp_server._normalize_indicator_from_kosis_meta
+
+    async def fake_normalize(user_input: Any, api_key: Any = None, **_: Any) -> dict[str, Any]:
+        raw = str(user_input)
+        if raw == "GDP":
+            return {
+                "raw_input": raw,
+                "normalized": "국내총생산(GDP)",
+                "source": "kosis_meta_match",
+                "match_evidence": "ITM_NM contains 'GDP'",
+                "alternatives": [],
+            }
+        return {"raw_input": raw, "normalized": raw, "source": "passthrough", "alternatives": []}
+
+    try:
+        kosis_mcp_server._normalize_indicator_from_kosis_meta = fake_normalize  # type: ignore[assignment]
+        result = await kosis_mcp_server.plan_query("한국 GDP 증가했어?")
+    finally:
+        kosis_mcp_server._normalize_indicator_from_kosis_meta = original_normalize  # type: ignore[assignment]
+
+    assert result["intended_dimensions"]["indicator"] == "국내총생산(GDP)", result
+    task_metrics = [
+        metric
+        for task in result.get("analysis_tasks") or []
+        for metric in task.get("metrics") or []
+    ]
+    assert "국내총생산(GDP)" in task_metrics, result
+    assert "GDP" not in task_metrics, result
+
+
 async def test_plan_query_change_implication_inference_log() -> None:
     original_normalize = kosis_mcp_server._normalize_indicator_from_kosis_meta
 
@@ -551,6 +627,20 @@ async def test_plan_query_change_implication_inference_log() -> None:
     assert result["intent"] == "growth_rate", result
     assert any(task["type"] == "yoy_pct_or_growth_rate" for task in result["analysis_tasks"]), result
     assert result["analysis_tasks_inference_log"][0]["source_field"] == "query_text", result
+
+
+async def test_plan_query_empty_and_nonstat_need_clarification() -> None:
+    empty = await kosis_mcp_server.plan_query("")
+    assert empty["status"] == "needs_clarification", empty
+    assert empty["route_intents"] == [], empty
+
+    weather = await kosis_mcp_server.plan_query("날씨 어때?")
+    assert weather["status"] == "needs_clarification", weather
+    assert weather["route_intents"] == [], weather
+    assert weather["metrics"] == [], weather
+    assert weather["analysis_tasks"] == [], weather
+    assert weather["suggested_workflow"] == [], weather
+    assert weather["evidence_workflow"] == [], weather
 
 
 async def test_resolve_concepts_ambiguity_best_selection_reason() -> None:
@@ -585,6 +675,15 @@ async def test_resolve_concepts_ambiguity_best_selection_reason() -> None:
     assert ambiguity["best"]["disambiguation_strategy"]["primary"] == "context_aware_parent_match", result
 
 
+async def test_resolve_concepts_empty_list_has_contract() -> None:
+    result = await kosis_mcp_server.resolve_concepts("101", "TBL_FAKE", [], api_key="dummy")
+    assert result["status"] == "unsupported", result
+    contract = result["mcp_output_contract"]
+    assert contract["role"] == "concept_resolution", contract
+    markers = contract["current_signals"]["markers_present"]
+    assert "invalid_input" in markers, markers
+
+
 def test_answer_query_deprecated_contract() -> None:
     result = kosis_mcp_server._attach_gemma_deprecation_warning({
         "status": "partial",
@@ -596,6 +695,120 @@ def test_answer_query_deprecated_contract() -> None:
     markers = contract["current_signals"]["markers_present"]
     assert "partial_fulfillment" in markers, markers
     assert contract["current_signals"]["dropped_dimensions"] == ["aggregation"], contract
+
+
+async def test_query_table_invalid_filter_has_contract() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "임의 표"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": "지표"},
+                {"OBJ_ID": "A", "OBJ_NM": "지역", "ITM_ID": "11", "ITM_NM": "서울"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}]
+        return []
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_FAKE",
+            filters={"ITEM": ["FAKE_CODE"], "BAD_AXIS": ["X"]},
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["code"] == "INVALID_FILTER_CODE", result
+    contract = result["mcp_output_contract"]
+    assert contract["current_signals"]["has_failures"] is True, contract
+    markers = contract["current_signals"]["markers_present"]
+    assert "invalid_input" in markers, markers
+    assert "validation_errors" in markers, markers
+
+
+async def test_query_table_period_error_has_contract_and_format_guidance() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "monthly table"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "item", "ITM_ID": "T1", "ITM_NM": "metric"},
+                {"OBJ_ID": "A", "OBJ_NM": "region", "ITM_ID": "11", "ITM_NM": "Seoul"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "M", "STRT_PRD_DE": "202001", "END_PRD_DE": "202412"}]
+        return []
+
+    async def fake_call(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        raise AssertionError("raw KOSIS call should not run for invalid period")
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_FAKE",
+            filters={"ITEM": ["T1"], "A": ["11"]},
+            period_range=["2024-Q1", "2024-Q1"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    assert result["code"] == "PERIOD_NOT_FOUND", result
+    assert result["suggested_period_range"] == ["202401", "202403"], result
+    assert result["period_format_examples"]["api_period_type"] == "M", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "period_not_found" in markers, markers
+    assert "period_type_mismatch" in markers, markers
+
+
+async def test_query_table_projection_data_marker() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "population projection"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "item", "ITM_ID": "T1", "ITM_NM": "population", "UNIT_NM": "people"},
+                {"OBJ_ID": "A", "OBJ_NM": "region", "ITM_ID": "11", "ITM_NM": "Seoul"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2050"}]
+        return []
+
+    async def fake_call(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        return [{"PRD_DE": "2050", "DT": "123", "ITM_ID": "T1", "C1": "11", "UNIT_NM": "people"}]
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_PROJ",
+            filters={"ITEM": ["T1"], "A": ["11"]},
+            period_range=["2050", "2050"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    assert result["data_nature"] == "projection", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "projection_data" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["data_nature"] == "projection", result
 
 
 async def test_query_table_fanout_limit_rejects_before_raw_call() -> None:
@@ -674,6 +887,7 @@ async def main() -> None:
         ("explore_table_stale_contract", lambda: test_explore_table_contract_on_stale_period()),
         ("search_kosis_empty_contract", lambda: test_search_kosis_contract_on_empty_results()),
         ("compute_growth_rate", lambda: test_compute_indicator_growth_rate()),
+        ("compute_growth_rate_single_row_reason", lambda: test_compute_indicator_growth_rate_single_row_has_reason()),
         ("compute_per_capita_denominator_zero", lambda: test_compute_indicator_per_capita_with_denominator_zero()),
         ("compute_unit_transformation", lambda: test_compute_indicator_unit_transformation_requires_caller_label()),
         ("compute_share_input_total", lambda: test_compute_indicator_share_uses_input_total()),
@@ -687,10 +901,17 @@ async def main() -> None:
         ("select_table_freshness_near_tiebreak", lambda: test_select_table_prefers_fresh_candidate_on_indicator_near_tie()),
         ("indicator_normalization_parenthetical_acronym", lambda: test_indicator_normalization_prefers_parenthetical_acronym()),
         ("indicator_normalization_route_terms", lambda: test_indicator_normalization_uses_route_search_terms()),
+        ("indicator_normalization_table_context", lambda: test_indicator_normalization_prefers_relevant_table_name()),
         ("plan_indicator_normalization", lambda: test_plan_query_indicator_normalization_from_kosis_meta()),
+        ("plan_normalized_metric_refs", lambda: test_plan_query_normalized_metric_references_are_synced()),
         ("plan_change_inference_log", lambda: test_plan_query_change_implication_inference_log()),
+        ("plan_empty_nonstat_clarification", lambda: test_plan_query_empty_and_nonstat_need_clarification()),
         ("resolve_ambiguity_reason", lambda: test_resolve_concepts_ambiguity_best_selection_reason()),
+        ("resolve_empty_contract", lambda: test_resolve_concepts_empty_list_has_contract()),
         ("answer_query_deprecated_contract", lambda: test_answer_query_deprecated_contract()),
+        ("query_table_invalid_filter_contract", lambda: test_query_table_invalid_filter_has_contract()),
+        ("query_table_period_error_contract", lambda: test_query_table_period_error_has_contract_and_format_guidance()),
+        ("query_table_projection_marker", lambda: test_query_table_projection_data_marker()),
         ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
     ]

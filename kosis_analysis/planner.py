@@ -260,6 +260,8 @@ class QueryWorkflowPlanner:
         route = route_payload.get("route") or {}
         if not metrics and not analysis_tasks:
             return True
+        if not metrics:
+            return True
         if route.get("type") != "miss":
             return False
         if metrics or analysis_tasks:
@@ -281,6 +283,12 @@ class QueryWorkflowPlanner:
         calculations: list[str],
         route_payload: dict[str, Any],
     ) -> dict[str, Any]:
+        route = route_payload.get("route") or {}
+        route_intents = (
+            []
+            if not query.strip() or (route.get("type") == "miss" and not dimensions)
+            else route_payload.get("intents", [])
+        )
         return {
             "상태": "needs_clarification",
             "status": "needs_clarification",
@@ -343,7 +351,7 @@ class QueryWorkflowPlanner:
                 "단일값, 추이, 지역 비교, 비중 계산 중 어떤 형태가 필요하신가요?",
             ],
             "route": route_payload.get("route", {}),
-            "route_intents": route_payload.get("intents", []),
+            "route_intents": route_intents,
             "router_slots": route_payload.get("slots", {}),
             "validation": route_payload.get("validation", {}),
             "must_not": [
@@ -1393,6 +1401,9 @@ class QueryWorkflowPlanner:
         dimension_names = [d["name"] for d in bundle_dimensions if d.get("name")]
         tasks: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
+
+        if not metric_names:
+            return tasks
 
         def add(task_type: str, **kwargs: Any) -> None:
             key = (task_type, json.dumps(kwargs, ensure_ascii=False, sort_keys=True, default=str))
