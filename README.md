@@ -122,8 +122,42 @@ MCP 설정은 대부분 아래 구조를 가집니다.
 
 korean-law MCP처럼 `command`만 짧게 쓰려면 먼저 실행 명령을 설치합니다.
 
+이 명령은 **Claude나 Cursor의 채팅창에 입력하는 것이 아니라, 내 컴퓨터의 터미널에서 실행**합니다.
+
+터미널 여는 방법:
+
+| OS | 어디서 실행하나요? |
+| --- | --- |
+| Windows | 시작 메뉴에서 `PowerShell` 또는 `Windows Terminal`을 열고 실행 |
+| macOS | `응용 프로그램` → `유틸리티` → `터미널`을 열고 실행 |
+| Linux | 사용하는 배포판의 Terminal 앱을 열고 실행 |
+
+실행 위치는 아무 폴더여도 괜찮습니다. 이 방식은 GitHub에서 패키지를 받아 Python 환경에 설치하는 명령이라, 특정 프로젝트 폴더 안으로 들어갈 필요가 없습니다.
+
+Windows PowerShell 예시:
+
 ```powershell
 pip install "git+https://github.com/jaykim429/korea-statistic-MCP-cginside.git"
+```
+
+macOS/Linux 터미널 예시:
+
+```bash
+pip install "git+https://github.com/jaykim429/korea-statistic-MCP-cginside.git"
+```
+
+`pip` 명령을 찾지 못하면 아래처럼 Python을 통해 실행합니다.
+
+Windows:
+
+```powershell
+python -m pip install "git+https://github.com/jaykim429/korea-statistic-MCP-cginside.git"
+```
+
+macOS/Linux:
+
+```bash
+python3 -m pip install "git+https://github.com/jaykim429/korea-statistic-MCP-cginside.git"
 ```
 
 설치 확인:
@@ -174,11 +208,39 @@ which kosis-analysis-mcp
 
 ## 방법 2. Git Clone 후 로컬 경로로 연결
 
+이 방식은 코드를 내 컴퓨터에 내려받아 직접 연결하는 방법입니다. 먼저 터미널에서 작업할 폴더로 이동합니다.
+
+예를 들어 Windows에서 문서 폴더 아래에 설치하려면:
+
+```powershell
+cd "$HOME\Documents"
+```
+
+macOS/Linux에서 홈 폴더 아래에 설치하려면:
+
+```bash
+cd ~
+```
+
+그 다음 아래 명령을 실행합니다.
+
+Windows PowerShell:
+
 ```powershell
 git clone https://github.com/jaykim429/korea-statistic-MCP-cginside.git
 cd korea-statistic-MCP-cginside
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+macOS/Linux:
+
+```bash
+git clone https://github.com/jaykim429/korea-statistic-MCP-cginside.git
+cd korea-statistic-MCP-cginside
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
 
