@@ -2172,6 +2172,10 @@ _INDUSTRY_TERMS = {
 _SOURCE_TERMS = {
     "kosis": "KOSIS",
     "통계청": "통계청",
+    "nabo": "NABO",
+    "nabostats": "NABO",
+    "국회예산정책처": "NABO",
+    "재정경제통계시스템": "NABO",
     "중기부": "중소벤처기업부",
     "중소벤처기업부": "중소벤처기업부",
     "소진공": "소상공인시장진흥공단",

@@ -42,8 +42,9 @@
     "Do not present plan_query output as a final answer.",
     "For analysis tools, use input arrays, must_know, data_characteristics, model_options, and common_pitfalls before choosing an interpretation.",
     "Use metrics, quarantined_metrics, conflict_decisions, semantic_dimensions, and table_required_dimensions to decide follow-up calls.",
-    "When using NABO tools, preserve source_system and provider; do not describe NABO rows as KOSIS evidence.",
-    "Use search_stats only to discover candidates across providers; verify table metadata before treating KOSIS and NABO statistics as comparable.",
+    "When using NABO tools, preserve source_system, provider, dtacycle_resolution, period_request, and ITEM.full_label; do not describe NABO rows as KOSIS evidence.",
+    "If query_nabo_table returns truncated_by_max_rows, do not treat latest_period_in_returned_rows as the full dataset latest period.",
+    "Use search_stats only to discover candidates across providers; when definition_comparison_required is true, verify table metadata before treating KOSIS and NABO statistics as comparable.",
     "Do not infer missing KOSIS values from model knowledge.",
     "Report unsupported, missing, or low-coverage metrics explicitly."
   ]

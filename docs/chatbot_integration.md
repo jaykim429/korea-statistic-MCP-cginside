@@ -183,10 +183,20 @@ NABO는 KOSIS의 하위 표가 아니라 별도 제공기관입니다. Gemma는 
 사용하더라도 출처를 섞어 말하면 안 됩니다.
 
 - `KOSIS_API_KEY`는 KOSIS 도구에, `NABO_API_KEY`는 NABO 도구에 필요합니다.
-- `search_stats(source="all")`는 후보 발견용입니다. 정의가 같은 표인지 판단하려면
+- `search_stats(source="all")`는 후보 발견용입니다. KOSIS와 NABO 후보가 함께 나오면
+  `definition_comparison_required`와 `cross_source_definition_check_required`를 확인하고,
   각 표의 메타데이터와 단위를 따로 확인합니다.
 - NABO 조회 흐름은 `search_nabo_tables` → `explore_nabo_table` →
   `query_nabo_table`입니다.
-- NABO 주기는 `dtacycle_cd`로 지정합니다. 연간은 `YY`, 분기는 `QY`, 월간은 `MM`을
-  우선 확인합니다.
+- NABO 주기는 `dtacycle_cd`로 지정합니다. 기본값 `auto`는 표 메타데이터에서 연간
+  `YY`, 분기 `QY`, 월간 `MM`을 추론하고 `dtacycle_resolution`에 근거를 남깁니다.
+  `dtacycle_cd_suggestions`는 실제 표 주기만 뜻하고, 전체 입력 enum은
+  `dtacycle_supported_values`에서 확인합니다.
+- NABO 기간은 `period="latest"`, `period="2024"`, `period_range=["2010", "2024"]`,
+  `period="2010:2024"`, `period="2010-2024"` 형식을 사용할 수 있습니다. 범위가
+  비어 있으면 `period_filter_empty`와 `period_request`를 확인합니다.
+- NABO 조회 결과에서 `ITEM.label`이 반복될 수 있으므로 `dimensions.ITEM.full_label`
+  또는 `item_full_name`을 우선 사용합니다.
+- `truncated_by_max_rows`가 있으면 `latest_period`는 완전한 최신 시점을 뜻하지 않습니다.
+  이때는 `latest_period_in_returned_rows`를 “반환된 행 중 최신”으로만 다룹니다.
 - 최종 답변에는 “KOSIS 기준”과 “NABO 기준”을 구분해서 씁니다.

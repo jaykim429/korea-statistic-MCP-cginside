@@ -781,8 +781,8 @@ chart_line("고령인구", region="전국", years=5)
 NABOSTATS(국회예산정책처 재정경제통계시스템) OpenAPI도 같은 MCP에서 조회할 수 있습니다. NABO 도구는 KOSIS 도구와 별개 제공기관이므로, 응답의 `source_system: "NABO"`와 `provider`를 답변에 보존해야 합니다.
 
 - `search_nabo_tables(query, limit?)` — NABO 통계표 후보를 검색합니다. 결과에는 `STATBL_ID`, 표명, 주기 정보, 조회 가능한 `dtacycle_cd_suggestion`이 들어갑니다.
-- `explore_nabo_table(statbl_id)` — 선택한 NABO 표의 항목·분류 코드와 주기 후보를 확인합니다. 값을 조회하기 전 코드 매핑용으로 사용합니다.
-- `query_nabo_table(statbl_id, dtacycle_cd, period?, filters?)` — NABO 원자료를 `period`, `value`, `unit`, `dimensions`, `raw` 형태로 정규화해 반환합니다. `filters`에는 `ITEM`, `CLASS`, `GROUP`, `period` 계열 키를 사용할 수 있습니다.
+- `explore_nabo_table(statbl_id)` — 선택한 NABO 표의 항목·분류 코드와 주기 후보를 확인합니다. 값을 조회하기 전 코드 매핑용으로 사용합니다. 응답의 `dtacycle_cd_suggestions`와 `dtacycle_guidance`를 보면 연간(`YY`), 분기(`QY`), 월간(`MM`) 중 어떤 주기로 조회할지 판단할 수 있습니다.
+- `query_nabo_table(statbl_id, dtacycle_cd="auto", period?, period_range?, filters?)` — NABO 원자료를 `period`, `value`, `unit`, `dimensions`, `raw` 형태로 정규화해 반환합니다. `dtacycle_cd="auto"`이면 표 메타데이터의 주기명을 보고 `YY`/`QY`/`MM`을 선택하고, 그 근거를 `dtacycle_resolution`에 남깁니다. `filters`에는 `ITEM`, `CLASS`, `GROUP`, `period` 계열 키를 사용할 수 있습니다.
 - `search_nabo_terms(term, limit?)` — NABO 통계 용어사전을 검색합니다.
 - `search_stats(query, source="all")` — KOSIS와 NABO 표 후보를 함께 찾는 통합 검색 입구입니다. 통합 검색은 후보를 합쳐 보여줄 뿐, 두 제공기관의 통계가 같은 정의라고 단정하지 않습니다.
 
@@ -792,8 +792,18 @@ NABOSTATS(국회예산정책처 재정경제통계시스템) OpenAPI도 같은 M
 search_stats("GDP", source="all")
 search_nabo_tables("재정수지")
 explore_nabo_table("T192213006109866")
-query_nabo_table("T192213006109866", dtacycle_cd="YY", period="latest", filters={"ITEM": ["10001"]})
+query_nabo_table("T192213006109866", period="latest", filters={"ITEM": ["10001"]})
+query_nabo_table("T192213006109866", period_range=["2010", "2024"], filters={"ITEM": ["10001"]})
+query_nabo_table("T192213006109866", period="2010:2024", filters={"ITEM": ["10001"]})
 ```
+
+NABO 기간 입력은 단일 시점(`"2024"`), 최신(`"latest"`), 배열 범위(`period_range=["2010", "2024"]`), 문자열 범위(`"2010:2024"`, `"2010-2024"`), 객체 범위(`{"start": "2010", "end": "2024"}`)를 지원합니다. 범위 조회는 NABO API가 직접 지원하지 않는 경우 MCP가 원자료를 받은 뒤 기간 필터를 적용하고, `period_request`와 `period_filtered_row_count`에 처리 과정을 남깁니다.
+
+`dtacycle_cd_suggestions`는 해당 NABO 표 메타데이터에서 확인된 실제 주기만 담습니다. 입력 가능한 전체 enum은 `dtacycle_supported_values`를 보세요. 예를 들어 연간 표에서 `dtacycle_cd="QY"`를 요청하면 빈 결과가 아니라 `period_type_incompatible`와 `dtacycle_mismatch`로 거절합니다.
+
+NABO 원자료는 같은 `ITEM.label`이 여러 코드에서 반복될 수 있습니다. `query_nabo_table`은 항목 메타데이터를 조인해 각 행의 `item_full_name`과 `dimensions.ITEM.full_label`에 `임금근로자>실업급여계정>수입` 같은 전체 경로를 함께 넣습니다. 답변에서는 짧은 `label`만 보지 말고 `full_label`을 우선 확인하세요.
+
+질문에 “NABO 기준”, “국회예산정책처”, “재정경제통계시스템”이 명시되면 `plan_query`는 KOSIS 표 선택 대신 `search_nabo_tables` → `explore_nabo_table` → `query_nabo_table` 흐름을 제안합니다. 이때 `source_preference: "NABO"`와 `nabo_indicator_normalization`을 확인하면 어떤 후보 문구와 NABO 메타데이터가 metric 추출에 쓰였는지 볼 수 있습니다.
 
 챗봇용 절차형 입구로 `plan_query(query)`가 제공됩니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 복잡한 질문에서 LLM이 직접 경로를 고르고 검증할 수 있도록 돕는 계획 전용 도구입니다.
 

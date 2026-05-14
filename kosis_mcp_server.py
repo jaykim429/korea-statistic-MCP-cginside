@@ -171,6 +171,21 @@ NABO_DTACYCLE_FROM_NAME = {
     "분기": "QY",
     "월": "MM",
 }
+NABO_DTACYCLE_GUIDANCE = {
+    "YY": {
+        "label": "annual",
+        "accepted_period_examples": ["2024", ["2010", "2024"], "2010:2024", "2010-2024"],
+    },
+    "QY": {
+        "label": "quarterly",
+        "accepted_period_examples": ["2024Q1", ["2023Q1", "2024Q4"], "2023Q1:2024Q4"],
+    },
+    "MM": {
+        "label": "monthly",
+        "accepted_period_examples": ["202401", "2024-01", ["202401", "202412"], "202401:202412"],
+    },
+}
+NABO_ITEM_META_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 
 ANSWER_QUERY_CONVENIENCE_NOTE = {
     "tool": "answer_query",
@@ -323,16 +338,18 @@ def _mcp_tool_output_contract(
         "missing_api_key": "Configure KOSIS_API_KEY or pass api_key; do not fabricate data.",
         "missing_denominator": "Provide denominator_rows from verified raw data before calculating ratios.",
         "not_matched": "Treat the result as no verified match; search or ask for clarification.",
-        "search_empty": "Report that no KOSIS search candidates were found; do not invent a table.",
+        "search_empty": "Report that no search candidates were found for this source; do not invent a table.",
         "concept_unresolved": "Use matches_by_concept/ambiguities or ask for a more specific concept.",
         "missing_metrics": "Ask for or infer a statistical metric before selecting a table.",
         "validation_errors": "Inspect validation_errors and retry with corrected structured arguments.",
         "partial_fanout_coverage": "Disclose missing filter sets and avoid treating returned rows as complete coverage.",
+        "truncated_by_max_rows": "Returned rows were cut by max_rows; do not treat latest_period_in_returned_rows as the dataset latest period.",
         "complete_fanout_miss": "Report that verified calls returned no rows; do not backfill from model knowledge.",
         "max_fanout_exceeded": "Reduce filters or split the query into smaller calls.",
         "fanout_call_failed": "Inspect fanout.call_details errors/timeouts before using any partial rows.",
         "period_not_found": "Use available_period_range or suggested_period_range before retrying.",
         "period_type_mismatch": "Convert the requested period to the table cadence shown in period_format_examples.",
+        "dtacycle_mismatch": "Use the table's dtacycle_cd_suggestions or dtacycle_cd='auto' before querying NABO rows.",
         "invalid_period_format": "Normalize natural-language time to KOSIS period codes before retrying query_table.",
         "duplicate_denominator_key": "Resolve duplicate denominator rows; do not choose one silently.",
         "non_numeric_aggregation_input": "Disclose dropped rows and avoid presenting aggregation as complete.",
@@ -349,6 +366,16 @@ def _mcp_tool_output_contract(
         "deprecation": "Prefer the recommended replacement workflow/tool.",
         "formula_advisory_only": "Treat formula guidance as advisory; verify numerator/denominator from KOSIS metadata/raw rows.",
         "heuristic_extraction": "Treat extracted concepts as candidates only; verify with KOSIS metadata before use.",
+        "not_matched_table": "The provided table identifier was not verified in provider metadata; search again before retrying.",
+        "period_filter_empty": "Rows existed before period filtering, but none matched the requested period range.",
+        "filter_no_match": "Rows existed before caller filters, but none matched the structured filters.",
+        "partial_filter_match": "Some requested filter values did not match returned metadata; inspect filter_coverage before answering.",
+        "item_metadata_joined": "Use ITEM.full_label when label is ambiguous or repeated.",
+        "metadata_partial": "Some metadata could not be joined; avoid over-interpreting labels without full paths.",
+        "source_preference_nabo": "Use NABO tools for follow-up unless the caller explicitly changes source.",
+        "nabo_routing": "NABO source preference changed the workflow away from KOSIS table selection.",
+        "nabo_metadata_candidate": "NABO metadata supplied candidate metrics; verify table/items before values.",
+        "nabo_metadata_partial": "NABO metadata lookup was partial; treat candidates as unverified.",
     }
     marker_guidance = {
         marker: marker_guidance_catalog[marker]
@@ -361,16 +388,22 @@ def _mcp_tool_output_contract(
         "missing_api_key",
         "missing_denominator",
         "not_matched",
+        "not_matched_table",
         "search_empty",
         "concept_unresolved",
         "missing_metrics",
         "validation_errors",
         "partial_fanout_coverage",
+        "truncated_by_max_rows",
         "complete_fanout_miss",
+        "period_filter_empty",
+        "filter_no_match",
+        "partial_filter_match",
         "max_fanout_exceeded",
         "fanout_call_failed",
         "period_not_found",
         "period_type_mismatch",
+        "dtacycle_mismatch",
         "invalid_period_format",
         "duplicate_denominator_key",
         "non_numeric_aggregation_input",
@@ -412,14 +445,20 @@ def _mcp_tool_output_contract(
             "missing_api_key",
             "missing_denominator",
             "not_matched",
+            "not_matched_table",
             "search_empty",
             "validation_errors",
             "partial_fanout_coverage",
+            "truncated_by_max_rows",
             "complete_fanout_miss",
+            "period_filter_empty",
+            "filter_no_match",
+            "partial_filter_match",
             "max_fanout_exceeded",
             "fanout_call_failed",
             "period_not_found",
             "period_type_mismatch",
+            "dtacycle_mismatch",
             "invalid_period_format",
             "duplicate_denominator_key",
             "non_numeric_aggregation_input",
@@ -1029,7 +1068,9 @@ def _analysis_common_pitfalls(series_result: dict[str, Any], values: list[float]
 
 
 def _nabo_dtacycle_code(value: Optional[str]) -> str:
-    raw = str(value or "YY").strip()
+    raw = str(value or "auto").strip()
+    if raw.upper() == "AUTO":
+        return "AUTO"
     return NABO_DTACYCLE_ALIASES.get(raw.upper()) or NABO_DTACYCLE_ALIASES.get(raw) or raw.upper()
 
 
@@ -1041,6 +1082,153 @@ def _nabo_dtacycle_from_name(value: Optional[str]) -> Optional[str]:
         if token in raw:
             return code
     return None
+
+
+def _nabo_dtacycle_suggestions(primary: Optional[str] = None, *, include_generic: bool = False) -> list[str]:
+    values = [primary]
+    if include_generic:
+        values.extend(["YY", "QY", "MM"])
+    return list(dict.fromkeys(c for c in values if c))
+
+
+def _nabo_dtacycle_guidance(codes: list[str]) -> dict[str, Any]:
+    return {code: NABO_DTACYCLE_GUIDANCE.get(code, {}) for code in codes}
+
+
+def _nabo_normalize_period_token(value: Any, cycle: str) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.lower() == "latest":
+        return "latest"
+    if cycle == "MM":
+        month_match = re.fullmatch(r"(\d{4})[-./년\s]?(\d{1,2})월?", raw)
+        if month_match:
+            month = int(month_match.group(2))
+            if 1 <= month <= 12:
+                return f"{month_match.group(1)}{month:02d}"
+    return raw
+
+
+def _nabo_period_sort_key(value: Any) -> tuple[int, int, str]:
+    raw = str(value or "").strip()
+    digits = "".join(re.findall(r"\d+", raw))
+    if len(digits) >= 6:
+        return (int(digits[:4]), int(digits[4:6]), raw)
+    if len(digits) >= 5:
+        return (int(digits[:4]), int(digits[4:]), raw)
+    if len(digits) >= 4:
+        return (int(digits[:4]), 0, raw)
+    return (-1, -1, raw)
+
+
+def _nabo_parse_period_request(
+    period: Any = None,
+    period_range: Optional[list[str]] = None,
+    *,
+    cycle: str,
+) -> dict[str, Any]:
+    source = "period_range" if period_range not in (None, []) else "period"
+    raw_input = period_range if source == "period_range" else period
+    result: dict[str, Any] = {
+        "source": source,
+        "raw_input": raw_input,
+        "mode": "all",
+        "api_filter_period": None,
+        "normalized_period": None,
+        "normalized_range": None,
+        "errors": [],
+        "accepted_forms": {
+            "latest": "latest",
+            "single": "2024",
+            "range_array": ["2010", "2024"],
+            "range_colon": "2010:2024",
+            "range_hyphen": "2010-2024",
+            "range_object": {"start": "2010", "end": "2024"},
+        },
+    }
+    if raw_input in (None, ""):
+        return result
+
+    if isinstance(raw_input, dict):
+        start = raw_input.get("start") or raw_input.get("from") or raw_input.get("begin")
+        end = raw_input.get("end") or raw_input.get("to") or raw_input.get("until")
+        raw_bounds = [start, end]
+    elif isinstance(raw_input, (list, tuple)):
+        values = [v for v in raw_input if v not in (None, "")]
+        if len(values) == 1:
+            raw_bounds = [values[0]]
+        else:
+            raw_bounds = values[:2]
+    else:
+        raw_text = str(raw_input).strip()
+        if raw_text.lower() == "latest":
+            result.update({"mode": "latest", "normalized_period": "latest"})
+            return result
+        colon_parts = re.split(r"\s*(?::|~|–|—)\s*", raw_text, maxsplit=1)
+        hyphen_match = re.fullmatch(r"\s*(\d{4,6})\s*-\s*(\d{4,6})\s*", raw_text)
+        if len(colon_parts) == 2:
+            raw_bounds = colon_parts
+        elif hyphen_match:
+            raw_bounds = [hyphen_match.group(1), hyphen_match.group(2)]
+        else:
+            raw_bounds = [raw_text]
+
+    normalized = [_nabo_normalize_period_token(v, cycle) for v in raw_bounds]
+    normalized = [v for v in normalized if v]
+    if not normalized:
+        result["errors"].append({
+            "code": "INVALID_PERIOD_INPUT",
+            "message": "period did not include a usable NABO period code.",
+        })
+        return result
+    if len(normalized) == 1:
+        if normalized[0] == "latest":
+            result.update({"mode": "latest", "normalized_period": "latest"})
+        else:
+            result.update({
+                "mode": "single",
+                "normalized_period": normalized[0],
+                "api_filter_period": normalized[0],
+            })
+        return result
+
+    start, end = normalized[0], normalized[1]
+    start_key = _nabo_period_sort_key(start)
+    end_key = _nabo_period_sort_key(end)
+    if start_key[0] < 0 or end_key[0] < 0:
+        result["errors"].append({
+            "code": "INVALID_PERIOD_RANGE",
+            "message": "period range bounds could not be interpreted as ordered period codes.",
+            "bounds": [start, end],
+        })
+        return result
+    if start_key > end_key:
+        start, end = end, start
+    result.update({
+        "mode": "range",
+        "normalized_range": [start, end],
+        "range_filter_applied_by_mcp": True,
+    })
+    return result
+
+
+def _nabo_apply_period_request(rows: list[dict[str, Any]], period_request: dict[str, Any]) -> list[dict[str, Any]]:
+    mode = period_request.get("mode")
+    if mode == "latest" and rows:
+        latest_period = max(str(row.get("WRTTIME_IDTFR_ID") or "") for row in rows)
+        return [row for row in rows if str(row.get("WRTTIME_IDTFR_ID") or "") == latest_period]
+    if mode == "range":
+        start, end = period_request.get("normalized_range") or [None, None]
+        start_key = _nabo_period_sort_key(start)
+        end_key = _nabo_period_sort_key(end)
+        selected = []
+        for row in rows:
+            period_key = _nabo_period_sort_key(row.get("WRTTIME_IDTFR_ID"))
+            if start_key <= period_key <= end_key:
+                selected.append(row)
+        return selected
+    return rows
 
 
 def _nabo_service_root(service: str) -> str:
@@ -1220,13 +1408,16 @@ def _nabo_item_record(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _nabo_data_record(row: dict[str, Any]) -> dict[str, Any]:
+def _nabo_data_record(row: dict[str, Any], item_meta: Optional[dict[str, dict[str, Any]]] = None) -> dict[str, Any]:
     raw_value = row.get("DTA_VAL")
     try:
         value = float(str(raw_value).replace(",", "")) if raw_value not in (None, "") else None
     except (TypeError, ValueError):
         value = None
     unit = row.get("UI_NM")
+    item_code = None if row.get("ITM_ID") in (None, "") else str(row.get("ITM_ID"))
+    meta = (item_meta or {}).get(item_code or "") or {}
+    item_full_name = meta.get("item_full_name") or row.get("ITM_FULLNM")
     return {
         "source_system": "NABO",
         "provider": "국회예산정책처 재정경제통계시스템",
@@ -1237,6 +1428,7 @@ def _nabo_data_record(row: dict[str, Any]) -> dict[str, Any]:
         "value_raw": raw_value,
         "unit": unit,
         "symbol": row.get("DTA_SVAL"),
+        "item_full_name": item_full_name,
         "dimensions": {
             "GROUP": {
                 "code": None if row.get("GRP_ID") in (None, "") else str(row.get("GRP_ID")),
@@ -1249,8 +1441,11 @@ def _nabo_data_record(row: dict[str, Any]) -> dict[str, Any]:
                 "unit": None,
             },
             "ITEM": {
-                "code": None if row.get("ITM_ID") in (None, "") else str(row.get("ITM_ID")),
+                "code": item_code,
                 "label": row.get("ITM_NM"),
+                "full_label": item_full_name,
+                "parent_item_id": meta.get("parent_item_id"),
+                "comment": meta.get("comment"),
                 "unit": unit,
             },
         },
@@ -1318,6 +1513,70 @@ def _nabo_filter_data_rows(rows: list[dict[str, Any]], filters: Optional[dict[st
         if matched:
             selected.append(row)
     return selected, []
+
+
+def _nabo_filter_coverage(rows: list[dict[str, Any]], filters: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not filters:
+        return {
+            "requested_value_count": 0,
+            "matched_value_count": 0,
+            "missing_filter_values": [],
+            "coverage_ratio": 1.0,
+        }
+    missing: list[dict[str, Any]] = []
+    requested_total = 0
+    matched_total = 0
+    for key, value in filters.items():
+        fields = NABO_FILTER_KEY_MAP.get(str(key))
+        if not fields:
+            continue
+        requested_values = _as_string_set(value)
+        if not requested_values:
+            continue
+        observed = {
+            str(row.get(field))
+            for row in rows
+            for field in fields
+            if row.get(field) not in (None, "")
+        }
+        matched = sorted(requested_values & observed)
+        missing_values = sorted(requested_values - observed)
+        requested_total += len(requested_values)
+        matched_total += len(matched)
+        if missing_values:
+            missing.append({
+                "filter_key": key,
+                "requested_values": sorted(requested_values),
+                "matched_values": matched,
+                "missing_values": missing_values,
+                "matched_fields": list(fields),
+            })
+    ratio = 1.0 if requested_total == 0 else matched_total / requested_total
+    return {
+        "requested_value_count": requested_total,
+        "matched_value_count": matched_total,
+        "missing_filter_values": missing,
+        "coverage_ratio": ratio,
+    }
+
+
+async def _nabo_item_meta_map(statbl_id: str, key: str) -> dict[str, dict[str, Any]]:
+    cache_key = str(statbl_id or "")
+    if cache_key in NABO_ITEM_META_CACHE:
+        return NABO_ITEM_META_CACHE[cache_key]
+    payload = await _nabo_fetch_rows(
+        "Sttsapitblitm",
+        key,
+        {"STATBL_ID": statbl_id, "pSize": NABO_MAX_PAGE_SIZE},
+        max_rows=NABO_MAX_PAGE_SIZE,
+    )
+    mapping = {
+        item["item_id"]: item
+        for item in (_nabo_item_record(row) for row in payload.get("rows", []))
+        if item.get("item_id")
+    }
+    NABO_ITEM_META_CACHE[cache_key] = mapping
+    return mapping
 
 
 def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
@@ -4589,7 +4848,7 @@ async def chain_full_analysis(
 
 
 @mcp.tool()
-async def plan_query(query: str, api_key: Optional[str] = None) -> dict:
+async def plan_query(query: str, api_key: Optional[str] = None, nabo_api_key: Optional[str] = None) -> dict:
     """[🧭] Gemma용 절차형 KOSIS 분석 계획을 만든다.
 
     질문을 차원과 작업 단계로 분해합니다.
@@ -4604,7 +4863,7 @@ async def plan_query(query: str, api_key: Optional[str] = None) -> dict:
     """
     planner = QueryWorkflowPlanner()
     plan = planner.build(query)
-    return await _enrich_plan_with_metadata(plan, query, api_key=api_key)
+    return await _enrich_plan_with_metadata(plan, query, api_key=api_key, nabo_api_key=nabo_api_key)
 
 
 @mcp.tool()
@@ -5462,10 +5721,333 @@ def _change_implication_evidence(query: str, route_payload: dict[str, Any]) -> O
     return None
 
 
+def _detect_explicit_source_preference(query: str, plan: dict[str, Any]) -> Optional[str]:
+    slots = plan.get("router_slots") if isinstance(plan.get("router_slots"), dict) else {}
+    raw = str((slots or {}).get("source_preference") or "").strip()
+    if raw:
+        raw_norm = _compact_text(raw).lower()
+        if raw_norm in {"nabo", "nabostats"} or "국회예산정책처" in raw or "재정경제통계시스템" in raw:
+            return "NABO"
+        if raw_norm in {"kosis"} or "통계청" in raw:
+            return "KOSIS"
+    q_norm = _compact_text(query).lower()
+    if any(term in q_norm for term in ("nabo", "nabostats", "국회예산정책처", "재정경제통계시스템")):
+        return "NABO"
+    if "kosis" in q_norm or "통계청" in q_norm:
+        return "KOSIS"
+    return None
+
+
+def _strip_korean_particle(value: str) -> str:
+    text = str(value or "").strip(" \t\r\n,.;:()[]{}\"'")
+    for suffix in ("으로", "로", "에서", "에게", "부터", "까지", "보다", "처럼", "라는", "란", "와", "과", "및", "은", "는", "이", "가", "을", "를", "의"):
+        if len(text) > len(suffix) + 1 and text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def _nabo_plan_candidate_phrases(query: str, plan: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        text = _strip_korean_particle(str(value or ""))
+        if not text:
+            return
+        compact = _compact_text(text).lower()
+        if compact in {
+            "nabo", "nabostats", "기준", "최근", "최신", "추이", "시계열",
+            "비율", "비중", "구성비", "대비", "증가율", "감소율", "변화율",
+            "관리", "국회예산정책처", "재정경제통계시스템",
+        }:
+            return
+        if re.fullmatch(r"\d+년?", compact):
+            return
+        if len(compact) <= 1:
+            return
+        if text not in candidates:
+            candidates.append(text)
+
+    dimensions = plan.get("intended_dimensions") if isinstance(plan.get("intended_dimensions"), dict) else {}
+    add(dimensions.get("indicator"))
+    for metric in plan.get("metrics") or []:
+        if isinstance(metric, dict):
+            add(metric.get("name"))
+    for concept in plan.get("concepts") or []:
+        add(concept)
+    route = plan.get("route") if isinstance(plan.get("route"), dict) else {}
+    for term in route.get("search_terms") or []:
+        add(term)
+
+    normalized_query = re.sub(r"[,;/|·\n]+", " ", str(query or ""))
+    parts = re.split(r"\s+(?:및|그리고|또는|또|이랑|랑|하고)\s+|와\s+|과\s+", normalized_query)
+    for part in parts:
+        part = re.sub(r"\b(?:NABO|NABOSTATS)\b", " ", part, flags=re.IGNORECASE)
+        part = re.sub(r"(국회예산정책처|재정경제통계시스템|기준|최근\s*\d+\s*년|최근|최신|추이|시계열)", " ", part)
+        part = re.sub(r"\s+", " ", part).strip()
+        add(part)
+
+    tokens = [
+        _strip_korean_particle(token)
+        for token in re.split(r"\s+", normalized_query)
+        if token.strip()
+    ]
+    for token in tokens:
+        add(token)
+    for window in (4, 3, 2):
+        for idx in range(0, max(0, len(tokens) - window + 1)):
+            add(" ".join(tokens[idx: idx + window]))
+    return candidates[:12]
+
+
+def _nabo_metric_from_search_query(query: str) -> Optional[str]:
+    text = str(query or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"\b(?:GDP|GNI|GRDP)\s*(?:대비|비율|ratio)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(대비\s*)?(비율|비중|구성비|추이|시계열)$", "", text).strip()
+    text = _strip_korean_particle(text)
+    return text or None
+
+
+async def _collect_nabo_plan_matches(query: str, plan: dict[str, Any], nabo_api_key: Optional[str]) -> dict[str, Any]:
+    candidates = _nabo_plan_candidate_phrases(query, plan)
+    metrics: list[dict[str, Any]] = []
+    seen_metrics: set[str] = set()
+    term_matches: list[dict[str, Any]] = []
+    table_matches: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    def add_metric(name: Any, *, source: str, evidence: dict[str, Any]) -> None:
+        metric_name = _nabo_metric_from_search_query(str(name or ""))
+        if not metric_name:
+            return
+        key = _metric_name_key(metric_name)
+        if not key or key in seen_metrics:
+            return
+        seen_metrics.add(key)
+        metrics.append({
+            "name": metric_name,
+            "role": "primary" if not metrics else "comparison",
+            "source": source,
+            "availability": "unknown",
+            "extraction_method": "nabo_metadata_or_query_candidate",
+            "caller_must_verify_with_nabo_meta": True,
+            "source_system": "NABO",
+            "nabo_evidence": evidence,
+        })
+
+    for candidate in candidates:
+        try:
+            terms_payload = await search_nabo_terms(candidate, limit=3, api_key=nabo_api_key)
+            if terms_payload.get("source_system") == "NABO" and terms_payload.get("status") == "executed":
+                for term in terms_payload.get("terms") or []:
+                    if not isinstance(term, dict):
+                        continue
+                    title = term.get("title")
+                    if title:
+                        term_matches.append({
+                            "query": candidate,
+                            "title": title,
+                            "term_id": term.get("term_id"),
+                        })
+                        add_metric(title, source="nabo_term_dictionary", evidence={"query": candidate, "term_id": term.get("term_id")})
+            elif terms_payload.get("code") == STATUS_MISSING_API_KEY:
+                errors.append({"tool": "search_nabo_terms", "query": candidate, "code": STATUS_MISSING_API_KEY})
+                break
+        except Exception as exc:
+            errors.append({"tool": "search_nabo_terms", "query": candidate, "error": str(exc)})
+
+        try:
+            tables_payload = await search_nabo_tables(candidate, limit=3, api_key=nabo_api_key)
+            if tables_payload.get("source_system") == "NABO" and tables_payload.get("status") in {"executed", "needs_table_selection"}:
+                tables = tables_payload.get("tables") or []
+                if tables:
+                    table_matches.extend([
+                        {
+                            "query": candidate,
+                            "table_id": table.get("table_id"),
+                            "table_name": table.get("table_name"),
+                            "dtacycle_cd_suggestion": table.get("dtacycle_cd_suggestion"),
+                        }
+                        for table in tables[:3]
+                        if isinstance(table, dict)
+                    ])
+                    add_metric(candidate, source="nabo_table_search", evidence={"query": candidate, "result_count": len(tables)})
+            elif tables_payload.get("code") == STATUS_MISSING_API_KEY:
+                errors.append({"tool": "search_nabo_tables", "query": candidate, "code": STATUS_MISSING_API_KEY})
+                break
+        except Exception as exc:
+            errors.append({"tool": "search_nabo_tables", "query": candidate, "error": str(exc)})
+
+    if not metrics:
+        for candidate in candidates:
+            add_metric(candidate, source="nabo_query_candidate", evidence={"query": candidate, "metadata_status": "unverified"})
+
+    return {
+        "source": "nabo_meta_match" if term_matches or table_matches else "nabo_query_candidate",
+        "candidate_phrases": candidates,
+        "metrics": metrics,
+        "term_matches": term_matches[:10],
+        "table_matches": table_matches[:10],
+        "errors": errors[:5],
+    }
+
+
+def _sync_analysis_tasks_to_metrics(plan: dict[str, Any]) -> None:
+    metric_names = [
+        metric.get("name")
+        for metric in plan.get("metrics") or []
+        if isinstance(metric, dict) and metric.get("name")
+    ]
+    if not metric_names:
+        return
+    for task in plan.get("analysis_tasks") or []:
+        if isinstance(task, dict) and "metrics" in task:
+            task["metrics"] = list(metric_names)
+
+
+def _nabo_period_range_from_time_request(time_request: Any) -> Any:
+    if not isinstance(time_request, dict):
+        return None
+    if time_request.get("type") in {"year_range", "range"} and time_request.get("start") and time_request.get("end"):
+        return [str(time_request["start"]), str(time_request["end"])]
+    if time_request.get("type") == "relative_period" and time_request.get("years"):
+        years = int(time_request.get("years") or 1)
+        return [f"<latest_available_period_minus_{max(0, years - 1)}>", "<latest_available_period>"]
+    if time_request.get("type") == "year" and time_request.get("value"):
+        return [str(time_request["value"]), str(time_request["value"])]
+    return None
+
+
+def _nabo_evidence_workflow(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    period_range = _nabo_period_range_from_time_request(plan.get("time_request"))
+    return [
+        {
+            "step": 1,
+            "operation": "for_each_metric",
+            "tool": "search_nabo_tables",
+            "args_template": {"query": "<metric.name>", "limit": 8},
+            "fills": "nabo_table_candidates",
+        },
+        {
+            "step": 2,
+            "operation": "for_each_candidate_table",
+            "tool": "explore_nabo_table",
+            "args_template": {"statbl_id": "<nabo_table_candidates[].table_id>"},
+            "fills": "items, dtacycle_cd_suggestions, query_template",
+        },
+        {
+            "step": 3,
+            "operation": "for_each_verified_nabo_table",
+            "tool": "query_nabo_table",
+            "args_template": {
+                "statbl_id": "<selected_nabo_table.table_id>",
+                "dtacycle_cd": "auto",
+                "period_range": period_range or "<time_request or latest>",
+                "filters": {"ITEM": ["<ITM_ID from explore_nabo_table.items>"]},
+            },
+        },
+        {
+            "step": 4,
+            "operation": "apply_analysis_tasks",
+            "tasks": plan.get("analysis_tasks") or [],
+            "performed_by": "chatbot LLM using NABO raw rows; compute_indicator only for explicit arithmetic",
+        },
+    ]
+
+
+def _nabo_suggested_workflow(plan: dict[str, Any], query: str) -> list[dict[str, Any]]:
+    period_range = _nabo_period_range_from_time_request(plan.get("time_request"))
+    return [
+        {
+            "step": 1,
+            "tool": "search_nabo_tables",
+            "purpose": "NABO 통계표 후보를 찾습니다.",
+            "args": {"query": query, "limit": 8},
+            "available_now": True,
+        },
+        {
+            "step": 2,
+            "tool": "explore_nabo_table",
+            "purpose": "선택된 NABO 표의 항목 코드와 주기를 확인합니다.",
+            "args": {"statbl_id": "<selected.table_id>"},
+            "available_now": True,
+        },
+        {
+            "step": 3,
+            "tool": "query_nabo_table",
+            "purpose": "NABO 원자료를 조회합니다.",
+            "args": {
+                "statbl_id": "<selected.table_id>",
+                "dtacycle_cd": "auto",
+                "period_range": period_range or "<period_range or latest>",
+                "filters": "<explore_nabo_table items/classes>",
+            },
+            "available_now": True,
+        },
+    ]
+
+
+async def _apply_nabo_source_routing(plan: dict[str, Any], query: str, nabo_api_key: Optional[str]) -> list[str]:
+    dimensions = plan.setdefault("intended_dimensions", {})
+    if not isinstance(dimensions, dict):
+        dimensions = {}
+        plan["intended_dimensions"] = dimensions
+    slots = plan.setdefault("router_slots", {})
+    if not isinstance(slots, dict):
+        slots = {}
+        plan["router_slots"] = slots
+    slots["source_preference"] = "NABO"
+    plan["source_preference"] = "NABO"
+    dimensions["source_system"] = "NABO"
+    dimensions["source_preference"] = "NABO"
+
+    match_info = await _collect_nabo_plan_matches(query, plan, nabo_api_key)
+    if match_info.get("metrics"):
+        plan["metrics"] = match_info["metrics"]
+        plan["raw_metric_candidates"] = match_info["metrics"]
+    plan["nabo_indicator_normalization"] = {
+        "source": match_info.get("source"),
+        "candidate_phrases": match_info.get("candidate_phrases"),
+        "term_matches": match_info.get("term_matches"),
+        "table_matches": match_info.get("table_matches"),
+        "errors": match_info.get("errors"),
+    }
+    metric_names = [metric.get("name") for metric in plan.get("metrics") or [] if isinstance(metric, dict) and metric.get("name")]
+    if metric_names:
+        dimensions["indicator"] = metric_names[0]
+        dimensions["indicator_candidates"] = [
+            {
+                "name": metric_name,
+                "role": "primary" if idx == 0 else "comparison",
+                "source": "nabo_indicator_normalization",
+                "extraction_method": "nabo_metadata_or_query_candidate",
+            }
+            for idx, metric_name in enumerate(metric_names)
+        ]
+        plan["concepts"] = list(dict.fromkeys([*metric_names, *(plan.get("concepts") or [])]))
+    _sync_analysis_tasks_to_metrics(plan)
+    workflow = _nabo_suggested_workflow(plan, query)
+    plan["suggested_workflow"] = workflow
+    plan["next_call"] = workflow[0] if workflow else None
+    plan["evidence_workflow"] = _nabo_evidence_workflow(plan)
+    policy = plan.setdefault("metric_availability_policy", {})
+    if isinstance(policy, dict):
+        policy["resolved_by"] = "search_nabo_tables -> explore_nabo_table"
+        policy["note"] = "Explicit NABO source preference detected; verify availability against NABO metadata, not KOSIS metadata."
+    markers = ["source_preference_nabo", "nabo_routing"]
+    if match_info.get("term_matches") or match_info.get("table_matches"):
+        markers.append("nabo_metadata_candidate")
+    if match_info.get("errors"):
+        markers.append("nabo_metadata_partial")
+    return markers
+
+
 async def _enrich_plan_with_metadata(
     plan: dict[str, Any],
     query: str,
     api_key: Optional[str] = None,
+    nabo_api_key: Optional[str] = None,
 ) -> dict[str, Any]:
     dimensions = plan.setdefault("intended_dimensions", {})
     if not isinstance(dimensions, dict):
@@ -5480,6 +6062,15 @@ async def _enrich_plan_with_metadata(
         plan["concepts"] = concepts
 
     markers: list[str] = []
+    source_preference = _detect_explicit_source_preference(query, plan)
+    if source_preference == "NABO":
+        markers.extend(await _apply_nabo_source_routing(plan, query, nabo_api_key))
+        if markers:
+            _plan_contract_add_markers(plan, markers)
+        return plan
+    if source_preference:
+        plan["source_preference"] = source_preference
+        dimensions["source_preference"] = source_preference
     promotion_log: list[dict[str, Any]] = []
     inference_log: list[dict[str, Any]] = []
     normalized_by_raw: dict[str, dict[str, Any]] = {}
@@ -5773,6 +6364,7 @@ async def explore_nabo_table(
     table = _nabo_table_record(table_rows[0]) if table_rows else None
     items = [_nabo_item_record(row) for row in item_rows]
     cadence_suggestion = (table or {}).get("dtacycle_cd_suggestion")
+    dtacycle_suggestions = _nabo_dtacycle_suggestions(cadence_suggestion)
     markers = []
     if not table:
         markers.append("not_matched")
@@ -5786,14 +6378,14 @@ async def explore_nabo_table(
         "table": table,
         "items": items,
         "item_count": len(items),
-        "dtacycle_cd_suggestions": list(dict.fromkeys(
-            c for c in [cadence_suggestion, "YY", "QY", "MM"] if c
-        )),
+        "dtacycle_cd_suggestions": dtacycle_suggestions,
+        "dtacycle_supported_values": ["YY", "QY", "MM"],
+        "dtacycle_guidance": _nabo_dtacycle_guidance(dtacycle_suggestions),
         "query_template": {
             "tool": "query_nabo_table",
             "args": {
                 "statbl_id": statbl_id,
-                "dtacycle_cd": cadence_suggestion or "YY",
+                "dtacycle_cd": "auto",
                 "period": "latest",
                 "filters": {"ITEM": ["<ITM_ID from items>"]},
             },
@@ -5802,6 +6394,8 @@ async def explore_nabo_table(
             "source_system": "NABO",
             "item_codes_valid_only_for_table": statbl_id,
             "data_endpoint_requires_dtacycle_cd": True,
+            "dtacycle_cd_auto_supported": True,
+            "period_range_forms_supported": ["period_range", "2010:2024", "2010-2024", {"start": "2010", "end": "2024"}],
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="metadata_inspection",
@@ -5820,8 +6414,9 @@ async def explore_nabo_table(
 @mcp.tool()
 async def query_nabo_table(
     statbl_id: str,
-    dtacycle_cd: str = "YY",
-    period: Optional[str] = None,
+    dtacycle_cd: str = "auto",
+    period: Optional[Any] = None,
+    period_range: Optional[list[str]] = None,
     filters: Optional[dict[str, Any]] = None,
     max_rows: int = NABO_DEFAULT_MAX_ROWS,
     api_key: Optional[str] = None,
@@ -5872,14 +6467,139 @@ async def query_nabo_table(
             return _missing_nabo_key_response("query_nabo_table", statbl_id=statbl_id, dtacycle_cd=dtacycle_cd)
         raise
 
+    requested_cycle = dtacycle_cd
     cycle = _nabo_dtacycle_code(dtacycle_cd)
+    table_exists: Optional[bool] = None
+    table_cadence_name = None
+    table_dtacycle_cd = None
+    cycle_resolution: dict[str, Any] = {
+        "requested": requested_cycle,
+        "resolved": cycle,
+        "source": "caller",
+    }
+    dtacycle_suggestions = _nabo_dtacycle_suggestions(None if cycle == "AUTO" else cycle)
+    try:
+        table_payload = await _nabo_fetch_rows("Sttsapitbl", key, {"STATBL_ID": statbl_id, "pSize": 1}, max_rows=1)
+        table_rows = table_payload.get("rows", [])
+        table_exists = bool(table_rows)
+        table = _nabo_table_record(table_rows[0]) if table_rows else {}
+        table_cadence_name = table.get("cadence_name")
+        table_dtacycle_cd = table.get("dtacycle_cd_suggestion")
+        if table_dtacycle_cd:
+            dtacycle_suggestions = _nabo_dtacycle_suggestions(table_dtacycle_cd)
+        if table_exists is False:
+            return {
+                "status": "not_matched",
+                "source_system": "NABO",
+                "table_id": statbl_id,
+                "dtacycle_cd": None if cycle == "AUTO" else cycle,
+                "dtacycle_cd_requested": requested_cycle,
+                "dtacycle_resolution": {
+                    "requested": requested_cycle,
+                    "resolved": None,
+                    "source": "table_metadata",
+                    "table_found": False,
+                },
+                "row_count": 0,
+                "rows": [],
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_extraction",
+                    final_answer_expected=False,
+                    markers=["not_matched", "not_matched_table"],
+                    explanation="NABO table id was not found in table metadata.",
+                    extra_signals={"source_system": "NABO", "table_id": statbl_id},
+                ),
+            }
+        if cycle == "AUTO":
+            suggested_cycle = table_dtacycle_cd
+            cycle = suggested_cycle or "YY"
+            cycle_resolution = {
+                "requested": requested_cycle,
+                "resolved": cycle,
+                "source": "table_metadata" if suggested_cycle else "fallback_default",
+                "table_cadence_name": table_cadence_name,
+            }
+            dtacycle_suggestions = _nabo_dtacycle_suggestions(suggested_cycle)
+        elif table_dtacycle_cd and cycle != table_dtacycle_cd:
+            return {
+                "status": "period_type_incompatible",
+                "source_system": "NABO",
+                "table_id": statbl_id,
+                "dtacycle_cd": cycle,
+                "dtacycle_cd_requested": requested_cycle,
+                "dtacycle_resolution": {
+                    **cycle_resolution,
+                    "table_cadence_name": table_cadence_name,
+                    "table_dtacycle_cd": table_dtacycle_cd,
+                    "compatible": False,
+                },
+                "dtacycle_cd_suggestions": _nabo_dtacycle_suggestions(table_dtacycle_cd),
+                "dtacycle_supported_values": ["YY", "QY", "MM"],
+                "period_type_check": {
+                    "table_supports": [table_dtacycle_cd],
+                    "requested": cycle,
+                    "compatible": False,
+                    "fallback_suggestion": f"use dtacycle_cd='{table_dtacycle_cd}' or dtacycle_cd='auto'",
+                },
+                "row_count": 0,
+                "rows": [],
+                "mcp_output_contract": _mcp_tool_output_contract(
+                    role="raw_extraction",
+                    final_answer_expected=False,
+                    markers=["period_type_mismatch", "dtacycle_mismatch", "invalid_input"],
+                    explanation="Requested NABO dtacycle_cd is not compatible with this table's metadata cadence.",
+                    extra_signals={
+                        "source_system": "NABO",
+                        "table_id": statbl_id,
+                        "table_dtacycle_cd": table_dtacycle_cd,
+                        "requested_dtacycle_cd": cycle,
+                    },
+                ),
+            }
+    except Exception as exc:
+        if cycle == "AUTO":
+            cycle = "YY"
+            cycle_resolution = {
+                "requested": requested_cycle,
+                "resolved": cycle,
+                "source": "fallback_default_after_metadata_error",
+                "metadata_error": str(exc),
+            }
+            dtacycle_suggestions = _nabo_dtacycle_suggestions(cycle)
+        else:
+            cycle_resolution["metadata_error"] = str(exc)
+
+    period_request = _nabo_parse_period_request(period, period_range, cycle=cycle)
+    if period_request.get("errors"):
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "dtacycle_cd": cycle,
+            "dtacycle_cd_requested": requested_cycle,
+            "dtacycle_resolution": cycle_resolution,
+            "period_requested": period,
+            "period_range_requested": period_range,
+            "period_request": period_request,
+            "validation_errors": period_request.get("errors"),
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["invalid_input", "period_format_error", "validation_errors"],
+                explanation="query_nabo_table received a period request that could not be normalized.",
+                extra_signals={
+                    "source_system": "NABO",
+                    "table_id": statbl_id,
+                    "period_request": period_request,
+                },
+            ),
+        }
     params: dict[str, Any] = {
         "STATBL_ID": statbl_id,
         "DTACYCLE_CD": cycle,
     }
-    latest_requested = period is not None and str(period).lower() == "latest"
-    if period and not latest_requested:
-        params["WRTTIME_IDTFR_ID"] = period
+    if period_request.get("api_filter_period"):
+        params["WRTTIME_IDTFR_ID"] = period_request["api_filter_period"]
     try:
         payload = await _nabo_fetch_rows("Sttsapitbldata", key, params, max_rows=max_rows)
     except Exception as exc:
@@ -5894,36 +6614,83 @@ async def query_nabo_table(
                 final_answer_expected=False,
                 markers=["fanout_call_failed"],
                 explanation="NABO data lookup failed during OpenAPI access.",
-                extra_signals={"source_system": "NABO", "table_id": statbl_id},
+                extra_signals={
+                    "source_system": "NABO",
+                    "table_id": statbl_id,
+                    "dtacycle_resolution": cycle_resolution,
+                    "period_request": period_request,
+                },
             ),
         }
 
-    raw_rows = payload.get("rows", [])
-    if latest_requested and raw_rows:
-        latest_period = max(str(row.get("WRTTIME_IDTFR_ID") or "") for row in raw_rows)
-        raw_rows = [row for row in raw_rows if str(row.get("WRTTIME_IDTFR_ID") or "") == latest_period]
-    filtered_rows, filter_errors = _nabo_filter_data_rows(raw_rows, filters)
+    api_rows = payload.get("rows", [])
+    period_rows = _nabo_apply_period_request(api_rows, period_request)
+    filtered_rows, filter_errors = _nabo_filter_data_rows(period_rows, filters)
+    filter_coverage = _nabo_filter_coverage(period_rows, filters)
     if filter_errors:
         return {
             "status": "unsupported",
             "source_system": "NABO",
             "table_id": statbl_id,
             "dtacycle_cd": cycle,
+            "dtacycle_cd_requested": requested_cycle,
+            "dtacycle_resolution": cycle_resolution,
+            "period_request": period_request,
             "validation_errors": filter_errors,
             "mcp_output_contract": _mcp_tool_output_contract(
                 role="raw_extraction",
                 final_answer_expected=False,
                 markers=["invalid_input", "validation_errors"],
                 explanation="query_nabo_table filters failed validation.",
-                extra_signals={"source_system": "NABO", "table_id": statbl_id},
+                extra_signals={
+                    "source_system": "NABO",
+                    "table_id": statbl_id,
+                    "dtacycle_resolution": cycle_resolution,
+                    "period_request": period_request,
+                },
             ),
         }
 
-    rows = [_nabo_data_record(row) for row in filtered_rows]
-    latest_period = max((row.get("period") or "" for row in rows), default=None)
+    item_meta_error = None
+    item_meta_map: dict[str, dict[str, Any]] = {}
+    try:
+        item_meta_map = await _nabo_item_meta_map(statbl_id, key)
+        if table_exists is None and item_meta_map:
+            table_exists = True
+    except Exception as exc:
+        item_meta_error = str(exc)
+    if table_exists is None and not api_rows:
+        try:
+            table_check = await _nabo_fetch_rows("Sttsapitbl", key, {"STATBL_ID": statbl_id, "pSize": 1}, max_rows=1)
+            table_exists = bool(table_check.get("rows") or [])
+        except Exception:
+            table_exists = None
+
+    rows = [_nabo_data_record(row, item_meta_map) for row in filtered_rows]
+    latest_period_in_returned_rows = max((row.get("period") or "" for row in rows), default=None)
+    latest_period = None if payload.get("truncated") else latest_period_in_returned_rows
     markers = []
+    if period_request.get("mode") in {"single", "range", "latest"}:
+        markers.append("period_input_normalized")
+    if cycle_resolution.get("source") != "caller":
+        markers.append("dtacycle_auto_resolved")
+    if item_meta_map:
+        markers.append("item_metadata_joined")
+    if item_meta_error:
+        markers.append("metadata_partial")
+    if filter_coverage.get("missing_filter_values"):
+        markers.append("partial_filter_match")
     if not rows:
-        markers.extend(["empty_rows", "complete_fanout_miss"])
+        markers.append("empty_rows")
+        if not api_rows:
+            if table_exists is False:
+                markers.extend(["not_matched", "not_matched_table"])
+            else:
+                markers.append("complete_fanout_miss")
+        elif not period_rows:
+            markers.append("period_filter_empty")
+        else:
+            markers.append("filter_no_match")
     missing_value_examples = [
         {
             "period": row.get("period"),
@@ -5943,7 +6710,7 @@ async def query_nabo_table(
         if missing_value_count == len(rows):
             markers.append("all_values_missing")
     if payload.get("truncated"):
-        markers.append("partial_fanout_coverage")
+        markers.append("truncated_by_max_rows")
     status = "executed" if rows else "empty"
     return {
         "status": status,
@@ -5951,13 +6718,27 @@ async def query_nabo_table(
         "provider": "국회예산정책처 재정경제통계시스템",
         "table_id": statbl_id,
         "dtacycle_cd": cycle,
+        "dtacycle_cd_requested": requested_cycle,
+        "dtacycle_resolution": cycle_resolution,
+        "dtacycle_cd_suggestions": dtacycle_suggestions,
+        "dtacycle_supported_values": ["YY", "QY", "MM"],
+        "dtacycle_guidance": _nabo_dtacycle_guidance(dtacycle_suggestions),
         "period_requested": period,
+        "period_range_requested": period_range,
+        "period_request": period_request,
         "latest_period": latest_period,
+        "latest_period_in_returned_rows": latest_period_in_returned_rows,
+        "latest_period_is_complete": not bool(payload.get("truncated")),
         "row_count": len(rows),
-        "source_row_count": len(raw_rows),
+        "source_row_count": len(api_rows),
+        "period_filtered_row_count": len(period_rows),
+        "item_metadata_joined": bool(item_meta_map),
+        "item_metadata_error": item_meta_error,
         "total_count": payload.get("total_count"),
+        "max_rows": payload.get("max_rows"),
         "truncated": payload.get("truncated", False),
         "filters_applied": filters or {},
+        "filter_coverage": filter_coverage,
         "missing_value_count": missing_value_count,
         "missing_value_examples": missing_value_examples,
         "rows": rows,
@@ -5967,6 +6748,10 @@ async def query_nabo_table(
             "raw_extraction_only": True,
             "unit_from_ui_nm": True,
             "do_not_label_as_kosis": True,
+            "dtacycle_cd_resolved": cycle,
+            "period_request_mode": period_request.get("mode"),
+            "item_full_name_joined_from_explore_metadata": bool(item_meta_map),
+            "period_range_forms_supported": ["period_range", "2010:2024", "2010-2024", {"start": "2010", "end": "2024"}],
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="raw_extraction",
@@ -5978,9 +6763,19 @@ async def query_nabo_table(
                 "table_id": statbl_id,
                 "row_count": len(rows),
                 "latest_period": latest_period,
+                "latest_period_in_returned_rows": latest_period_in_returned_rows,
+                "latest_period_is_complete": not bool(payload.get("truncated")),
                 "truncated": payload.get("truncated", False),
+                "truncated_by_max_rows": payload.get("truncated", False),
                 "missing_value_count": missing_value_count,
                 "missing_value_examples": missing_value_examples,
+                "dtacycle_resolution": cycle_resolution,
+                "period_request": period_request,
+                "period_filtered_row_count": len(period_rows),
+                "filter_coverage": filter_coverage,
+                "item_metadata_joined": bool(item_meta_map),
+                "item_metadata_error": item_meta_error,
+                "table_exists": table_exists,
             },
         ),
     }
@@ -6100,6 +6895,18 @@ async def search_stats(
     ]
     if missing_sources:
         markers.append("missing_api_key")
+    source_systems_present = sorted({
+        str(row.get("source_system"))
+        for row in results
+        if row.get("source_system")
+    })
+    cross_source_definition_check_required = (
+        source_norm == "all"
+        and "KOSIS" in source_systems_present
+        and "NABO" in source_systems_present
+    )
+    if cross_source_definition_check_required:
+        markers.append("cross_source_definition_check_required")
     return {
         "status": "executed" if results else "empty",
         "query": query,
@@ -6111,6 +6918,9 @@ async def search_stats(
             "mixed_sources": source_norm == "all",
             "caller_must_preserve_source_system": True,
             "kosis_and_nabo_tables_are_not_interchangeable": True,
+            "source_systems_present": source_systems_present,
+            "definition_comparison_required": cross_source_definition_check_required,
+            "do_not_treat_cross_source_results_as_equivalent": cross_source_definition_check_required,
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_search",
@@ -6121,6 +6931,8 @@ async def search_stats(
                 "source": source_norm,
                 "result_count": len(results),
                 "missing_sources": missing_sources,
+                "source_systems_present": source_systems_present,
+                "definition_comparison_required": cross_source_definition_check_required,
             },
         ),
     }
