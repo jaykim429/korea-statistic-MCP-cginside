@@ -11,13 +11,18 @@
     "explore_table",
     "query_table",
     "compute_indicator",
-    "search_kosis"
+    "search_kosis",
+    "search_stats",
+    "search_nabo_tables",
+    "explore_nabo_table",
+    "query_nabo_table"
   ],
   "expert_optional": [
     "analyze_trend",
     "forecast_stat",
     "correlate_stats",
     "detect_outliers",
+    "search_nabo_terms",
     "chain_full_analysis",
     "chart_line",
     "chart_compare_regions",
@@ -37,6 +42,8 @@
     "Do not present plan_query output as a final answer.",
     "For analysis tools, use input arrays, must_know, data_characteristics, model_options, and common_pitfalls before choosing an interpretation.",
     "Use metrics, quarantined_metrics, conflict_decisions, semantic_dimensions, and table_required_dimensions to decide follow-up calls.",
+    "When using NABO tools, preserve source_system and provider; do not describe NABO rows as KOSIS evidence.",
+    "Use search_stats only to discover candidates across providers; verify table metadata before treating KOSIS and NABO statistics as comparable.",
     "Do not infer missing KOSIS values from model knowledge.",
     "Report unsupported, missing, or low-coverage metrics explicitly."
   ]

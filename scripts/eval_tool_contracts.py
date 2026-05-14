@@ -1208,6 +1208,187 @@ async def test_query_table_fanout_limit_rejects_before_raw_call() -> None:
     assert "max_fanout_exceeded" in markers, markers
 
 
+async def test_nabo_search_and_query_normalization() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+
+    async def fake_fetch(service: str, key: str, params: Any = None, *, max_rows: int = 5000) -> dict[str, Any]:
+        if service == "Sttsapitbl":
+            return {
+                "status": "executed",
+                "total_count": 1,
+                "rows": [
+                    {
+                        "STATBL_ID": "T1",
+                        "STATBL_NM": "재정수지",
+                        "DTACYCLE_NM": "년",
+                        "TOP_ORG_NM": "국회예산정책처",
+                        "DATA_START_YY": "2020",
+                        "DATA_END_YY": "2024",
+                    }
+                ],
+            }
+        if service == "Sttsapitblitm":
+            return {
+                "status": "executed",
+                "total_count": 1,
+                "rows": [
+                    {
+                        "STATBL_ID": "T1",
+                        "ITM_TAG": "항목",
+                        "ITM_ID": 10001,
+                        "PAR_ITM_ID": 0,
+                        "ITM_NM": "통합재정수지",
+                        "ITM_FULLNM": "통합재정수지",
+                        "UI_NM": "조원",
+                    }
+                ],
+            }
+        if service == "Sttsapitbldata":
+            return {
+                "status": "executed",
+                "total_count": 2,
+                "rows": [
+                    {
+                        "STATBL_ID": "T1",
+                        "DTACYCLE_CD": "YY",
+                        "WRTTIME_IDTFR_ID": "2023",
+                        "GRP_ID": None,
+                        "GRP_NM": None,
+                        "CLS_ID": 50001,
+                        "CLS_NM": "결산",
+                        "ITM_ID": 10001,
+                        "ITM_NM": "통합재정수지",
+                        "UI_NM": "조원",
+                        "DTA_VAL": "-10.5",
+                        "DTA_SVAL": None,
+                    },
+                    {
+                        "STATBL_ID": "T1",
+                        "DTACYCLE_CD": "YY",
+                        "WRTTIME_IDTFR_ID": "2024",
+                        "GRP_ID": None,
+                        "GRP_NM": None,
+                        "CLS_ID": 50001,
+                        "CLS_NM": "결산",
+                        "ITM_ID": 10001,
+                        "ITM_NM": "통합재정수지",
+                        "UI_NM": "조원",
+                        "DTA_VAL": "-8.0",
+                        "DTA_SVAL": None,
+                    },
+                ],
+            }
+        return {"status": "executed", "total_count": 0, "rows": []}
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        search = await kosis_mcp_server.search_nabo_tables("재정수지", api_key="dummy")
+        explore = await kosis_mcp_server.explore_nabo_table("T1", api_key="dummy")
+        query = await kosis_mcp_server.query_nabo_table(
+            "T1",
+            dtacycle_cd="년",
+            period="latest",
+            filters={"ITEM": ["10001"]},
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+
+    assert search["source_system"] == "NABO", search
+    assert search["tables"][0]["dtacycle_cd_suggestion"] == "YY", search
+    assert explore["items"][0]["item_id"] == "10001", explore
+    assert query["dtacycle_cd"] == "YY", query
+    assert query["row_count"] == 1, query
+    assert query["rows"][0]["period"] == "2024", query
+    assert query["rows"][0]["value"] == -8.0, query
+    assert query["rows"][0]["dimensions"]["ITEM"]["code"] == "10001", query
+
+
+async def test_nabo_query_rejects_unknown_filter_key() -> None:
+    result = await kosis_mcp_server.query_nabo_table(
+        "T1",
+        filters={"REGION": ["서울"]},
+        api_key="dummy",
+    )
+    assert result["status"] == "unsupported", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "validation_errors" in markers, markers
+
+
+async def test_nabo_query_marks_missing_values() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+
+    async def fake_fetch(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "status": "executed",
+            "total_count": 1,
+            "rows": [
+                {
+                    "STATBL_ID": "T1",
+                    "DTACYCLE_CD": "YY",
+                    "WRTTIME_IDTFR_ID": "2025",
+                    "CLS_ID": 50002,
+                    "CLS_NM": "결산",
+                    "ITM_ID": 10001,
+                    "ITM_NM": "총수입",
+                    "UI_NM": "조원",
+                    "DTA_VAL": None,
+                    "DTA_SVAL": None,
+                }
+            ],
+        }
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_nabo_table(
+            "T1",
+            dtacycle_cd="YY",
+            period="2025",
+            filters={"ITEM": ["10001"], "CLASS": ["50002"]},
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert result["row_count"] == 1, result
+    assert result["missing_value_count"] == 1, result
+    assert "missing_values" in markers, markers
+    assert "all_values_missing" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["has_failures"] is True, result
+
+
+async def test_search_stats_preserves_source_systems() -> None:
+    original_search_kosis = kosis_mcp_server.search_kosis
+    original_search_nabo = kosis_mcp_server.search_nabo_tables
+
+    async def fake_search_kosis(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "결과": [
+                {"통계표ID": "K1", "기관ID": "101", "통계표명": "KOSIS GDP"}
+            ]
+        }
+
+    async def fake_search_nabo(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "tables": [
+                {"source_system": "NABO", "table_id": "N1", "table_name": "NABO GDP"}
+            ]
+        }
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = fake_search_nabo  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_stats("GDP")
+    finally:
+        kosis_mcp_server.search_kosis = original_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = original_search_nabo  # type: ignore[assignment]
+
+    sources = {row["source_system"] for row in result["results"]}
+    assert sources == {"KOSIS", "NABO"}, result
+    assert result["must_know"]["caller_must_preserve_source_system"] is True, result
+
+
 async def test_http_auth_middleware_requires_token_when_configured() -> None:
     from kosis_http_server import OptionalBearerAuthMiddleware
 
@@ -1281,6 +1462,10 @@ async def main() -> None:
         ("query_table_projection_marker", lambda: test_query_table_projection_data_marker()),
         ("query_table_aggregation_dropped_rows", lambda: test_query_table_aggregation_dropped_rows_are_marked()),
         ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
+        ("nabo_search_query_normalization", lambda: test_nabo_search_and_query_normalization()),
+        ("nabo_unknown_filter", lambda: test_nabo_query_rejects_unknown_filter_key()),
+        ("nabo_missing_values", lambda: test_nabo_query_marks_missing_values()),
+        ("search_stats_source_systems", lambda: test_search_stats_preserves_source_systems()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
     ]
     passed = 0

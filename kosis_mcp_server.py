@@ -142,6 +142,35 @@ def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
 QUERY_TABLE_MAX_FANOUT = _env_int("KOSIS_MCP_QUERY_TABLE_MAX_FANOUT", 80)
 QUERY_TABLE_CONCURRENCY = _env_int("KOSIS_MCP_QUERY_TABLE_CONCURRENCY", 8)
 QUERY_TABLE_CALL_TIMEOUT = _env_float("KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT", 15.0)
+NABO_API_BASE = "https://www.nabostats.go.kr/openapi"
+NABO_MAX_PAGE_SIZE = 1000
+NABO_DEFAULT_MAX_ROWS = 5000
+NABO_DTACYCLE_ALIASES = {
+    "YY": "YY",
+    "Y": "YY",
+    "YEAR": "YY",
+    "YEARLY": "YY",
+    "연": "YY",
+    "년": "YY",
+    "연간": "YY",
+    "QY": "QY",
+    "Q": "QY",
+    "QUARTER": "QY",
+    "QUARTERLY": "QY",
+    "분기": "QY",
+    "MM": "MM",
+    "M": "MM",
+    "MONTH": "MM",
+    "MONTHLY": "MM",
+    "월": "MM",
+    "월간": "MM",
+}
+NABO_DTACYCLE_FROM_NAME = {
+    "년": "YY",
+    "연": "YY",
+    "분기": "QY",
+    "월": "MM",
+}
 
 ANSWER_QUERY_CONVENIENCE_NOTE = {
     "tool": "answer_query",
@@ -310,6 +339,8 @@ def _mcp_tool_output_contract(
         "aggregation_dropped_rows": "Inspect aggregation_report before using summed values.",
         "period_metadata_missing": "Treat period validation as unavailable and disclose the limitation.",
         "projection_data": "Label values as projection/forecast when answering.",
+        "missing_values": "Some returned rows have no numeric value; inspect missing_value_examples before quoting values.",
+        "all_values_missing": "Rows were matched but every returned value is empty; report unavailable data instead of a numeric answer.",
         "unit_caller_resolution_required": "Resolve the computed unit from unit_transformation before quoting.",
         "share_total_from_input_rows": "Disclose that the denominator was derived from input_rows, not an external total.",
         "share_total_grouped_by_period": "Interpret share results within each period group, not across all periods.",
@@ -348,6 +379,7 @@ def _mcp_tool_output_contract(
         "empty_rows",
         "partial_computation",
         "partial_fulfillment",
+        "all_values_missing",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -392,6 +424,7 @@ def _mcp_tool_output_contract(
             "duplicate_denominator_key",
             "non_numeric_aggregation_input",
             "empty_rows",
+            "all_values_missing",
             "partial_fulfillment",
             "coverage_ratio",
         ],
@@ -419,6 +452,40 @@ def _missing_api_key_response(tool: str, **context: Any) -> dict[str, Any]:
             extra_signals={"tool": tool},
         ),
     }
+
+
+def _resolve_nabo_key(api_key: Optional[str] = None) -> str:
+    key = api_key or os.environ.get("NABO_API_KEY")
+    if not key:
+        raise RuntimeError("NABO_API_KEY is required.")
+    return key
+
+
+def _missing_nabo_key_response(tool: str, **context: Any) -> dict[str, Any]:
+    clean_context = {k: v for k, v in context.items() if v not in (None, "")}
+    return {
+        "상태": "failed",
+        "status": "failed",
+        "코드": STATUS_MISSING_API_KEY,
+        "code": STATUS_MISSING_API_KEY,
+        "tool": tool,
+        "source_system": "NABO",
+        "error": "NABO_API_KEY is required.",
+        "오류": "NABO_API_KEY 설정 필요",
+        "권고": "서버 환경변수 NABO_API_KEY를 설정하거나 도구 호출에 api_key를 전달하세요.",
+        **clean_context,
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="configuration_error",
+            final_answer_expected=False,
+            markers=["missing_api_key"],
+            explanation="The tool cannot call NABO OpenAPI without an API key.",
+            extra_signals={"tool": tool, "source_system": "NABO"},
+        ),
+    }
+
+
+def _is_missing_nabo_key_error(exc: Exception) -> bool:
+    return "NABO_API_KEY" in str(exc)
 
 
 def _is_missing_key_error(exc: Exception) -> bool:
@@ -959,6 +1026,298 @@ def _analysis_common_pitfalls(series_result: dict[str, Any], values: list[float]
             "example_right": "Describe them as exploratory calculations based on limited observations.",
         })
     return pitfalls
+
+
+def _nabo_dtacycle_code(value: Optional[str]) -> str:
+    raw = str(value or "YY").strip()
+    return NABO_DTACYCLE_ALIASES.get(raw.upper()) or NABO_DTACYCLE_ALIASES.get(raw) or raw.upper()
+
+
+def _nabo_dtacycle_from_name(value: Optional[str]) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for token, code in NABO_DTACYCLE_FROM_NAME.items():
+        if token in raw:
+            return code
+    return None
+
+
+def _nabo_service_root(service: str) -> str:
+    roots = {
+        "Sttsapitbl": "Sttsapitbl",
+        "Sttsapitblitm": "Sttsapitblitm",
+        "Sttsapitbldata": "Sttsapitbldata",
+        "DicApiList": "DicApiList",
+    }
+    return roots.get(service, service)
+
+
+def _nabo_parse_response(payload: dict[str, Any], service: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {
+            "status": "failed",
+            "code": "INVALID_RESPONSE",
+            "message": "NABO response was not a JSON object.",
+            "total_count": 0,
+            "rows": [],
+        }
+    if isinstance(payload.get("RESULT"), dict):
+        result = payload["RESULT"]
+        code = str(result.get("CODE") or "")
+        return {
+            "status": "executed" if code.endswith("000") else "failed",
+            "code": code,
+            "message": result.get("MESSAGE"),
+            "total_count": 0,
+            "rows": [],
+        }
+
+    root = _nabo_service_root(service)
+    blocks = payload.get(root) or payload.get(root.lower()) or payload.get(root.upper())
+    if not isinstance(blocks, list):
+        return {
+            "status": "failed",
+            "code": "MISSING_SERVICE_ROOT",
+            "message": f"NABO response did not include {root}.",
+            "total_count": 0,
+            "rows": [],
+        }
+
+    total_count = 0
+    result_code = None
+    result_message = None
+    rows: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        head = block.get("head")
+        if isinstance(head, list):
+            for item in head:
+                if not isinstance(item, dict):
+                    continue
+                if "list_total_count" in item:
+                    try:
+                        total_count = int(item.get("list_total_count") or 0)
+                    except (TypeError, ValueError):
+                        total_count = 0
+                result = item.get("RESULT")
+                if isinstance(result, dict):
+                    result_code = result.get("CODE")
+                    result_message = result.get("MESSAGE")
+        row = block.get("row")
+        if isinstance(row, list):
+            rows.extend([r for r in row if isinstance(r, dict)])
+        elif isinstance(row, dict):
+            rows.append(row)
+
+    code = str(result_code or "")
+    return {
+        "status": "executed" if not code or code.endswith("000") else "failed",
+        "code": code or None,
+        "message": result_message,
+        "total_count": total_count or len(rows),
+        "rows": rows,
+    }
+
+
+async def _nabo_call(
+    client: httpx.AsyncClient,
+    service: str,
+    key: str,
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    query = {
+        "Key": key,
+        "Type": "json",
+        "pIndex": 1,
+        "pSize": 100,
+    }
+    query.update({k: v for k, v in (params or {}).items() if v not in (None, "", [])})
+    response = await client.get(f"{NABO_API_BASE}/{service}.do", params=query, timeout=20.0)
+    response.raise_for_status()
+    return _nabo_parse_response(response.json(), service)
+
+
+async def _nabo_fetch_rows(
+    service: str,
+    key: str,
+    params: Optional[dict[str, Any]] = None,
+    *,
+    max_rows: int = NABO_DEFAULT_MAX_ROWS,
+) -> dict[str, Any]:
+    clean_max = max(1, min(max_rows, 50000))
+    all_rows: list[dict[str, Any]] = []
+    total_count = 0
+    last: dict[str, Any] = {}
+    async with httpx.AsyncClient() as client:
+        page = 1
+        while len(all_rows) < clean_max:
+            page_size = min(NABO_MAX_PAGE_SIZE, clean_max - len(all_rows))
+            call_params = dict(params or {})
+            call_params.update({"pIndex": page, "pSize": page_size})
+            parsed = await _nabo_call(client, service, key, call_params)
+            last = parsed
+            total_count = int(parsed.get("total_count") or total_count or 0)
+            rows = parsed.get("rows") or []
+            if parsed.get("status") != "executed":
+                break
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if total_count and len(all_rows) >= total_count:
+                break
+            if len(rows) < page_size:
+                break
+            page += 1
+    return {
+        **last,
+        "rows": all_rows[:clean_max],
+        "returned_count": min(len(all_rows), clean_max),
+        "total_count": total_count or len(all_rows),
+        "truncated": bool(total_count and len(all_rows) < total_count),
+        "max_rows": clean_max,
+    }
+
+
+def _nabo_table_record(row: dict[str, Any]) -> dict[str, Any]:
+    cadence_name = row.get("DTACYCLE_NM")
+    return {
+        "source_system": "NABO",
+        "provider": "국회예산정책처 재정경제통계시스템",
+        "table_id": str(row.get("STATBL_ID") or ""),
+        "table_name": row.get("STATBL_NM"),
+        "category": row.get("CATE_FULLNM"),
+        "cadence_name": cadence_name,
+        "dtacycle_cd_suggestion": _nabo_dtacycle_from_name(cadence_name),
+        "original_source": row.get("TOP_ORG_NM"),
+        "department": row.get("ORG_NM"),
+        "manager": row.get("USR_NM"),
+        "load_date": row.get("LOAD_DATE"),
+        "open_date": row.get("OPEN_DATE"),
+        "data_start_year": row.get("DATA_START_YY"),
+        "data_end_year": row.get("DATA_END_YY"),
+        "table_comment": row.get("STATBL_CMMT"),
+        "service_url": row.get("SRV_URL"),
+        "raw": row,
+    }
+
+
+def _nabo_item_record(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_system": "NABO",
+        "table_id": str(row.get("STATBL_ID") or ""),
+        "item_tag": row.get("ITM_TAG"),
+        "item_id": str(row.get("ITM_ID") or ""),
+        "parent_item_id": None if row.get("PAR_ITM_ID") in (None, "", 0, "0") else str(row.get("PAR_ITM_ID")),
+        "item_name": row.get("ITM_NM"),
+        "item_full_name": row.get("ITM_FULLNM"),
+        "unit": row.get("UI_NM"),
+        "comment_id": row.get("ITM_CMMT_IDTFR"),
+        "comment": row.get("ITM_CMMT_CONT"),
+        "order": row.get("V_ORDER"),
+        "raw": row,
+    }
+
+
+def _nabo_data_record(row: dict[str, Any]) -> dict[str, Any]:
+    raw_value = row.get("DTA_VAL")
+    try:
+        value = float(str(raw_value).replace(",", "")) if raw_value not in (None, "") else None
+    except (TypeError, ValueError):
+        value = None
+    unit = row.get("UI_NM")
+    return {
+        "source_system": "NABO",
+        "provider": "국회예산정책처 재정경제통계시스템",
+        "table_id": str(row.get("STATBL_ID") or ""),
+        "dtacycle_cd": row.get("DTACYCLE_CD"),
+        "period": str(row.get("WRTTIME_IDTFR_ID") or ""),
+        "value": value,
+        "value_raw": raw_value,
+        "unit": unit,
+        "symbol": row.get("DTA_SVAL"),
+        "dimensions": {
+            "GROUP": {
+                "code": None if row.get("GRP_ID") in (None, "") else str(row.get("GRP_ID")),
+                "label": row.get("GRP_NM"),
+                "unit": None,
+            },
+            "CLASS": {
+                "code": None if row.get("CLS_ID") in (None, "") else str(row.get("CLS_ID")),
+                "label": row.get("CLS_NM"),
+                "unit": None,
+            },
+            "ITEM": {
+                "code": None if row.get("ITM_ID") in (None, "") else str(row.get("ITM_ID")),
+                "label": row.get("ITM_NM"),
+                "unit": unit,
+            },
+        },
+        "raw": row,
+    }
+
+
+NABO_FILTER_KEY_MAP = {
+    "ITEM": ("ITM_ID", "ITM_NM"),
+    "ITM_ID": ("ITM_ID",),
+    "item_id": ("ITM_ID",),
+    "ITEM_NM": ("ITM_NM",),
+    "item_name": ("ITM_NM",),
+    "CLASS": ("CLS_ID", "CLS_NM"),
+    "CLS_ID": ("CLS_ID",),
+    "class_id": ("CLS_ID",),
+    "CLS_NM": ("CLS_NM",),
+    "class_name": ("CLS_NM",),
+    "GROUP": ("GRP_ID", "GRP_NM"),
+    "GRP_ID": ("GRP_ID",),
+    "group_id": ("GRP_ID",),
+    "GRP_NM": ("GRP_NM",),
+    "group_name": ("GRP_NM",),
+    "period": ("WRTTIME_IDTFR_ID",),
+    "WRTTIME_IDTFR_ID": ("WRTTIME_IDTFR_ID",),
+}
+
+
+def _as_string_set(value: Any) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        return {str(v) for v in value if v not in (None, "")}
+    if value in (None, ""):
+        return set()
+    return {str(value)}
+
+
+def _nabo_filter_data_rows(rows: list[dict[str, Any]], filters: Optional[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not filters:
+        return rows, []
+    errors: list[dict[str, Any]] = []
+    predicates: list[tuple[str, tuple[str, ...], set[str]]] = []
+    for key, value in filters.items():
+        fields = NABO_FILTER_KEY_MAP.get(str(key))
+        if not fields:
+            errors.append({
+                "code": "UNKNOWN_FILTER_KEY",
+                "filter_key": key,
+                "valid_filter_keys": sorted(NABO_FILTER_KEY_MAP),
+            })
+            continue
+        values = _as_string_set(value)
+        if values:
+            predicates.append((str(key), fields, values))
+    if errors:
+        return [], errors
+
+    selected = []
+    for row in rows:
+        matched = True
+        for _, fields, values in predicates:
+            row_values = {str(row.get(field)) for field in fields if row.get(field) not in (None, "")}
+            if not row_values & values:
+                matched = False
+                break
+        if matched:
+            selected.append(row)
+    return selected, []
 
 
 def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
@@ -5295,6 +5654,476 @@ async def search_kosis(
         api_key,
         used_routing=used_routing,
     )
+
+
+@mcp.tool()
+async def search_nabo_tables(
+    query: str,
+    limit: int = 10,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🔍] NABOSTATS 재정경제통계시스템 통계표 검색."""
+    try:
+        key = _resolve_nabo_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_nabo_key_error(exc):
+            return _missing_nabo_key_response("search_nabo_tables", query=query, limit=limit)
+        raise
+
+    safe_limit = max(1, min(int(limit or 10), NABO_MAX_PAGE_SIZE))
+    params = {"pIndex": 1, "pSize": safe_limit}
+    if query:
+        params["STATBL_NM"] = query
+    try:
+        payload = await _nabo_fetch_rows("Sttsapitbl", key, params, max_rows=safe_limit)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "source_system": "NABO",
+            "error": str(exc),
+            "query": query,
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="table_search",
+                final_answer_expected=False,
+                markers=["fanout_call_failed"],
+                explanation="NABO table search failed during OpenAPI access.",
+                extra_signals={"source_system": "NABO"},
+            ),
+        }
+
+    tables = [_nabo_table_record(row) for row in payload.get("rows", [])]
+    markers = ["search_empty"] if not tables else []
+    return {
+        "status": "executed" if tables else "needs_table_selection",
+        "source_system": "NABO",
+        "provider": "국회예산정책처 재정경제통계시스템",
+        "query": query,
+        "result_count": len(tables),
+        "total_count": payload.get("total_count", len(tables)),
+        "truncated": payload.get("truncated", False),
+        "tables": tables,
+        "results": tables,
+        "must_know": {
+            "source_system": "NABO",
+            "provider": "국회예산정책처 재정경제통계시스템",
+            "do_not_mix_with_kosis_without_source_label": True,
+        },
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="table_search",
+            final_answer_expected=False,
+            markers=markers,
+            explanation="NABO table search returns table candidates only, not statistical values.",
+            extra_signals={
+                "source_system": "NABO",
+                "result_count": len(tables),
+                "total_count": payload.get("total_count", len(tables)),
+            },
+        ),
+    }
+
+
+@mcp.tool()
+async def explore_nabo_table(
+    statbl_id: str,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🧭] NABO 통계표 메타와 항목 코드를 조회한다."""
+    if not statbl_id:
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "error": "statbl_id is required.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="metadata_inspection",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="explore_nabo_table requires a NABO STATBL_ID.",
+                extra_signals={"source_system": "NABO"},
+            ),
+        }
+    try:
+        key = _resolve_nabo_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_nabo_key_error(exc):
+            return _missing_nabo_key_response("explore_nabo_table", statbl_id=statbl_id)
+        raise
+
+    try:
+        table_payload, item_payload = await asyncio.gather(
+            _nabo_fetch_rows("Sttsapitbl", key, {"STATBL_ID": statbl_id, "pSize": 1}, max_rows=1),
+            _nabo_fetch_rows("Sttsapitblitm", key, {"STATBL_ID": statbl_id, "pSize": NABO_MAX_PAGE_SIZE}, max_rows=NABO_MAX_PAGE_SIZE),
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "error": str(exc),
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="metadata_inspection",
+                final_answer_expected=False,
+                markers=["metadata_failed"],
+                explanation="NABO metadata lookup failed during OpenAPI access.",
+                extra_signals={"source_system": "NABO", "table_id": statbl_id},
+            ),
+        }
+
+    table_rows = table_payload.get("rows", [])
+    item_rows = item_payload.get("rows", [])
+    table = _nabo_table_record(table_rows[0]) if table_rows else None
+    items = [_nabo_item_record(row) for row in item_rows]
+    cadence_suggestion = (table or {}).get("dtacycle_cd_suggestion")
+    markers = []
+    if not table:
+        markers.append("not_matched")
+    if not items:
+        markers.append("metadata_failed")
+    return {
+        "status": "executed" if table or items else "failed",
+        "source_system": "NABO",
+        "provider": "국회예산정책처 재정경제통계시스템",
+        "table_id": statbl_id,
+        "table": table,
+        "items": items,
+        "item_count": len(items),
+        "dtacycle_cd_suggestions": list(dict.fromkeys(
+            c for c in [cadence_suggestion, "YY", "QY", "MM"] if c
+        )),
+        "query_template": {
+            "tool": "query_nabo_table",
+            "args": {
+                "statbl_id": statbl_id,
+                "dtacycle_cd": cadence_suggestion or "YY",
+                "period": "latest",
+                "filters": {"ITEM": ["<ITM_ID from items>"]},
+            },
+        },
+        "must_know": {
+            "source_system": "NABO",
+            "item_codes_valid_only_for_table": statbl_id,
+            "data_endpoint_requires_dtacycle_cd": True,
+        },
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="metadata_inspection",
+            final_answer_expected=False,
+            markers=markers,
+            explanation="NABO metadata describes table/items only; call query_nabo_table for values.",
+            extra_signals={
+                "source_system": "NABO",
+                "table_id": statbl_id,
+                "item_count": len(items),
+            },
+        ),
+    }
+
+
+@mcp.tool()
+async def query_nabo_table(
+    statbl_id: str,
+    dtacycle_cd: str = "YY",
+    period: Optional[str] = None,
+    filters: Optional[dict[str, Any]] = None,
+    max_rows: int = NABO_DEFAULT_MAX_ROWS,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[📥] NABO 통계표 원자료를 조회하고 공통 row 포맷으로 정규화한다."""
+    if not statbl_id:
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "error": "statbl_id is required.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="query_nabo_table requires a NABO STATBL_ID.",
+                extra_signals={"source_system": "NABO"},
+            ),
+        }
+    unknown_filter_keys = [
+        key for key in (filters or {})
+        if str(key) not in NABO_FILTER_KEY_MAP
+    ]
+    if unknown_filter_keys:
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "validation_errors": [
+                {
+                    "code": "UNKNOWN_FILTER_KEY",
+                    "filter_key": key,
+                    "valid_filter_keys": sorted(NABO_FILTER_KEY_MAP),
+                }
+                for key in unknown_filter_keys
+            ],
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["invalid_input", "validation_errors"],
+                explanation="query_nabo_table received unsupported filter keys.",
+                extra_signals={"source_system": "NABO", "table_id": statbl_id},
+            ),
+        }
+    try:
+        key = _resolve_nabo_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_nabo_key_error(exc):
+            return _missing_nabo_key_response("query_nabo_table", statbl_id=statbl_id, dtacycle_cd=dtacycle_cd)
+        raise
+
+    cycle = _nabo_dtacycle_code(dtacycle_cd)
+    params: dict[str, Any] = {
+        "STATBL_ID": statbl_id,
+        "DTACYCLE_CD": cycle,
+    }
+    latest_requested = period is not None and str(period).lower() == "latest"
+    if period and not latest_requested:
+        params["WRTTIME_IDTFR_ID"] = period
+    try:
+        payload = await _nabo_fetch_rows("Sttsapitbldata", key, params, max_rows=max_rows)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "dtacycle_cd": cycle,
+            "error": str(exc),
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["fanout_call_failed"],
+                explanation="NABO data lookup failed during OpenAPI access.",
+                extra_signals={"source_system": "NABO", "table_id": statbl_id},
+            ),
+        }
+
+    raw_rows = payload.get("rows", [])
+    if latest_requested and raw_rows:
+        latest_period = max(str(row.get("WRTTIME_IDTFR_ID") or "") for row in raw_rows)
+        raw_rows = [row for row in raw_rows if str(row.get("WRTTIME_IDTFR_ID") or "") == latest_period]
+    filtered_rows, filter_errors = _nabo_filter_data_rows(raw_rows, filters)
+    if filter_errors:
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "dtacycle_cd": cycle,
+            "validation_errors": filter_errors,
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["invalid_input", "validation_errors"],
+                explanation="query_nabo_table filters failed validation.",
+                extra_signals={"source_system": "NABO", "table_id": statbl_id},
+            ),
+        }
+
+    rows = [_nabo_data_record(row) for row in filtered_rows]
+    latest_period = max((row.get("period") or "" for row in rows), default=None)
+    markers = []
+    if not rows:
+        markers.extend(["empty_rows", "complete_fanout_miss"])
+    missing_value_examples = [
+        {
+            "period": row.get("period"),
+            "item": ((row.get("dimensions") or {}).get("ITEM") or {}).get("label"),
+            "item_code": ((row.get("dimensions") or {}).get("ITEM") or {}).get("code"),
+            "class": ((row.get("dimensions") or {}).get("CLASS") or {}).get("label"),
+            "class_code": ((row.get("dimensions") or {}).get("CLASS") or {}).get("code"),
+            "unit": row.get("unit"),
+            "symbol": row.get("symbol"),
+        }
+        for row in rows
+        if row.get("value") is None
+    ][:10]
+    missing_value_count = sum(1 for row in rows if row.get("value") is None)
+    if missing_value_count:
+        markers.append("missing_values")
+        if missing_value_count == len(rows):
+            markers.append("all_values_missing")
+    if payload.get("truncated"):
+        markers.append("partial_fanout_coverage")
+    status = "executed" if rows else "empty"
+    return {
+        "status": status,
+        "source_system": "NABO",
+        "provider": "국회예산정책처 재정경제통계시스템",
+        "table_id": statbl_id,
+        "dtacycle_cd": cycle,
+        "period_requested": period,
+        "latest_period": latest_period,
+        "row_count": len(rows),
+        "source_row_count": len(raw_rows),
+        "total_count": payload.get("total_count"),
+        "truncated": payload.get("truncated", False),
+        "filters_applied": filters or {},
+        "missing_value_count": missing_value_count,
+        "missing_value_examples": missing_value_examples,
+        "rows": rows,
+        "must_know": {
+            "source_system": "NABO",
+            "provider": "국회예산정책처 재정경제통계시스템",
+            "raw_extraction_only": True,
+            "unit_from_ui_nm": True,
+            "do_not_label_as_kosis": True,
+        },
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="raw_extraction",
+            final_answer_expected=False,
+            markers=markers,
+            explanation="query_nabo_table returns NABO raw rows normalized for downstream LLM analysis.",
+            extra_signals={
+                "source_system": "NABO",
+                "table_id": statbl_id,
+                "row_count": len(rows),
+                "latest_period": latest_period,
+                "truncated": payload.get("truncated", False),
+                "missing_value_count": missing_value_count,
+                "missing_value_examples": missing_value_examples,
+            },
+        ),
+    }
+
+
+@mcp.tool()
+async def search_nabo_terms(
+    term: str,
+    limit: int = 10,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[📖] NABOSTATS 통계 용어사전을 검색한다."""
+    try:
+        key = _resolve_nabo_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_nabo_key_error(exc):
+            return _missing_nabo_key_response("search_nabo_terms", term=term, limit=limit)
+        raise
+    safe_limit = max(1, min(int(limit or 10), NABO_MAX_PAGE_SIZE))
+    try:
+        payload = await _nabo_fetch_rows(
+            "DicApiList",
+            key,
+            {"DIC_TITLE": term, "pIndex": 1, "pSize": safe_limit},
+            max_rows=safe_limit,
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "source_system": "NABO",
+            "term": term,
+            "error": str(exc),
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="dictionary_search",
+                final_answer_expected=False,
+                markers=["fanout_call_failed"],
+                explanation="NABO dictionary search failed during OpenAPI access.",
+                extra_signals={"source_system": "NABO"},
+            ),
+        }
+    terms = [
+        {
+            "source_system": "NABO",
+            "term_id": str(row.get("DIC_SEQ") or ""),
+            "title": row.get("DIC_TITLE"),
+            "content": row.get("DIC_CONTENT"),
+            "raw": row,
+        }
+        for row in payload.get("rows", [])
+    ]
+    markers = ["search_empty"] if not terms else []
+    return {
+        "status": "executed" if terms else "empty",
+        "source_system": "NABO",
+        "term": term,
+        "result_count": len(terms),
+        "total_count": payload.get("total_count", len(terms)),
+        "terms": terms,
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="dictionary_search",
+            final_answer_expected=False,
+            markers=markers,
+            explanation="NABO dictionary search returns term definitions only.",
+            extra_signals={"source_system": "NABO", "result_count": len(terms)},
+        ),
+    }
+
+
+@mcp.tool()
+async def search_stats(
+    query: str,
+    source: str = "all",
+    limit: int = 10,
+    kosis_api_key: Optional[str] = None,
+    nabo_api_key: Optional[str] = None,
+) -> dict:
+    """[🔎] KOSIS/NABO 통합 통계표 후보 검색 facade."""
+    source_norm = str(source or "all").lower()
+    if source_norm not in {"all", "kosis", "nabo"}:
+        return {
+            "status": "unsupported",
+            "error": "source must be one of all, kosis, nabo.",
+            "source": source,
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="table_search",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="search_stats source must be all, kosis, or nabo.",
+            ),
+        }
+
+    results: list[dict[str, Any]] = []
+    source_payloads: dict[str, Any] = {}
+    if source_norm in {"all", "kosis"}:
+        kosis_payload = await search_kosis(query, limit=limit, api_key=kosis_api_key)
+        source_payloads["kosis"] = kosis_payload
+        for row in (kosis_payload.get("결과") or [])[:limit]:
+            results.append({
+                "source_system": "KOSIS",
+                "provider": "통계청 KOSIS",
+                "table_id": row.get("통계표ID") or row.get("TBL_ID"),
+                "org_id": row.get("기관ID") or row.get("ORG_ID"),
+                "table_name": row.get("통계표명") or row.get("TBL_NM"),
+                "raw": row,
+            })
+    if source_norm in {"all", "nabo"}:
+        nabo_payload = await search_nabo_tables(query, limit=limit, api_key=nabo_api_key)
+        source_payloads["nabo"] = nabo_payload
+        results.extend((nabo_payload.get("tables") or [])[:limit])
+
+    markers = []
+    if not results:
+        markers.append("search_empty")
+    missing_sources = [
+        name for name, payload in source_payloads.items()
+        if isinstance(payload, dict) and payload.get("code") == STATUS_MISSING_API_KEY
+    ]
+    if missing_sources:
+        markers.append("missing_api_key")
+    return {
+        "status": "executed" if results else "empty",
+        "query": query,
+        "source": source_norm,
+        "result_count": len(results),
+        "results": results,
+        "source_payloads": source_payloads,
+        "must_know": {
+            "mixed_sources": source_norm == "all",
+            "caller_must_preserve_source_system": True,
+            "kosis_and_nabo_tables_are_not_interchangeable": True,
+        },
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="table_search",
+            final_answer_expected=False,
+            markers=markers,
+            explanation="search_stats merges table candidates but does not claim cross-source equivalence.",
+            extra_signals={
+                "source": source_norm,
+                "result_count": len(results),
+                "missing_sources": missing_sources,
+            },
+        ),
+    }
 
 
 
