@@ -114,6 +114,10 @@ class QueryWorkflowPlanner:
         "note": "충돌 시 intended_dimensions가 권위입니다. router_slots는 디버깅용 보조 정보입니다.",
     }
     GENERIC_ROUTER_INDICATORS = {"비중", "비율", "구성비", "증가율", "감소율", "변화율"}
+    MULTI_INDICATOR_SPLIT_RE = re.compile(
+        r"[,;/|·\n]+|\s+(?:그리고|및|또는|또|랑|하고)\s+",
+        re.IGNORECASE,
+    )
     TIME_GROUP_BY_TERMS = {
         "year", "years", "annual", "month", "months", "monthly",
         "quarter", "quarters", "period", "prd", "time",
@@ -450,6 +454,8 @@ class QueryWorkflowPlanner:
             markers.append("conflict_decisions")
         if unknown_metrics:
             markers.append("metric_availability_unverified")
+        if len(metrics) > 1:
+            markers.append("multi_metric_request")
         heuristic_metrics = [
             metric.get("name")
             for metric in metrics
@@ -465,6 +471,7 @@ class QueryWorkflowPlanner:
             "quarantined_metrics_count": len(quarantined_metrics),
             "conflict_decisions_count": len(conflict_decisions),
             "unknown_metric_count": len(unknown_metrics),
+            "metric_count": len(metrics),
             "analysis_task_count": len(analysis_tasks),
             "unknown_metrics": unknown_metrics,
             "heuristic_metrics": heuristic_metrics,
@@ -472,6 +479,7 @@ class QueryWorkflowPlanner:
             "marker_guidance": {
                 "heuristic_extraction": "Treat extracted metrics/dimensions as candidates only; verify with KOSIS metadata before using as evidence.",
                 "metric_availability_unverified": "Call select_table_for_query and resolve_concepts before query_table.",
+                "multi_metric_request": "Treat each metric as a separate table-selection/query path unless KOSIS metadata proves they share one table.",
                 "missing_metrics": "Ask for or infer a statistical metric before selecting a table.",
                 "quarantined_metrics": "Do not use quarantined metrics unless the user explicitly confirms them.",
             },
@@ -753,6 +761,14 @@ class QueryWorkflowPlanner:
                 dimensions["disambiguation_suggested"] = (
                     f"{indicator}는 여러 공식 통계 기준이 있습니다. 기준을 명시하면 더 정확합니다."
                 )
+        indicator_candidates = self._multi_indicator_candidates(query, route_payload, indicator)
+        if indicator_candidates:
+            dimensions["indicator_candidates"] = indicator_candidates
+            dimensions["multi_indicator_extraction"] = {
+                "source": "query_segments",
+                "candidate_count": len(indicator_candidates),
+                "caller_should_process_each_metric_separately": True,
+            }
         if "폐업" in q_norm:
             dimensions["event"] = "폐업"
         if "창업" in q_norm:
@@ -829,6 +845,60 @@ class QueryWorkflowPlanner:
         if implicit_count:
             return implicit_count
         return None
+
+    def _multi_indicator_candidates(
+        self,
+        query: str,
+        route_payload: dict[str, Any],
+        primary_indicator: Optional[str],
+    ) -> list[dict[str, Any]]:
+        """Extract multiple metric candidates from explicit multi-part requests.
+
+        The splitter is structural only. Each segment is fed back through the
+        same planner/router indicator path instead of using a domain synonym map.
+        """
+        slots = route_payload.get("slots") or {}
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(name: Any, source: str, segment: Optional[str] = None) -> None:
+            if not isinstance(name, str) or not name.strip():
+                return
+            key = self._metric_key(name)
+            if not key or key in seen:
+                return
+            seen.add(key)
+            candidates.append({
+                "name": self._metric_display_name(name),
+                "role": "primary" if not candidates else "comparison",
+                "source": source,
+                "segment": segment,
+                "extraction_method": "structured_segment" if segment else "structured_slot",
+                "availability": "unknown",
+            })
+
+        if isinstance(slots, dict):
+            add(slots.get("indicator"), "router_slots.indicator")
+            for item in slots.get("secondary_indicators") or []:
+                add(item, "router_slots.secondary_indicators")
+
+        if not self._explicit_multi_metric_query(query, slots):
+            return candidates
+
+        segments = [
+            segment.strip()
+            for segment in self.MULTI_INDICATOR_SPLIT_RE.split(str(query or ""))
+            if segment and segment.strip()
+        ]
+        for segment in segments:
+            segment_route = _route_query(segment).to_agent_payload()
+            indicator = self._indicator(segment, _compact_text(segment), segment.lower(), segment_route)
+            if indicator:
+                add(indicator, "query_segment.indicator", segment)
+
+        if len(candidates) <= 1 and primary_indicator:
+            return []
+        return candidates
 
     @staticmethod
     def _alias_in_query(alias: str, q_lower: str) -> bool:
@@ -1259,7 +1329,21 @@ class QueryWorkflowPlanner:
                 "caller_must_verify_with_kosis_meta": heuristic,
             })
 
-        add(dimensions.get("indicator"), "primary", "intended_dimensions")
+        indicator_candidates = dimensions.get("indicator_candidates") or []
+        for candidate in indicator_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            add(
+                candidate.get("name"),
+                candidate.get("role") or ("primary" if not metrics else "comparison"),
+                candidate.get("source") or "intended_dimensions.indicator_candidates",
+                candidate.get("extraction_method") or "structured_segment",
+            )
+        add(
+            dimensions.get("indicator"),
+            "primary" if not metrics else "comparison",
+            "intended_dimensions",
+        )
         if isinstance(slots, dict):
             add(slots.get("indicator"), "primary" if not metrics else "comparison", "router_slots.indicator")
             for item in slots.get("secondary_indicators") or []:

@@ -651,6 +651,31 @@ async def test_plan_query_normalized_metric_references_are_synced() -> None:
     assert "GDP" not in task_metrics, result
 
 
+async def test_plan_query_extracts_multiple_indicators() -> None:
+    original_normalize = kosis_mcp_server._normalize_indicator_from_kosis_meta
+
+    async def fake_normalize(user_input: Any, api_key: Any = None, **_: Any) -> dict[str, Any]:
+        raw = str(user_input)
+        return {"raw_input": raw, "normalized": raw, "source": "passthrough", "alternatives": []}
+
+    try:
+        kosis_mcp_server._normalize_indicator_from_kosis_meta = fake_normalize  # type: ignore[assignment]
+        result = await kosis_mcp_server.plan_query("경제성장률, 인구 변화율, 합계출산율 추이")
+    finally:
+        kosis_mcp_server._normalize_indicator_from_kosis_meta = original_normalize  # type: ignore[assignment]
+
+    metric_names = [metric.get("name") for metric in result.get("metrics") or []]
+    assert "경제성장률" in metric_names, result
+    assert "인구" in metric_names, result
+    assert "합계출산율" in metric_names, result
+    assert len(metric_names) >= 3, result
+    candidates = result["intended_dimensions"].get("indicator_candidates") or []
+    assert len(candidates) >= 3, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "multi_metric_request" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["marker_guidance"]["multi_metric_request"], result
+
+
 async def test_plan_query_change_implication_inference_log() -> None:
     original_normalize = kosis_mcp_server._normalize_indicator_from_kosis_meta
 
@@ -1080,6 +1105,7 @@ async def main() -> None:
         ("indicator_normalization_table_context", lambda: test_indicator_normalization_prefers_relevant_table_name()),
         ("plan_indicator_normalization", lambda: test_plan_query_indicator_normalization_from_kosis_meta()),
         ("plan_normalized_metric_refs", lambda: test_plan_query_normalized_metric_references_are_synced()),
+        ("plan_multi_indicator_extraction", lambda: test_plan_query_extracts_multiple_indicators()),
         ("plan_change_inference_log", lambda: test_plan_query_change_implication_inference_log()),
         ("plan_empty_nonstat_clarification", lambda: test_plan_query_empty_and_nonstat_need_clarification()),
         ("plan_heuristic_extraction_marker", lambda: test_plan_query_heuristic_extraction_is_marked()),

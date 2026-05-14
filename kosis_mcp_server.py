@@ -4552,6 +4552,20 @@ def _replace_metric_references(plan: dict[str, Any], raw_value: Any, normalized_
     visit(plan)
 
 
+def _dedupe_metric_dicts(metrics: list[Any]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        key = _metric_name_key(metric.get("name"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(metric)
+    return deduped
+
+
 def _plan_contract_add_markers(plan: dict[str, Any], markers: list[str]) -> None:
     contract = plan.get("mcp_output_contract")
     if not isinstance(contract, dict):
@@ -4628,6 +4642,26 @@ async def _enrich_plan_with_metadata(
                         metric["name"] = normalized_name
                         metric["indicator_raw_input"] = raw_indicator
                         metric["indicator_normalization"] = normalization
+
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        raw_metric = metric.get("name")
+        if not isinstance(raw_metric, str) or not raw_metric.strip():
+            continue
+        normalization = await normalize_once(raw_metric)
+        metric["indicator_raw_input"] = metric.get("indicator_raw_input") or raw_metric
+        metric["indicator_normalization"] = normalization
+        if normalization.get("source") == "kosis_meta_match":
+            normalized_name = normalization.get("normalized") or raw_metric
+            if normalized_name != raw_metric:
+                metric["name"] = normalized_name
+                _replace_metric_references(plan, raw_metric, normalized_name)
+                markers.append("indicator_normalized")
+                if normalized_name not in concepts:
+                    concepts.append(normalized_name)
+    plan["metrics"] = _dedupe_metric_dicts(metrics)
+    metrics = plan["metrics"]
 
     route = plan.get("route") or {}
     route_concepts = route.get("matched_concepts") or []
