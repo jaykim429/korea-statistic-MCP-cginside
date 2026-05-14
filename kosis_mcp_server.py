@@ -92,6 +92,7 @@ from kosis_analysis.periods import (
 )
 from kosis_analysis.indicators import (
     OPERATIONS as INDICATOR_OPERATIONS,
+    OPERATION_ALIASES_KO,
     operation_catalog as _indicator_operation_catalog,
 )
 from kosis_analysis.planner import QueryWorkflowPlanner
@@ -175,6 +176,39 @@ def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]
         "Re-run the same query through plan_query -> select_table_for_query -> resolve_concepts -> query_table when reliability matters.",
         "If this response is partial, unsupported, or a search plan, report that limitation instead of filling gaps from model knowledge.",
     ])
+    existing_contract = result.get("mcp_output_contract") if isinstance(result.get("mcp_output_contract"), dict) else {}
+    existing_signals = existing_contract.get("current_signals") if isinstance(existing_contract, dict) else {}
+    if not isinstance(existing_signals, dict):
+        existing_signals = {}
+    markers = list(existing_signals.get("markers_present") or [])
+    markers.append("deprecation")
+    dropped = result.get("dropped_dimensions") or result.get("누락_차원") or []
+    fulfillment_status = result.get("status") or result.get("이행_상태")
+    gap_reason = result.get("부분충족_사유") or result.get("fulfillment_gap_reason")
+    if fulfillment_status == "partial" or dropped:
+        markers.append("partial_fulfillment")
+    if dropped:
+        markers.append("dropped_dimensions")
+    if result.get("status") == "failed":
+        markers.append("runtime_error")
+    result["mcp_output_contract"] = _mcp_tool_output_contract(
+        role="deprecated_shortcut",
+        final_answer_expected=False,
+        markers=markers,
+        explanation="answer_query is a deprecated shortcut; prefer the stepwise evidence pipeline.",
+        extra_signals={
+            "fulfillment_status": fulfillment_status,
+            "dropped_dimensions": dropped,
+            "fulfillment_gap_reason": gap_reason,
+            "recommended_replacement": "plan_query",
+        },
+    )
+    result.setdefault("deprecated_fields", {
+        "이행_상태": "Use mcp_output_contract.current_signals.fulfillment_status",
+        "누락_차원": "Use mcp_output_contract.current_signals.dropped_dimensions",
+        "부분충족_사유": "Use mcp_output_contract.current_signals.fulfillment_gap_reason",
+        "deprecation_warning": "Use mcp_output_contract (role: deprecated_shortcut)",
+    })
     return result
 
 
@@ -205,6 +239,7 @@ def _mcp_tool_output_contract(
         "metadata_failed",
         "empty_rows",
         "partial_computation",
+        "partial_fulfillment",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -226,6 +261,7 @@ def _mcp_tool_output_contract(
             "Do not hide unsupported, not_matched, empty_rows, validation_errors, or partial_fanout_coverage markers.",
             "If coverage_ratio is below 1.0, disclose partial coverage before using the returned rows.",
             "Do not fill missing rows from model knowledge.",
+            "If unit_caller_should_label is null, resolve the unit before quoting; do not reuse unit_raw as the computed result unit.",
         ],
         "failure_markers": [
             "unsupported",
@@ -239,6 +275,7 @@ def _mcp_tool_output_contract(
             "complete_fanout_miss",
             "max_fanout_exceeded",
             "empty_rows",
+            "partial_fulfillment",
             "coverage_ratio",
         ],
     }
@@ -3459,7 +3496,7 @@ async def chain_full_analysis(
 
 
 @mcp.tool()
-async def plan_query(query: str) -> dict:
+async def plan_query(query: str, api_key: Optional[str] = None) -> dict:
     """[🧭] Gemma용 절차형 KOSIS 분석 계획을 만든다.
 
     질문을 차원과 작업 단계로 분해합니다.
@@ -3473,7 +3510,8 @@ async def plan_query(query: str) -> dict:
     역할은 의도 추출과 워크플로우 제안까지만입니다.
     """
     planner = QueryWorkflowPlanner()
-    return planner.build(query)
+    plan = planner.build(query)
+    return await _enrich_plan_with_metadata(plan, query, api_key=api_key)
 
 
 @mcp.tool()
@@ -3926,6 +3964,387 @@ async def _search_kosis_keywords(
     }
 
 
+def _candidate_latest_period_year(candidate: dict[str, Any]) -> int:
+    years: list[int] = []
+    for period in candidate.get("periods") or []:
+        text = str(period.get("latest_period") or "")
+        match = re.match(r"^(\d{4})", text)
+        if match:
+            years.append(int(match.group(1)))
+    return max(years) if years else 0
+
+
+def _candidate_cadence_diversity(candidate: dict[str, Any]) -> int:
+    return len({
+        str(period.get("cadence") or "")
+        for period in candidate.get("periods") or []
+        if period.get("cadence")
+    })
+
+
+def _candidate_item_count(candidate: dict[str, Any]) -> int:
+    profile = candidate.get("metadata_profile") or {}
+    try:
+        return int(profile.get("item_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_indicator_score(candidate: dict[str, Any]) -> int:
+    compatibility = candidate.get("compatibility") or {}
+    try:
+        return int(compatibility.get("indicator_score") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]]) -> None:
+    for candidate in candidates:
+        features = {
+            "indicator_score": _candidate_indicator_score(candidate),
+            "latest_period_year": _candidate_latest_period_year(candidate),
+            "cadence_diversity": _candidate_cadence_diversity(candidate),
+            "item_count": _candidate_item_count(candidate),
+        }
+        candidate["ranking_features"] = features
+
+
+def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
+    features = candidate.get("ranking_features") or {}
+    return (
+        candidate.get("status") != "selected",
+        -int(features.get("indicator_score") or 0),
+        -int(features.get("latest_period_year") or 0),
+        -int(features.get("cadence_diversity") or 0),
+        -int(features.get("item_count") or 0),
+        -int(candidate.get("score") or 0),
+        str(candidate.get("tbl_id") or ""),
+    )
+
+
+def _table_selection_reasons(selected: dict[str, Any], selected_candidates: list[dict[str, Any]]) -> list[str]:
+    features = selected.get("ranking_features") or {}
+    indicator_score = int(features.get("indicator_score") or 0)
+    latest_year = int(features.get("latest_period_year") or 0)
+    cadence_count = int(features.get("cadence_diversity") or 0)
+    item_count = int(features.get("item_count") or 0)
+    tied_indicator = [
+        candidate for candidate in selected_candidates
+        if int((candidate.get("ranking_features") or {}).get("indicator_score") or 0) == indicator_score
+    ]
+    freshest_tied = max(
+        (int((candidate.get("ranking_features") or {}).get("latest_period_year") or 0) for candidate in tied_indicator),
+        default=0,
+    )
+    reasons = [f"indicator_score={indicator_score} (tied with {max(0, len(tied_indicator) - 1)} others)"]
+    if latest_year:
+        suffix = "freshest among tied" if latest_year >= freshest_tied else "not freshest among tied"
+        reasons.append(f"latest_period_year={latest_year} ({suffix})")
+    if cadence_count:
+        reasons.append(f"cadence_diversity={cadence_count}")
+    if item_count:
+        reasons.append(f"item_count={item_count}")
+    return reasons
+
+
+def _search_result_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("결과")
+    if not isinstance(rows, list):
+        rows = payload.get("寃곌낵")
+    return rows if isinstance(rows, list) else []
+
+
+def _row_first(row: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _indicator_meta_match_score(raw: str, label: Any, field_name: str) -> int:
+    target = _compact_text(raw)
+    text = _compact_text(str(label or ""))
+    if not target or not text:
+        return 0
+    if target == text:
+        return 100
+    if target in text:
+        return 90 if field_name == "ITM_NM" else 70
+    if text in target and len(text) >= 2:
+        return 80 if field_name == "ITM_NM" else 60
+    return 0
+
+
+async def _normalize_indicator_from_kosis_meta(
+    user_input: Any,
+    api_key: Optional[str] = None,
+    *,
+    search_limit: int = 6,
+    table_limit: int = 4,
+) -> dict[str, Any]:
+    raw = str(user_input or "").strip()
+    base = {
+        "raw_input": raw,
+        "normalized": raw,
+        "source": "passthrough",
+        "match_evidence": None,
+        "alternatives": [],
+    }
+    if not raw:
+        return base
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return {
+                **base,
+                "source": "metadata_unavailable",
+                "status": "skipped",
+                "reason": "missing_api_key",
+            }
+        raise
+
+    try:
+        search_payload = await search_kosis(raw, limit=search_limit, use_routing=False, api_key=key)
+    except Exception as exc:
+        return {
+            **base,
+            "source": "metadata_unavailable",
+            "status": "search_failed",
+            "reason": str(exc),
+        }
+
+    rows = _search_result_rows(search_payload)
+    matches: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for row in rows[:table_limit]:
+            org_id = _row_first(row, ["기관ID", "湲곌?ID", "ORG_ID", "org_id"])
+            tbl_id = _row_first(row, ["통계표ID", "?듦퀎?쏧D", "TBL_ID", "tbl_id"])
+            table_name = _row_first(row, ["통계표명", "?듦퀎?쒕챸", "TBL_NM", "table_name"])
+            if not org_id or not tbl_id:
+                continue
+            try:
+                item_rows = await _fetch_meta(client, key, str(org_id), str(tbl_id), "ITM")
+            except Exception:
+                continue
+            if not isinstance(item_rows, list):
+                continue
+            for item in item_rows:
+                label = item.get("ITM_NM") or item.get("label")
+                label_en = item.get("ITM_NM_ENG") or item.get("label_en")
+                scored = [
+                    ("ITM_NM", label, _indicator_meta_match_score(raw, label, "ITM_NM")),
+                    ("ITM_NM_ENG", label_en, _indicator_meta_match_score(raw, label_en, "ITM_NM_ENG")),
+                ]
+                field_name, matched_value, score = max(scored, key=lambda part: part[2])
+                if score <= 0:
+                    continue
+                matches.append({
+                    "canonical_name": str(label or matched_value),
+                    "score": score,
+                    "matched_field": field_name,
+                    "matched_value": matched_value,
+                    "match_evidence": f"{field_name} contains {raw!r}",
+                    "org_id": str(org_id),
+                    "tbl_id": str(tbl_id),
+                    "table_name": table_name,
+                    "itm_id": item.get("ITM_ID"),
+                    "unit": item.get("UNIT_NM"),
+                })
+
+    if not matches:
+        return {
+            **base,
+            "candidate_count": 0,
+            "search_result_count": len(rows),
+        }
+    matches.sort(key=lambda item: (-int(item["score"]), len(_compact_text(item["canonical_name"])), item["canonical_name"]))
+    best = matches[0]
+    alternatives = [
+        {
+            "name": item["canonical_name"],
+            "match_evidence": item["match_evidence"],
+            "score": item["score"],
+            "tbl_id": item["tbl_id"],
+            "itm_id": item.get("itm_id"),
+        }
+        for item in matches[1:5]
+    ]
+    return {
+        "raw_input": raw,
+        "normalized": best["canonical_name"],
+        "source": "kosis_meta_match",
+        "match_evidence": best["match_evidence"],
+        "matched_field": best["matched_field"],
+        "matched_value": best["matched_value"],
+        "alternatives": alternatives,
+        "org_id": best["org_id"],
+        "tbl_id": best["tbl_id"],
+        "table_name": best["table_name"],
+        "itm_id": best.get("itm_id"),
+        "unit": best.get("unit"),
+        "candidate_count": len(matches),
+        "search_result_count": len(rows),
+    }
+
+
+def _metric_name_key(value: Any) -> str:
+    return re.sub(r"[\s_]+", "", _compact_text(str(value or "")))
+
+
+def _plan_contract_add_markers(plan: dict[str, Any], markers: list[str]) -> None:
+    contract = plan.get("mcp_output_contract")
+    if not isinstance(contract, dict):
+        return
+    signals = contract.setdefault("current_signals", {})
+    present = list(signals.get("markers_present") or [])
+    for marker in markers:
+        if marker not in present:
+            present.append(marker)
+    signals["markers_present"] = present
+    signals["has_caveats"] = bool(present)
+
+
+def _change_implication_evidence(query: str, route_payload: dict[str, Any]) -> Optional[str]:
+    intents = route_payload.get("intents") or []
+    slots = route_payload.get("slots") or {}
+    if "STAT_GROWTH_RATE" in intents:
+        return "route intent STAT_GROWTH_RATE"
+    calculations = slots.get("calculation") if isinstance(slots, dict) else None
+    if isinstance(calculations, list) and any(item in calculations for item in ("growth_rate", "change")):
+        return "router_slots.calculation implies change"
+    match = re.search(r"(올랐|올라|오르|내렸|내려|내리|늘었|늘어|줄었|줄어|증가|감소|상승|하락|변화|증감)", query)
+    if match:
+        return f"query contains change cue {match.group(1)!r}"
+    return None
+
+
+async def _enrich_plan_with_metadata(
+    plan: dict[str, Any],
+    query: str,
+    api_key: Optional[str] = None,
+) -> dict[str, Any]:
+    dimensions = plan.setdefault("intended_dimensions", {})
+    if not isinstance(dimensions, dict):
+        return plan
+    metrics = plan.setdefault("metrics", [])
+    if not isinstance(metrics, list):
+        metrics = []
+        plan["metrics"] = metrics
+    concepts = plan.setdefault("concepts", [])
+    if not isinstance(concepts, list):
+        concepts = []
+        plan["concepts"] = concepts
+
+    markers: list[str] = []
+    promotion_log: list[dict[str, Any]] = []
+    inference_log: list[dict[str, Any]] = []
+    normalized_by_raw: dict[str, dict[str, Any]] = {}
+
+    async def normalize_once(raw_value: Any) -> dict[str, Any]:
+        key = str(raw_value or "").strip()
+        if key not in normalized_by_raw:
+            normalized_by_raw[key] = await _normalize_indicator_from_kosis_meta(key, api_key=api_key)
+        return normalized_by_raw[key]
+
+    raw_indicator = dimensions.get("indicator")
+    if isinstance(raw_indicator, str) and raw_indicator.strip():
+        normalization = await normalize_once(raw_indicator)
+        dimensions["indicator_raw_input"] = raw_indicator
+        dimensions["indicator_normalization"] = normalization
+        if normalization.get("source") == "kosis_meta_match":
+            normalized_name = normalization.get("normalized") or raw_indicator
+            if normalized_name != raw_indicator:
+                dimensions["indicator"] = normalized_name
+                markers.append("indicator_normalized")
+                for idx, concept in enumerate(list(concepts)):
+                    if _metric_name_key(concept) == _metric_name_key(raw_indicator):
+                        concepts[idx] = normalized_name
+                if normalized_name not in concepts:
+                    concepts.insert(0, normalized_name)
+                for metric in metrics:
+                    if _metric_name_key(metric.get("name")) == _metric_name_key(raw_indicator):
+                        metric["name"] = normalized_name
+                        metric["indicator_raw_input"] = raw_indicator
+                        metric["indicator_normalization"] = normalization
+
+    route = plan.get("route") or {}
+    route_concepts = route.get("matched_concepts") or []
+    initial_metric_count = len(metrics)
+    blocked_metric_keys = {
+        _metric_name_key(item.get("name"))
+        for item in (plan.get("quarantined_metrics") or [])
+        if isinstance(item, dict)
+    }
+    for concept in route_concepts:
+        if not isinstance(concept, str) or not concept.strip():
+            continue
+        normalization = await normalize_once(concept)
+        metric_name = normalization.get("normalized") if normalization.get("source") == "kosis_meta_match" else concept
+        if not metric_name:
+            continue
+        metric_key = _metric_name_key(metric_name)
+        should_promote = (
+            normalization.get("source") == "kosis_meta_match"
+            or initial_metric_count == 0
+        )
+        if metric_key in blocked_metric_keys:
+            should_promote = False
+        if should_promote and not any(_metric_name_key(metric.get("name")) == metric_key for metric in metrics):
+            metrics.append({
+                "name": metric_name,
+                "role": "primary" if not metrics else "mentioned",
+                "source": "route_promotion",
+                "availability": "unknown",
+            })
+            markers.append("route_metric_promoted")
+        promotion_log.append({
+            "source_field": "route.matched_concepts",
+            "raw_value": concept,
+            "promoted_to_metric": metric_name,
+            "normalization_source": normalization.get("source"),
+            "match_evidence": normalization.get("match_evidence"),
+            "promoted": should_promote,
+        })
+
+    route_payload = {
+        "route": route,
+        "intents": plan.get("route_intents") or plan.get("intents") or [],
+        "slots": plan.get("router_slots") or {},
+    }
+    evidence = _change_implication_evidence(query, route_payload)
+    analysis_tasks = plan.setdefault("analysis_tasks", [])
+    if not isinstance(analysis_tasks, list):
+        analysis_tasks = []
+        plan["analysis_tasks"] = analysis_tasks
+    if evidence and not any(task.get("type") in {"growth_rate", "change_compare", "yoy_pct_or_growth_rate"} for task in analysis_tasks if isinstance(task, dict)):
+        analysis_tasks.append({
+            "type": "yoy_pct_or_growth_rate",
+            "auto_inferred": True,
+            "inference_evidence": evidence,
+        })
+        inference_log.append({
+            "source_field": "query_text",
+            "inferred_task": "yoy_pct_or_growth_rate",
+            "inference_evidence": evidence,
+        })
+        markers.append("analysis_task_inferred")
+        calculations = plan.setdefault("calculations", [])
+        if isinstance(calculations, list) and "growth_rate" not in calculations:
+            calculations.append("growth_rate")
+        if plan.get("intent") == "single_value":
+            plan["intent"] = "growth_rate"
+
+    if promotion_log:
+        plan["metrics_promotion_log"] = promotion_log
+    if inference_log:
+        plan["analysis_tasks_inference_log"] = inference_log
+    if markers:
+        _plan_contract_add_markers(plan, markers)
+    return plan
+
+
 @mcp.tool()
 async def search_kosis(
     query: str, limit: int = 10,
@@ -4062,6 +4481,7 @@ async def resolve_concepts(
     filters: dict[str, list[str]] = {}
     unresolved: list[str] = []
     ambiguities: list[dict[str, Any]] = []
+    resolved_context: list[dict[str, Any]] = []
 
     for concept in concepts:
         concept_matches: list[dict[str, Any]] = []
@@ -4086,12 +4506,54 @@ async def resolve_concepts(
                     "UP_ITM_ID": meta.get("parent"),
                 })
         concept_matches.sort(key=lambda row: (-int(row["score"]), str(row["OBJ_ID"]), str(row["ITM_ID"])))
+        parent_context = {
+            str(item.get("ITM_ID"))
+            for item in resolved_context
+            if item.get("ITM_ID")
+        }
+        context_best = None
+        if parent_context:
+            context_best = next(
+                (
+                    row for row in concept_matches
+                    if str(row.get("UP_ITM_ID") or "") in parent_context and int(row.get("score") or 0) >= 60
+                ),
+                None,
+            )
+            if context_best is not None:
+                concept_matches = [
+                    context_best,
+                    *[
+                        row for row in concept_matches
+                        if row.get("OBJ_ID") != context_best.get("OBJ_ID")
+                        or row.get("ITM_ID") != context_best.get("ITM_ID")
+                    ],
+                ]
         top = concept_matches[:limit]
         matches_by_concept.append({"concept": concept, "matches": top})
         if not top:
             unresolved.append(str(concept))
             continue
-        best = top[0]
+        best = dict(top[0])
+        selection_reason = "context_aware_parent_match" if context_best is not None else "highest_score_then_axis_code"
+        context_evidence = None
+        if context_best is not None:
+            parent_id = str(context_best.get("UP_ITM_ID") or "")
+            parent = next((item for item in resolved_context if str(item.get("ITM_ID")) == parent_id), None)
+            if parent:
+                context_evidence = (
+                    f"previous concept {parent.get('concept')!r} matched ITM_ID={parent_id}; "
+                    f"current candidate has UP_ITM_ID={parent_id}"
+                )
+            else:
+                context_evidence = f"current candidate has UP_ITM_ID={parent_id}"
+        best["best_selection_reason"] = selection_reason
+        best["context_evidence"] = context_evidence
+        best["disambiguation_strategy"] = {
+            "primary": "context_aware_parent_match",
+            "fallback": "highest_score_then_axis_code",
+            "caller_can_override": "by specifying the parent concept first or constraining axes_to_search",
+        }
         close = [
             row for row in top
             if row["score"] >= best["score"] - 5 and (
@@ -4104,6 +4566,12 @@ async def resolve_concepts(
             filters.setdefault(str(best["OBJ_ID"]), [])
             if best["ITM_ID"] not in filters[str(best["OBJ_ID"])]:
                 filters[str(best["OBJ_ID"])].append(str(best["ITM_ID"]))
+            resolved_context.append({
+                "concept": concept,
+                "OBJ_ID": best.get("OBJ_ID"),
+                "ITM_ID": best.get("ITM_ID"),
+                "ITM_NM": best.get("ITM_NM"),
+            })
 
     status = "resolved" if filters and not unresolved else "partial" if filters else "needs_concept_selection"
     concept_markers: list[str] = []
@@ -4202,9 +4670,15 @@ async def select_table_for_query(
         effective_indicator, indicator_source = query_text, "query_fallback"
     else:
         effective_indicator, indicator_source = None, "none"
+    indicator_raw_input = effective_indicator
+    indicator_normalization = None
+    if effective_indicator:
+        indicator_normalization = await _normalize_indicator_from_kosis_meta(effective_indicator, api_key=key)
+        if indicator_normalization.get("source") == "kosis_meta_match":
+            effective_indicator = str(indicator_normalization.get("normalized") or effective_indicator)
     search_queries = [
         term.strip()
-        for term in [query, *(search_terms or []), explicit_indicator or ""]
+        for term in [query, *(search_terms or []), explicit_indicator or "", effective_indicator or ""]
         if isinstance(term, str) and term.strip()
     ]
     search_queries = list(dict.fromkeys(search_queries))
@@ -4214,19 +4688,26 @@ async def select_table_for_query(
     ])
     raw_candidates: list[dict[str, Any]] = []
     for term, search in zip(search_queries, searches):
-        tier_a = search.get("Tier_A_직접_매핑")
-        if isinstance(tier_a, dict) and tier_a.get("통계표ID"):
+        tier_a = search.get("Tier_A_직접_매핑") or search.get("Tier_A_吏곸젒_留ㅽ븨")
+        tier_tbl_id = _row_first(tier_a, ["통계표ID", "?듦퀎?쏧D", "TBL_ID"]) if isinstance(tier_a, dict) else None
+        tier_org_id = _row_first(tier_a, ["기관ID", "湲곌?ID", "ORG_ID"]) if isinstance(tier_a, dict) else None
+        if isinstance(tier_a, dict) and tier_tbl_id:
             raw_candidates.append({
-                "통계표명": tier_a.get("통계표"),
-                "통계표ID": tier_a.get("통계표ID"),
-                "기관ID": tier_a.get("기관ID"),
+                "통계표명": _row_first(tier_a, ["통계표", "?듦퀎??", "통계표명", "TBL_NM"]),
+                "통계표ID": tier_tbl_id,
+                "기관ID": tier_org_id,
                 "source": "tier_a_direct_mapping",
                 "search_term": term,
             })
-        for row in search.get("결과") or []:
-            if row.get("통계표ID") and row.get("기관ID"):
+        for row in _search_result_rows(search):
+            row_tbl_id = _row_first(row, ["통계표ID", "?듦퀎?쏧D", "TBL_ID"])
+            row_org_id = _row_first(row, ["기관ID", "湲곌?ID", "ORG_ID"])
+            if row_tbl_id and row_org_id:
                 raw_candidates.append({
                     **row,
+                    "통계표ID": row_tbl_id,
+                    "기관ID": row_org_id,
+                    "통계표명": _row_first(row, ["통계표명", "?듦퀎?쒕챸", "TBL_NM"]),
                     "source": row.get("검색어") or "search_kosis",
                     "search_term": term,
                 })
@@ -4271,8 +4752,11 @@ async def select_table_for_query(
                 period_rows=period_rows,
             )
             candidates.append(scorer.evaluate(profile).to_response())
-    candidates.sort(key=lambda c: (c.get("status") != "selected", -int(c.get("score") or 0)))
+    _annotate_table_candidate_ranking(candidates)
+    candidates.sort(key=_table_candidate_sort_key)
     selected = [c for c in candidates if c.get("status") == "selected"]
+    if selected:
+        selected[0]["selection_reasons"] = _table_selection_reasons(selected[0], selected)
     warnings = []
     if not required:
         warnings.append(
@@ -4283,6 +4767,8 @@ async def select_table_for_query(
         selection_markers.append("not_matched")
     if any(c.get("status") == "not_matched_indicator" for c in candidates):
         selection_markers.append("indicator_evidence_empty")
+    if isinstance(indicator_normalization, dict) and indicator_normalization.get("source") == "kosis_meta_match":
+        selection_markers.append("indicator_normalized")
     if indicator_source == "query_fallback":
         selection_markers.append("indicator_inferred_from_query")
         warnings.append(
@@ -4306,6 +4792,8 @@ async def select_table_for_query(
         "query": query,
         "indicator": indicator,
         "indicator_used": effective_indicator,
+        "indicator_raw_input": indicator_raw_input,
+        "indicator_normalization": indicator_normalization,
         "indicator_source": indicator_source,
         "search_terms_used": search_queries,
         "required_dimensions": required,
@@ -4315,6 +4803,13 @@ async def select_table_for_query(
         "selected": selected[0] if selected else None,
         "alternatives": candidates[:limit],
         "rejected": [c for c in candidates if c.get("status") != "selected"][:limit],
+        "ranking_criteria": [
+            {"order": 1, "field": "indicator_score", "applied": True},
+            {"order": 2, "field": "latest_period_year", "applied": True},
+            {"order": 3, "field": "cadence_diversity", "applied": True},
+            {"order": 4, "field": "item_count", "applied": True},
+            {"order": 5, "field": "score", "applied": True},
+        ],
         "warnings": warnings,
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_selection",
@@ -4853,15 +5348,29 @@ async def compute_indicator(
         scale_factor: per_capita/ratio 결과에 곱할 단위 스케일 (예: 1000). share는 무시.
         decimals: 결과 반올림 자릿수.
     """
+    original_operation = operation
+    operation_alias_used = None
+    if isinstance(operation, str) and operation not in INDICATOR_OPERATIONS:
+        mapped = OPERATION_ALIASES_KO.get(operation)
+        if mapped:
+            operation_alias_used = {
+                "input": operation,
+                "mapped_to": mapped,
+                "source": "operation_alias_ko",
+            }
+            operation = mapped
     op = INDICATOR_OPERATIONS.get(operation) if isinstance(operation, str) else None
     if op is None:
+        did_you_mean = OPERATION_ALIASES_KO.get(original_operation) if isinstance(original_operation, str) else None
         return {
             "status": "invalid_input",
             "상태": "invalid_input",
-            "error": f"Unknown operation: {operation!r}",
-            "오류": f"알 수 없는 operation: {operation!r}",
+            "error": f"Unknown operation: {original_operation!r}",
+            "오류": f"알 수 없는 operation: {original_operation!r}",
+            "did_you_mean": did_you_mean,
             "valid_operations": list(INDICATOR_OPERATIONS.keys()),
             "operation_catalog": _indicator_operation_catalog(),
+            "korean_to_enum_map": dict(OPERATION_ALIASES_KO),
             "mcp_output_contract": _mcp_tool_output_contract(
                 role="indicator_computation",
                 final_answer_expected=False,
@@ -4914,6 +5423,12 @@ async def compute_indicator(
     markers = list(outcome.markers)
     if outcome.unmatched:
         markers.append("period_or_group_mismatch")
+    if any(
+        isinstance(result.unit_transformation, dict)
+        and result.unit_transformation.get("caller_must_resolve")
+        for result in outcome.results
+    ):
+        markers.append("unit_caller_resolution_required")
     if outcome.status == "invalid_input":
         markers.append("invalid_input")
     elif outcome.status == "partial":
@@ -4927,6 +5442,8 @@ async def compute_indicator(
         "status": outcome.status,
         "상태": outcome.status,
         "operation": operation,
+        "operation_raw_input": original_operation,
+        "operation_alias_used": operation_alias_used,
         "verification_level": "caller_inputs_only",
         "confidence": "medium" if outcome.results else "low",
         "results": [r.to_dict() for r in outcome.results],
@@ -4939,9 +5456,12 @@ async def compute_indicator(
             explanation=explanation,
             extra_signals={
                 "operation": operation,
+                "operation_raw_input": original_operation,
+                "operation_alias_used": operation_alias_used,
                 "result_count": len(outcome.results),
                 "unmatched_count": len(outcome.unmatched),
                 "additivity_caller_asserted": op.aggregation_caller_asserted,
+                "unit_caller_resolution_required": "unit_caller_resolution_required" in markers,
             },
         ),
         "주의": [
@@ -5032,12 +5552,24 @@ async def explore_table(
     if not meta_errors and not any(meta_counts.values()):
         return {
             "상태": "failed",
+            "status": "failed",
             "코드": STATUS_STAT_NOT_FOUND,
+            "code": STATUS_STAT_NOT_FOUND,
             "오류": "KOSIS 메타 API가 해당 org_id/tbl_id에 대해 어떤 메타도 반환하지 않았습니다.",
             "기관ID": org_id,
             "통계표ID": tbl_id,
             "조회_결과": meta_counts,
             "권고": "기관ID와 통계표ID를 다시 확인하거나 search_kosis로 통계표를 재검색하세요.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="table_metadata",
+                final_answer_expected=False,
+                markers=["metadata_failed", "not_matched"],
+                explanation="No metadata was returned for the requested table; caller must re-search or verify IDs.",
+                extra_signals={
+                    "metadata_errors": [],
+                    "metadata_counts": meta_counts,
+                },
+            ),
         }
 
     classifications: dict[str, dict[str, Any]] = {}

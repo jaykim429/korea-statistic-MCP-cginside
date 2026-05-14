@@ -233,6 +233,7 @@ class QueryWorkflowPlanner:
             "evidence_workflow": self._evidence_workflow(metrics, bundle_dimensions, analysis_tasks),
             "next_call": workflow[0].to_dict() if workflow else None,
             "route": route_payload.get("route", {}),
+            "route_intents": route_payload.get("intents", []),
             "router_slots": route_payload.get("slots", {}),
             "validation": route_payload.get("validation", {}),
             "must_not": [
@@ -342,6 +343,7 @@ class QueryWorkflowPlanner:
                 "단일값, 추이, 지역 비교, 비중 계산 중 어떤 형태가 필요하신가요?",
             ],
             "route": route_payload.get("route", {}),
+            "route_intents": route_payload.get("intents", []),
             "router_slots": route_payload.get("slots", {}),
             "validation": route_payload.get("validation", {}),
             "must_not": [

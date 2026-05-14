@@ -112,6 +112,11 @@ class IndicatorResult:
     period: Optional[str] = None
     label: Optional[str] = None
     unit: Optional[str] = None
+    unit_raw: Optional[str] = None
+    unit_denominator: Optional[str] = None
+    unit_resolved: Optional[str] = None
+    unit_caller_should_label: Optional[str] = None
+    unit_transformation: Optional[dict[str, Any]] = None
     dimensions: dict[str, Any] = field(default_factory=dict)
     inputs: dict[str, Any] = field(default_factory=dict)
     note: Optional[str] = None
@@ -125,6 +130,16 @@ class IndicatorResult:
             "dimensions": self.dimensions,
             "inputs": self.inputs,
         }
+        if self.unit_raw is not None:
+            payload["unit_raw"] = self.unit_raw
+        if self.unit_denominator is not None:
+            payload["unit_denominator"] = self.unit_denominator
+        if self.unit_resolved is not None or self.unit_transformation is not None:
+            payload["unit_resolved"] = self.unit_resolved
+        if self.unit_caller_should_label is not None or self.unit_transformation is not None:
+            payload["unit_caller_should_label"] = self.unit_caller_should_label
+        if self.unit_transformation is not None:
+            payload["unit_transformation"] = self.unit_transformation
         if self.note:
             payload["note"] = self.note
         return payload
@@ -161,6 +176,7 @@ class IndicatorOperation:
     requires_denominator: bool = False
     aggregation_caller_asserted: bool = False
     description: str = ""
+    aliases_ko: tuple[str, ...] = ()
 
     def compute(
         self,
@@ -194,6 +210,7 @@ class _PairOverPeriodOperation(IndicatorOperation):
 class GrowthRate(_PairOverPeriodOperation):
     name = "growth_rate"
     description = "Period-over-period percent change within each group (sorted by period)."
+    aliases_ko = ("변화율", "증감률", "성장률", "증가율", "감소율")
 
     def compute(
         self,
@@ -245,6 +262,7 @@ class GrowthRate(_PairOverPeriodOperation):
 class Cagr(_PairOverPeriodOperation):
     name = "cagr"
     description = "Compound annual growth rate between the earliest and latest period per group."
+    aliases_ko = ("연평균성장률", "연평균증가율")
 
     def compute(
         self,
@@ -350,12 +368,14 @@ class YoyPct(_YearOverYear):
     name = "yoy_pct"
     mode = "pct"
     description = "Year-over-year percent change at matching intra-year periods."
+    aliases_ko = ("전년대비", "전년대비변화율", "전년동기대비", "전년동기대비변화율")
 
 
 class YoyDiff(_YearOverYear):
     name = "yoy_diff"
     mode = "diff"
     description = "Year-over-year absolute change at matching intra-year periods."
+    aliases_ko = ("전년대비차이", "전년대비증감", "전년동기대비증감", "증감")
 
 
 class _RatioLike(IndicatorOperation):
@@ -364,6 +384,46 @@ class _RatioLike(IndicatorOperation):
     requires_denominator = False  # Share can fall back to numerator total
     output_unit: Optional[str] = None
     multiply_by: float = 1.0
+
+    def _unit_payload(
+        self,
+        numerator_row: dict[str, Any],
+        denominator_row: Optional[dict[str, Any]],
+        *,
+        effective_scale: float,
+        denominator_source: str,
+    ) -> dict[str, Any]:
+        numerator_unit = _row_unit(numerator_row)
+        denominator_unit = _row_unit(denominator_row or {}) if denominator_row is not None else numerator_unit
+        if self.name == "share":
+            formula = "(numerator / denominator) * 100"
+            expression = f"({numerator_unit or 'unknown'} / {denominator_unit or 'unknown'}) * 100"
+            unit_resolved = "%"
+            caller_must_resolve = False
+        else:
+            formula = "(numerator * scale_factor) / denominator"
+            expression = (
+                f"({numerator_unit or 'unknown'} * {effective_scale:g})"
+                f" / {denominator_unit or 'unknown'}"
+            )
+            unit_resolved = None
+            caller_must_resolve = True
+        return {
+            "unit": unit_resolved,
+            "unit_raw": numerator_unit,
+            "unit_denominator": denominator_unit,
+            "unit_resolved": unit_resolved,
+            "unit_caller_should_label": None if caller_must_resolve else unit_resolved,
+            "unit_transformation": {
+                "numerator_unit": numerator_unit,
+                "denominator_unit": denominator_unit,
+                "scale_factor": effective_scale,
+                "formula": formula,
+                "expression": expression,
+                "denominator_source": denominator_source,
+                "caller_must_resolve": caller_must_resolve,
+            },
+        }
 
     def _denominator_index(
         self,
@@ -414,17 +474,33 @@ class _RatioLike(IndicatorOperation):
                         outcome.markers.append("denominator_zero")
                     continue
                 value = num / den * effective_scale
+                unit_payload = self._unit_payload(
+                    row,
+                    denom_row,
+                    effective_scale=effective_scale,
+                    denominator_source="external_denominator_rows",
+                )
+                if unit_payload["unit_transformation"]["caller_must_resolve"]:
+                    if "unit_caller_resolution_required" not in outcome.markers:
+                        outcome.markers.append("unit_caller_resolution_required")
                 outcome.results.append(IndicatorResult(
                     value=_round(value, decimals),
                     period=period,
                     label=_row_label(row),
-                    unit=self.output_unit or _row_unit(row),
+                    unit=unit_payload["unit"],
+                    unit_raw=unit_payload["unit_raw"],
+                    unit_denominator=unit_payload["unit_denominator"],
+                    unit_resolved=unit_payload["unit_resolved"],
+                    unit_caller_should_label=unit_payload["unit_caller_should_label"],
+                    unit_transformation=unit_payload["unit_transformation"],
                     dimensions=_row_dimensions(row),
                     inputs={
                         "numerator": num,
                         "denominator": den,
+                        "denominator_source": "external_denominator_rows",
                         "denominator_label": _row_label(denom_row),
                         "scale_factor": effective_scale,
+                        "additivity_caller_asserted": False,
                     },
                 ))
         elif self.name == "share":
@@ -448,13 +524,31 @@ class _RatioLike(IndicatorOperation):
                 return outcome
             for v, row in usable:
                 value = v / total * 100
+                unit_payload = self._unit_payload(
+                    row,
+                    row,
+                    effective_scale=100.0,
+                    denominator_source="input_rows_total_sum",
+                )
                 outcome.results.append(IndicatorResult(
                     value=_round(value, decimals),
                     period=str(row.get("period") or ""),
                     label=_row_label(row),
-                    unit="%",
+                    unit=unit_payload["unit"],
+                    unit_raw=unit_payload["unit_raw"],
+                    unit_denominator=unit_payload["unit_denominator"],
+                    unit_resolved=unit_payload["unit_resolved"],
+                    unit_caller_should_label=unit_payload["unit_caller_should_label"],
+                    unit_transformation=unit_payload["unit_transformation"],
                     dimensions=_row_dimensions(row),
-                    inputs={"numerator": v, "denominator_total": total},
+                    inputs={
+                        "numerator": v,
+                        "denominator": total,
+                        "denominator_total": total,
+                        "denominator_source": "input_rows_total_sum",
+                        "denominator_label": "input_rows_total_sum",
+                        "additivity_caller_asserted": True,
+                    },
                 ))
             outcome.markers.append("share_total_from_input_rows")
         else:
@@ -474,18 +568,21 @@ class Share(_RatioLike):
     output_unit = "%"
     multiply_by = 100.0
     description = "Percent share against denominator_rows (or the input_rows total if omitted)."
+    aliases_ko = ("비중", "구성비", "점유율")
 
 
 class PerCapita(_RatioLike):
     name = "per_capita"
     requires_denominator = True
     description = "Numerator divided by a per-capita denominator (e.g., population). scale_factor controls units."
+    aliases_ko = ("1인당", "인당", "인구당")
 
 
 class Ratio(_RatioLike):
     name = "ratio"
     requires_denominator = True
     description = "Plain A/B ratio matched by period and dimension codes."
+    aliases_ko = ("비율", "배율")
 
 
 class SumAdditiveRows(IndicatorOperation):
@@ -495,6 +592,7 @@ class SumAdditiveRows(IndicatorOperation):
         "Sum row values within caller-defined groups. Caller asserts the rows are additive "
         "(do not use for rates, ratios, indices, or averages)."
     )
+    aliases_ko = ("합계", "합산", "총합")
 
     def compute(
         self,
@@ -564,6 +662,12 @@ OPERATIONS: dict[str, IndicatorOperation] = {
     ]
 }
 
+OPERATION_ALIASES_KO: dict[str, str] = {
+    alias: op.name
+    for op in OPERATIONS.values()
+    for alias in op.aliases_ko
+}
+
 
 def operation_catalog() -> list[dict[str, Any]]:
     """Public catalog of operations for tool discovery (LLM / docs)."""
@@ -571,6 +675,7 @@ def operation_catalog() -> list[dict[str, Any]]:
         {
             "name": op.name,
             "description": op.description,
+            "aliases_ko": list(op.aliases_ko),
             "requires_denominator_rows": op.requires_denominator,
             "aggregation_caller_asserted": op.aggregation_caller_asserted,
         }
