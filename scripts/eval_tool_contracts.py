@@ -75,6 +75,51 @@ def test_indicator_evidence_not_required_for_axis_only_exploration() -> None:
     assert result["status"] == "selected", result
 
 
+async def test_select_table_falls_back_to_query_indicator() -> None:
+    """When indicator is omitted, query must drive evidence matching (no silent pass)."""
+    original_search = kosis_mcp_server.search_kosis
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_search(term: str, limit: int = 10, use_routing: bool = True, api_key: Any = None) -> dict[str, Any]:
+        return {
+            "결과": [
+                {"통계표명": "읍면동별 지가변동률", "통계표ID": "DT_31501N_010", "기관ID": "101"},
+            ],
+            "Tier_A_직접_매핑": None,
+        }
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "읍면동별 지가변동률"}]
+        if kind == "ITM":
+            return [{"OBJ_ID": "A", "OBJ_NM": "지역별", "ITM_ID": "00", "ITM_NM": "전국"}]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}]
+        return []
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server.select_table_for_query(
+            "행복지수",
+            required_dimensions=["region"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server.search_kosis = original_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["indicator_source"] == "query_fallback", result
+    assert result["indicator_used"] == "행복지수", result
+    assert result["selected"] is None, result
+    assert result["status"] == "needs_table_selection", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "indicator_evidence_empty" in markers, markers
+    assert "indicator_inferred_from_query" in markers, markers
+    rejected = result["rejected"]
+    assert rejected and rejected[0]["status"] == "not_matched_indicator", rejected
+
+
 async def test_search_kosis_preserves_original_query() -> None:
     calls: list[str] = []
     original_hints = kosis_mcp_server._routing_hints
@@ -106,6 +151,7 @@ async def main() -> None:
         ("fanout_partial_coverage", lambda: test_fanout_partial_coverage()),
         ("indicator_evidence_required", lambda: test_indicator_evidence_required_when_indicator_supplied()),
         ("axis_only_exploration", lambda: test_indicator_evidence_not_required_for_axis_only_exploration()),
+        ("select_table_query_fallback", lambda: test_select_table_falls_back_to_query_indicator()),
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
     ]
     passed = 0

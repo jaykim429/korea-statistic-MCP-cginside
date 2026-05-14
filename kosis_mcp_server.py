@@ -4014,9 +4014,17 @@ async def select_table_for_query(
         *inferred_dimensions,
     ])
     key = _resolve_key(api_key)
+    explicit_indicator = indicator.strip() if isinstance(indicator, str) and indicator.strip() else None
+    query_text = query.strip() if isinstance(query, str) else ""
+    if explicit_indicator:
+        effective_indicator, indicator_source = explicit_indicator, "explicit"
+    elif query_text:
+        effective_indicator, indicator_source = query_text, "query_fallback"
+    else:
+        effective_indicator, indicator_source = None, "none"
     search_queries = [
         term.strip()
-        for term in [query, *(search_terms or []), indicator or ""]
+        for term in [query, *(search_terms or []), explicit_indicator or ""]
         if isinstance(term, str) and term.strip()
     ]
     search_queries = list(dict.fromkeys(search_queries))
@@ -4047,7 +4055,7 @@ async def select_table_for_query(
     candidates: list[dict[str, Any]] = []
     scorer = MetadataCompatibilityScorer(
         required_dimensions=required,
-        indicator=indicator,
+        indicator=effective_indicator,
         reject_if_missing_dimensions=reject_if_missing_dimensions,
     )
     async with httpx.AsyncClient() as client:
@@ -4095,11 +4103,30 @@ async def select_table_for_query(
         selection_markers.append("not_matched")
     if any(c.get("status") == "not_matched_indicator" for c in candidates):
         selection_markers.append("indicator_evidence_empty")
+    if indicator_source == "query_fallback":
+        selection_markers.append("indicator_inferred_from_query")
+        warnings.append(
+            "indicator 인자가 명시되지 않아 query 전체를 indicator 증거 매칭에 사용했습니다. "
+            "후보가 부정확하거나 selected가 비면 더 구체적인 indicator를 명시해 재호출하세요."
+        )
+    elif indicator_source == "none":
+        warnings.append(
+            "indicator와 query가 모두 비어 있어 indicator 증거 검증이 수행되지 않았습니다."
+        )
+    explanation = (
+        "No candidate satisfied both metadata dimensions and indicator evidence."
+        if not selected else
+        "Some candidates were rejected because indicator evidence was empty."
+        if "indicator_evidence_empty" in selection_markers else
+        "A metadata-compatible table candidate was selected."
+    )
     return {
         "상태": "selected" if selected else "needs_table_selection",
         "status": "selected" if selected else "needs_table_selection",
         "query": query,
         "indicator": indicator,
+        "indicator_used": effective_indicator,
+        "indicator_source": indicator_source,
         "search_terms_used": search_queries,
         "required_dimensions": required,
         "infer_dimensions": infer_dimensions,
@@ -4113,17 +4140,12 @@ async def select_table_for_query(
             role="table_selection",
             final_answer_expected=False,
             markers=selection_markers,
-            explanation=(
-                "No candidate satisfied both metadata dimensions and indicator evidence."
-                if not selected else
-                "Some candidates were rejected because indicator evidence was empty."
-                if "indicator_evidence_empty" in selection_markers else
-                "A metadata-compatible table candidate was selected."
-            ),
+            explanation=explanation,
             extra_signals={
                 "selected_count": len(selected),
                 "candidate_count": len(candidates),
-                "indicator_required": bool(indicator),
+                "indicator_required": effective_indicator is not None,
+                "indicator_source": indicator_source,
             },
         ),
         "주의": [
