@@ -603,12 +603,12 @@ Gemma 4 26B처럼 로컬 LLM을 MCP 클라이언트로 쓸 때는 답을 한 번
 5. `compute_indicator`
    필요한 경우 1인당 값, 비중, 변화율, CAGR 같은 계산을 수행합니다. 단위 변환이나 “합산해도 되는 값인지” 같은 해석은 응답 marker로 caller에게 책임을 남깁니다.
 
-기존 고속 경로도 유지되지만 Gemma 기본 manifest에서는 숨기는 것을 권장합니다. 빠른 대신 검증 절차를 일부 건너뛸 수 있기 때문입니다.
+고속 경로도 유지됩니다. 차이는 “어느 정도까지 MCP가 대신 처리하느냐”입니다.
 
 - 단순 Tier A 조회는 `quick_stat`, 시계열은 `quick_trend`
 - 시도별·지역별 비교는 `quick_region_compare`
-- 기존 자연어 즉시 답변은 `answer_query`가 담당하지만, 응답의 `mcp_output_contract.role: "deprecated_shortcut"`과 `deprecation` marker를 보고 fallback으로만 취급해야 합니다.
-- 복합 분석은 `analyze_trend`, `stat_time_compare`, `correlate_stats`, `forecast_stat`, `detect_outliers`
+- 자연어 편의 응답은 `answer_query`가 담당합니다. 기본값은 `verbose=false`라서 `data`, `metadata`, `notes`, `diagnostics` 중심의 얇은 응답을 반환합니다.
+- 복합 분석 재료는 `analyze_trend`, `stat_time_compare`, `correlate_stats`, `forecast_stat`, `detect_outliers`
 - 차트는 `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`
 
 ## 예시
@@ -623,7 +623,7 @@ plan_query("경제성장률, 인구 변화율, 합계출산율 추이")
 query_table("101", "DT_1DA7004S", filters={"ITEM": ["T80"], "A": ["00"]}, period_range=["2025", "2025"])
 ```
 
-아래 도구들은 남아 있지만, 챗봇 기본 사용에서는 fallback 또는 전문가용으로 두는 편이 안전합니다.
+아래처럼 바로 물어볼 수도 있습니다. 자세한 진단 필드까지 보고 싶으면 `verbose=true`를 넘기면 됩니다.
 
 ```text
 answer_query("최근 기준 중소기업 수와 소상공인 사업체 수를 함께 보여줘")
@@ -636,9 +636,10 @@ answer_query("서울 중소기업 매출액이 전국에서 차지하는 비중"
 answer_query("서울과 경기 중소기업 사업체수 합계")
 answer_query("AI 관련 통계 찾아줘")
 answer_query("최근 5년간 실업률 추이 분석해줘")
+answer_query("서울 인구 알려줘", verbose=true)
 quick_region_compare("중소기업 사업체수")
 quick_stat("주택매매가격지수", region="서울", period="2026.03")
-stat_time_compare("실업률", years=5)
+detect_outliers("합계출산율", method="detrended_zscore")
 indicator_dependency_map("폐업률")
 chart_line("고령인구", region="전국", years=5)
 ```
@@ -658,7 +659,7 @@ chart_line("고령인구", region="전국", years=5)
 - `analysis_tasks`: `trend`, `rank`, `per_capita`, `share_by_group`, `growth_rate`, `compare_metrics` 같은 후속 분석 의도
 - `evidence_workflow`: `select_table_for_query` → `resolve_concepts` → `query_table` → 필요 시 `compute_indicator`
 - `next_call`: Gemma가 그대로 따라갈 수 있는 다음 도구 호출 템플릿
-- `mcp_output_contract`: `final_answer_expected: false`, 실패/주의 마커, `current_signals.marker_guidance`, LLM guardrail을 기계적으로 노출
+- `mcp_output_contract`: 실패/주의 마커와 기계 판독용 신호를 노출합니다. 이 필드는 내부 진단용이며 최종 답변 문구를 강제하지 않습니다.
 
 쉽게 말해 `plan_query`는 “답”이 아니라 “답을 찾는 계획서”입니다. `answer`가 `null`이어도 정상입니다.
 
@@ -732,7 +733,7 @@ chart_line("고령인구", region="전국", years=5)
 
 `search_kosis` 응답은 `Tier_A_직접_매핑` 필드를 통해 같은 키워드에 검증된 Tier A 통계표가 있는지 표면화합니다 — KOSIS 검색 인덱스가 약하게 매칭된 통계표를 상위에 올리는 경우에도 정확한 매핑을 놓치지 않습니다.
 
-`STAT_CORRELATION`·`STAT_OUTLIER_DETECTION`·`STAT_FORECAST` 의도가 감지되면 `answer_query`는 `search_and_plan` 응답의 `추천_도구_호출` 필드에 `correlate_stats`/`detect_outliers`/`forecast_stat`의 호출 syntax를 명시합니다. 두 Tier-A 지표가 명확히 추출되는 high-confidence 케이스(예: "실업률과 고용률 상관관계")는 0.5.0부터 `correlate_stats`로 자동 위임돼 `tier_a_auto_correlation`을 반환합니다.
+`STAT_CORRELATION`·`STAT_OUTLIER_DETECTION`·`STAT_FORECAST` 의도가 감지되면 `answer_query`는 필요한 분석 재료를 찾을 수 있도록 관련 도구 이름과 후보 통계표를 함께 노출합니다. 두 Tier-A 지표가 명확히 추출되는 high-confidence 케이스(예: "실업률과 고용률 상관관계")는 `correlate_stats` 재료로 연결될 수 있습니다.
 
 `생존율`·`폐업률`·`창업률` 같은 시간-코호트 기반 동태 지표 질의("음식점업 5년 살아남는 비율" 등)는 정태 비중(`tier_a_share_ratio`)으로 잘못 매핑되지 않고 `dynamic_ratio_advisory`로 분기되어 `indicator_dependency_map`의 산식 사양과 KOSIS 통계표 후보를 같이 반환합니다.
 
@@ -754,9 +755,16 @@ chart_line("고령인구", region="전국", years=5)
 - `check_stat_availability(query, live_period_check=True)` — Tier A curation 메모뿐 아니라 KOSIS 메타 API의 실제 최신 수록 시점을 같이 조회합니다. 메모 스냅샷과 라이브 수록 시점이 어긋나면 `⚠️ 메모_vs_KOSIS_drift`, 데이터가 1년 이상 정체돼 있으면 `⚠️ 데이터_신선도`를 자동 첨부합니다.
 - `query_table(org_id, tbl_id, filters, period_range?)` — `explore_table`로 검증 가능한 분류축 코드만 받아 KOSIS raw rows를 조회합니다. 여러 코드가 들어와도 서버는 합산하지 않고 개별 행을 반환하며, 잘못된 코드는 `suggested_codes`와 함께 거절합니다.
 
-Gemma 챗봇용 절차형 입구로 `plan_query(query)`가 추가되었습니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 즉 `answer_query`의 즉시 답변 경로에서 발생할 수 있는 silent failure를 줄이기 위한 계획 전용 도구입니다.
+챗봇용 절차형 입구로 `plan_query(query)`가 제공됩니다. `plan_query`는 의도·차원·개념·다음 도구 호출 템플릿만 반환하며, 통계표 ID 확정·코드 매핑·값 조회·산술을 하지 않습니다. 복잡한 질문에서 LLM이 직접 경로를 고르고 검증할 수 있도록 돕는 계획 전용 도구입니다.
 
-Gemma 챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)와 [docs/gemma_manifest.default.json](docs/gemma_manifest.default.json)를 참고하세요. 기본 manifest에서는 `plan_query`, `select_table_for_query`, `resolve_concepts`, `explore_table`, `query_table`, `compute_indicator`, `search_kosis`만 노출하고, `answer_query`·`quick_*` 계열은 내부/전문가용으로 숨기는 구성을 권장합니다. shortcut 도구를 실수로 호출해도 응답의 `mcp_output_contract.role: "deprecated_shortcut"`, `deprecation`, `partial_fulfillment`, `dropped_dimensions` marker로 Gemma가 우회 경로임을 기계적으로 감지할 수 있습니다.
+챗봇에 노출할 도구 manifest는 [docs/chatbot_integration.md](docs/chatbot_integration.md)와 [docs/gemma_manifest.default.json](docs/gemma_manifest.default.json)를 참고하세요. `answer_query`는 더 이상 deprecated가 아니며, 빠른 자연어 편의 도구입니다. 정밀 검증이 필요하면 `plan_query` → `select_table_for_query` → `resolve_concepts` → `query_table` → 필요 시 `compute_indicator` 또는 분석 재료 도구를 조합하세요.
+
+분석 계층은 0.9.x부터 “결론 생성”보다 “재현 가능한 재료 제공”을 우선합니다.
+
+- `analyze_trend`: `input.x`, `input.y`, `model_parameters`, `formula`, `fitted_values`, `residuals`를 반환합니다. 자연어 `해석`은 기본적으로 포함하지 않습니다.
+- `forecast_stat`: 예측 결론 대신 `data_characteristics`, `model_options`, `computed_examples.linear.forecast_path`를 반환합니다. 기존 `예측` 필드는 `include_legacy_forecast=true`일 때만 포함됩니다.
+- `correlate_stats`: Pearson/Spearman/Kendall 계수와 정합 데이터 배열을 반환합니다. “상관은 인과가 아님”은 `must_know`와 `common_pitfalls`에 구조화됩니다.
+- `detect_outliers`: 기본값은 `detrended_zscore`이며, `zscore`, `iqr`, `stl`, `all`을 선택할 수 있습니다. 결과와 함께 원자료 배열과 데이터 특성을 반환합니다.
 
 `decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
 

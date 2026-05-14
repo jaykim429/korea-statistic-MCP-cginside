@@ -143,45 +143,27 @@ QUERY_TABLE_MAX_FANOUT = _env_int("KOSIS_MCP_QUERY_TABLE_MAX_FANOUT", 80)
 QUERY_TABLE_CONCURRENCY = _env_int("KOSIS_MCP_QUERY_TABLE_CONCURRENCY", 8)
 QUERY_TABLE_CALL_TIMEOUT = _env_float("KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT", 15.0)
 
-GEMMA_DEPRECATED_TOOL_WARNING = {
+ANSWER_QUERY_CONVENIENCE_NOTE = {
     "tool": "answer_query",
-    "manifest_policy": "hide_from_gemma_default",
-    "recommended_replacement": "plan_query",
+    "tool_mode": "convenience",
     "reason": (
-        "answer_query can execute shortcut answers and may hide partial fulfillment. "
-        "Gemma chatbot integrations should prefer plan_query -> select_table_for_query -> "
-        "resolve_concepts -> query_table -> compute/LLM synthesis."
+        "Natural-language convenience entry point. Use the stepwise tools when the caller "
+        "needs to inspect table selection, concept resolution, raw rows, or calculations."
     ),
 }
 
 
 def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]:
-    """Self-announce deprecated shortcut tools in the machine-readable payload."""
+    """Compatibility wrapper: annotate answer_query as a convenience tool, not deprecated."""
     result = dict(payload)
-    result.setdefault("deprecation_warning", GEMMA_DEPRECATED_TOOL_WARNING)
-    result.setdefault("recommended_replacement", {
-        "tool": "plan_query",
-        "first_call": "plan_query(query)",
-        "workflow": [
-            "plan_query",
-            "select_table_for_query",
-            "resolve_concepts",
-            "query_table",
-            "compute_indicator_or_chatbot_synthesis",
-        ],
-    })
-    result.setdefault("llm_guardrails", [
-        "This response came from a deprecated shortcut tool; Gemma default manifests should not call answer_query directly.",
-        "Do not pass this response to the user as the final answer when the query is composite, multi-axis, ratio, ranking, trend, or report-style.",
-        "Re-run the same query through plan_query -> select_table_for_query -> resolve_concepts -> query_table when reliability matters.",
-        "If this response is partial, unsupported, or a search plan, report that limitation instead of filling gaps from model knowledge.",
-    ])
+    result.setdefault("tool_mode", "convenience")
+    result.setdefault("convenience_note", ANSWER_QUERY_CONVENIENCE_NOTE)
     existing_contract = result.get("mcp_output_contract") if isinstance(result.get("mcp_output_contract"), dict) else {}
     existing_signals = existing_contract.get("current_signals") if isinstance(existing_contract, dict) else {}
     if not isinstance(existing_signals, dict):
         existing_signals = {}
     markers = list(existing_signals.get("markers_present") or [])
-    markers.append("deprecation")
+    markers.append("convenience_response")
     dropped = result.get("dropped_dimensions") or result.get("누락_차원") or []
     fulfillment_status = result.get("status") or result.get("이행_상태")
     gap_reason = result.get("부분충족_사유") or result.get("fulfillment_gap_reason")
@@ -192,23 +174,17 @@ def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]
     if result.get("status") == "failed":
         markers.append("runtime_error")
     result["mcp_output_contract"] = _mcp_tool_output_contract(
-        role="deprecated_shortcut",
-        final_answer_expected=False,
+        role="convenience_tool",
+        final_answer_expected=True,
         markers=markers,
-        explanation="answer_query is a deprecated shortcut; prefer the stepwise evidence pipeline.",
+        explanation="answer_query is a natural-language convenience response; inspect status and caveats before using it.",
         extra_signals={
             "fulfillment_status": fulfillment_status,
             "dropped_dimensions": dropped,
             "fulfillment_gap_reason": gap_reason,
-            "recommended_replacement": "plan_query",
+            "tool_mode": "convenience",
         },
     )
-    result.setdefault("deprecated_fields", {
-        "이행_상태": "Use mcp_output_contract.current_signals.fulfillment_status",
-        "누락_차원": "Use mcp_output_contract.current_signals.dropped_dimensions",
-        "부분충족_사유": "Use mcp_output_contract.current_signals.fulfillment_gap_reason",
-        "deprecation_warning": "Use mcp_output_contract (role: deprecated_shortcut)",
-    })
     return result
 
 
@@ -219,24 +195,87 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
     existing_contract = result.get("mcp_output_contract") if isinstance(result.get("mcp_output_contract"), dict) else {}
     existing_signals = existing_contract.get("current_signals") if isinstance(existing_contract, dict) else {}
     markers = list(existing_signals.get("markers_present") or []) if isinstance(existing_signals, dict) else []
-    markers.append("deprecation")
+    markers.append("shortcut_response")
     if ignored_params:
         markers.append("dropped_dimensions")
         markers.append("partial_fulfillment")
     if result.get("오류") or result.get("status") in {"failed", "unsupported"}:
         markers.append("unsupported")
     result["mcp_output_contract"] = _mcp_tool_output_contract(
-        role="deprecated_shortcut",
-        final_answer_expected=False,
+        role="shortcut_tool",
+        final_answer_expected=True,
         markers=markers,
-        explanation=f"{tool} is a shortcut compatibility tool; prefer the stepwise evidence pipeline for chatbot answers.",
+        explanation=f"{tool} is a narrow shortcut tool; check dropped_dimensions before treating the result as complete.",
         extra_signals={
             "tool": tool,
-            "recommended_replacement": "plan_query",
             "ignored_params": ignored_params or [],
         },
     )
     return result
+
+
+def _compact_answer_query_response(payload: dict[str, Any], *, query: str, region: str) -> dict[str, Any]:
+    """Return a slim answer_query shape for chatbot clients that do their own reasoning."""
+    metadata_keys = {
+        "query": query,
+        "region": payload.get("region") or payload.get("지역") or region,
+        "answer_type": payload.get("answer_type") or payload.get("답변유형"),
+        "stat_name": payload.get("stat_name") or payload.get("통계명"),
+        "unit": payload.get("unit") or payload.get("단위"),
+        "period": payload.get("period") or payload.get("시점") or payload.get("used_period"),
+        "source": payload.get("source") or payload.get("출처"),
+        "table_id": payload.get("table_id") or payload.get("tbl_id") or payload.get("통계표ID"),
+        "period_age_years": payload.get("period_age_years"),
+    }
+    metadata = {k: v for k, v in metadata_keys.items() if v not in (None, "", [], {})}
+
+    notes: list[Any] = []
+    for key in (
+        "notes",
+        "warnings",
+        "validation_warnings",
+        "검증_주의",
+        "data_quality_note",
+        "fulfillment_gap_reason",
+        "부분충족_사유",
+    ):
+        value = payload.get(key)
+        if not value:
+            continue
+        if isinstance(value, list):
+            notes.extend(value)
+        else:
+            notes.append(value)
+
+    data = None
+    for key in ("data", "rows", "results", "result", "표", "시계열", "결과", "예측", "이상치"):
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            data = value
+            break
+
+    contract = payload.get("mcp_output_contract") if isinstance(payload.get("mcp_output_contract"), dict) else {}
+    signals = contract.get("current_signals") if isinstance(contract, dict) else {}
+    markers = signals.get("markers_present") if isinstance(signals, dict) else []
+    diagnostics = {
+        "tool_mode": payload.get("tool_mode", "convenience"),
+        "markers_present": markers or [],
+        "fulfillment_status": payload.get("fulfillment_status") or payload.get("status") or payload.get("상태"),
+        "dropped_dimensions": payload.get("dropped_dimensions") or payload.get("누락_차원") or [],
+    }
+    diagnostics = {k: v for k, v in diagnostics.items() if v not in (None, "", [], {})}
+
+    compact = {
+        "status": payload.get("status") or payload.get("상태") or "unknown",
+        "code": payload.get("code") or payload.get("코드"),
+        "answer": payload.get("answer") or payload.get("답변"),
+        "error": payload.get("error") or payload.get("오류"),
+        "data": data,
+        "metadata": metadata,
+        "notes": notes,
+        "diagnostics": diagnostics,
+    }
+    return {k: v for k, v in compact.items() if v not in (None, "", [], {})}
 
 
 def _mcp_tool_output_contract(
@@ -274,6 +313,8 @@ def _mcp_tool_output_contract(
         "unit_caller_resolution_required": "Resolve the computed unit from unit_transformation before quoting.",
         "share_total_from_input_rows": "Disclose that the denominator was derived from input_rows, not an external total.",
         "share_total_grouped_by_period": "Interpret share results within each period group, not across all periods.",
+        "convenience_response": "Use compact metadata/notes first; request verbose=True only for diagnostics.",
+        "shortcut_response": "Check ignored_params/dropped_dimensions before treating shortcut output as complete.",
         "deprecation": "Prefer the recommended replacement workflow/tool.",
         "formula_advisory_only": "Treat formula guidance as advisory; verify numerator/denominator from KOSIS metadata/raw rows.",
         "heuristic_extraction": "Treat extracted concepts as candidates only; verify with KOSIS metadata before use.",
@@ -836,6 +877,88 @@ def _values_from_series(series: list[dict]) -> tuple[list[str], list[float]]:
             continue
     pairs.sort(key=lambda p: p[0])
     return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _analysis_input_materials(times: list[str], values: list[float]) -> dict[str, Any]:
+    """Expose reproducible arrays so callers can re-check or replace MCP calculations."""
+    x = list(range(len(values)))
+    y = [float(v) for v in values]
+    return {
+        "data": [{"period": t, "value": y[i]} for i, t in enumerate(times)],
+        "x": x,
+        "x_periods": list(times),
+        "y": y,
+    }
+
+
+def _series_characteristics(times: list[str], values: list[float], *, unit: Optional[str] = None) -> dict[str, Any]:
+    if not values:
+        return {"n_points": 0}
+    y = np.array(values, dtype=float)
+    diffs = np.diff(y)
+    nonzero_diffs = diffs[np.abs(diffs) > 1e-12]
+    return {
+        "n_points": len(values),
+        "period_range": [times[0], times[-1]] if times else None,
+        "observed_min": round(float(np.min(y)), 8),
+        "observed_max": round(float(np.max(y)), 8),
+        "observed_mean": round(float(np.mean(y)), 8),
+        "observed_std": round(float(np.std(y)), 8),
+        "is_monotonic_increasing": bool(len(diffs) and np.all(diffs >= 0)),
+        "is_monotonic_decreasing": bool(len(diffs) and np.all(diffs <= 0)),
+        "direction_changes": int(np.sum(np.sign(nonzero_diffs[1:]) != np.sign(nonzero_diffs[:-1]))) if len(nonzero_diffs) > 1 else 0,
+        "has_negative_values": bool(np.any(y < 0)),
+        "has_zero_values": bool(np.any(y == 0)),
+        "likely_index": bool(unit and "지수" in str(unit)),
+    }
+
+
+def _analysis_must_know(
+    series_result: dict[str, Any],
+    times: list[str],
+    values: list[float],
+    *,
+    extra_limitations: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    unit = series_result.get("단위") or series_result.get("unit")
+    latest_period = times[-1] if times else series_result.get("used_period")
+    age = series_result.get("period_age_years")
+    if age is None and latest_period:
+        age = NaturalLanguageAnswerEngine._period_age_years(str(latest_period))
+    limitations = [
+        "MCP returns data and reproducible calculation materials; caller chooses interpretation and final wording.",
+    ]
+    if extra_limitations:
+        limitations.extend(extra_limitations)
+    if age is not None and age >= 1.0:
+        limitations.append(f"Latest period is {latest_period} (~{age:.1f} years old).")
+    return {
+        "unit": unit,
+        "latest_period": latest_period,
+        "period_range": [times[0], times[-1]] if times else None,
+        "data_age_years": age,
+        "source": "KOSIS",
+        "is_index": bool(unit and "지수" in str(unit)),
+        "limitations": limitations,
+    }
+
+
+def _analysis_common_pitfalls(series_result: dict[str, Any], values: list[float]) -> list[dict[str, Any]]:
+    unit = series_result.get("단위") or series_result.get("unit") or ""
+    pitfalls: list[dict[str, Any]] = []
+    if "지수" in str(unit):
+        pitfalls.append({
+            "pitfall": "This series is an index, not an absolute amount.",
+            "example_wrong": "Treating 105 as an average price or count.",
+            "example_right": "Treating 105 as 5% above a base of 100 when the base definition supports it.",
+        })
+    if len(values) < 8:
+        pitfalls.append({
+            "pitfall": "Small sample size can make regression, correlation, and outlier scores unstable.",
+            "example_wrong": "Presenting p-values or forecasts as robust conclusions.",
+            "example_right": "Describe them as exploratory calculations based on limited observations.",
+        })
+    return pitfalls
 
 
 def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
@@ -3106,14 +3229,25 @@ async def browse_topic(topic: Optional[str] = None) -> dict:
 async def analyze_trend(
     query: str, region: str = "전국", years: int = 20,
     api_key: Optional[str] = None,
+    method: str = "linear",
+    include_interpretation: bool = False,
 ) -> dict:
-    """[📊] 통계적 추세 분석.
+    """[📊] 통계적 추세 재료와 재현 가능한 계산값을 반환.
 
     제공:
-      - 선형회귀 (기울기, R², p-value)
-      - 평균 변화율, 변동성
+      - 원자료 배열(data/x/y)
+      - 선형회귀 계수, fitted_values, residuals, formula
       - 극값, 최근 변화
     """
+    method_requested = str(method or "linear").lower().strip()
+    valid_methods = ["linear"]
+    if method_requested not in valid_methods:
+        return {
+            "status": "invalid_input",
+            "오류": f"지원하지 않는 trend method: {method}",
+            "method_requested": method,
+            "valid_methods": valid_methods,
+        }
     series_result = await quick_trend(query, region, years, api_key)
     if "오류" in series_result:
         return series_result
@@ -3125,6 +3259,8 @@ async def analyze_trend(
     y = np.array(values)
     slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(x, y)
     r2 = r_value ** 2
+    fitted = slope * x + intercept
+    residuals = y - fitted
 
     changes = np.diff(y) / np.abs(y[:-1]) * 100
     avg_growth = float(np.mean(changes))
@@ -3143,14 +3279,40 @@ async def analyze_trend(
         float((y[-1] - y[-2]) / abs(y[-2]) * 100) if len(y) >= 2 and y[-2] != 0 else 0.0
     )
 
-    return {
+    result = {
+        "status": "executed",
+        "method": method_requested,
         "통계명": series_result.get("통계명"), "지역": region,
         "기간": f"{times[0]} ~ {times[-1]}",
-        "데이터수": len(values), "추세_라벨": trend_label,
+        "데이터수": len(values),
+        "must_know": _analysis_must_know(series_result, times, values),
+        "input": _analysis_input_materials(times, values),
+        "data_characteristics": _series_characteristics(times, values, unit=series_result.get("단위")),
+        "common_pitfalls": _analysis_common_pitfalls(series_result, values),
+        "analysis_materials": {
+            "available_methods": valid_methods,
+            "interpretation_included": include_interpretation,
+            "caller_can_recompute": True,
+        },
         "선형회귀": {
             "기울기_연간": round(slope, 4), "R제곱": round(r2, 4),
             "p_value": round(p_value, 4), "유의": p_value < 0.05,
+            "slope": round(float(slope), 8),
+            "intercept": round(float(intercept), 8),
+            "std_err": round(float(std_err), 8),
         },
+        "model": "linear_regression",
+        "model_parameters": {
+            "slope": round(float(slope), 8),
+            "intercept": round(float(intercept), 8),
+            "r_value": round(float(r_value), 8),
+            "r_squared": round(float(r2), 8),
+            "p_value": round(float(p_value), 8),
+            "std_err": round(float(std_err), 8),
+        },
+        "formula": f"y = {float(slope):.12g} * x + {float(intercept):.12g}",
+        "fitted_values": [round(float(v), 8) for v in fitted],
+        "residuals": [round(float(v), 8) for v in residuals],
         "변화율": {
             "평균_퍼센트": round(avg_growth, 2),
             "변동성_퍼센트": round(volatility, 2),
@@ -3164,13 +3326,16 @@ async def analyze_trend(
             "최댓값": {"시점": times[max_idx], "값": values[max_idx]},
             "최솟값": {"시점": times[min_idx], "값": values[min_idx]},
         },
-        "해석": (
+        "단위": series_result.get("단위"),
+    }
+    if include_interpretation:
+        result["추세_라벨"] = trend_label
+        result["해석"] = (
             f"{years}년간 {trend_label}. "
             f"평균 연 {avg_growth:+.2f}% 변화, "
             f"회귀 R²={r2:.2f} (p={p_value:.3f})."
-        ),
-        "단위": series_result.get("단위"),
-    }
+        )
+    return result
 
 
 @mcp.tool()
@@ -3178,11 +3343,9 @@ async def correlate_stats(
     query_a: str, query_b: str,
     region: str = "전국", years: int = 15,
     api_key: Optional[str] = None,
+    include_interpretation: bool = False,
 ) -> dict:
-    """[📊] 두 통계의 상관관계 분석 (Pearson + Spearman).
-
-    상관 ≠ 인과 면책 자동 첨부.
-    """
+    """[📊] 두 통계의 상관계수와 재현 가능한 정합 데이터를 반환."""
     a = await quick_trend(query_a, region, years, api_key)
     b = await quick_trend(query_b, region, years, api_key)
     if "오류" in a or "오류" in b:
@@ -3202,29 +3365,75 @@ async def correlate_stats(
     pr, pp = scipy_stats.pearsonr(aa, bb)
     sr, sp = scipy_stats.spearmanr(aa, bb)
 
+    kr, kp = scipy_stats.kendalltau(aa, bb)
+
     def interpret(r: float) -> str:
         absr = abs(r)
-        if absr < 0.2: s = "거의 무관"
-        elif absr < 0.4: s = "약한 상관"
-        elif absr < 0.7: s = "중간 상관"
-        else: s = "강한 상관"
+        if absr < 0.2:
+            s = "거의 무관"
+        elif absr < 0.4:
+            s = "약한 상관"
+        elif absr < 0.7:
+            s = "중간 상관"
+        else:
+            s = "강한 상관"
         return f"{s} ({'양의' if r > 0 else '음의'})"
 
-    return {
+    result = {
+        "status": "executed",
         "통계_A": a.get("통계명"), "통계_B": b.get("통계명"),
         "지역": region, "공통_시점수": len(common),
         "기간": f"{common[0]} ~ {common[-1]}",
+        "must_know": {
+            "source": "KOSIS",
+            "period_range": [common[0], common[-1]],
+            "common_period_count": len(common),
+            "correlation_is_not_causation": True,
+            "limitations": [
+                "Correlation coefficients are descriptive materials, not causal evidence.",
+                "Definitions, units, and collection methods should be checked before comparing indicators.",
+            ],
+        },
+        "input": {
+            "common_periods": common,
+            "series_a": [{"period": t, "value": da[t]} for t in common],
+            "series_b": [{"period": t, "value": db[t]} for t in common],
+            "x": aa,
+            "y": bb,
+        },
+        "analysis_materials": {
+            "available_methods": ["pearson", "spearman", "kendall", "lag_correlation_from_input"],
+            "caller_can_recompute": True,
+            "interpretation_included": include_interpretation,
+        },
+        "correlations": {
+            "pearson": {"coefficient": round(float(pr), 8), "p_value": round(float(pp), 8)},
+            "spearman": {"coefficient": round(float(sr), 8), "p_value": round(float(sp), 8)},
+            "kendall": {"coefficient": round(float(kr), 8), "p_value": round(float(kp), 8)},
+        },
         "Pearson": {
-            "상관계수": round(pr, 4), "p_value": round(pp, 4),
-            "해석": interpret(pr),
+            "상관계수": round(float(pr), 4), "p_value": round(float(pp), 4),
         },
         "Spearman": {
-            "상관계수": round(sr, 4), "p_value": round(sp, 4),
-            "해석": interpret(sr),
+            "상관계수": round(float(sr), 4), "p_value": round(float(sp), 4),
         },
-        "면책": "상관관계는 인과관계를 의미하지 않습니다.",
+        "Kendall": {
+            "상관계수": round(float(kr), 4), "p_value": round(float(kp), 4),
+        },
         "정합데이터": list(zip(common, aa, bb)),
+        "common_pitfalls": [
+            {
+                "pitfall": "Correlation is not causation.",
+                "example_wrong": "Saying indicator A caused indicator B because r is high.",
+                "example_right": "Saying the two series moved together over the overlapping periods.",
+            }
+        ],
     }
+    if include_interpretation:
+        result["Pearson"]["해석"] = interpret(pr)
+        result["Spearman"]["해석"] = interpret(sr)
+        result["Kendall"]["해석"] = interpret(kr)
+    return result
 
 
 @mcp.tool()
@@ -3232,13 +3441,25 @@ async def forecast_stat(
     query: str, region: str = "전국",
     history_years: int = 15, horizon: int = 5,
     api_key: Optional[str] = None,
+    model: str = "linear",
+    include_legacy_forecast: bool = False,
 ) -> dict:
-    """[📊] 선형 외삽 + 95% 신뢰구간 예측.
+    """[📊] 예측에 필요한 원자료, 모델 옵션, 재현 가능한 계산 예시를 반환.
 
     Args:
         history_years: 과거 데이터 기간
         horizon: 미래 예측 기간 (년)
+        model: 현재 계산 예시는 linear만 지원. 다른 모델은 option metadata로 제공.
     """
+    model_requested = str(model or "linear").lower().strip()
+    valid_models = ["linear", "materials_only"]
+    if model_requested not in valid_models:
+        return {
+            "status": "invalid_input",
+            "오류": f"지원하지 않는 forecast model: {model}",
+            "model_requested": model,
+            "valid_models": valid_models,
+        }
     series_result = await quick_trend(query, region, history_years, api_key)
     if "오류" in series_result:
         return series_result
@@ -3257,56 +3478,328 @@ async def forecast_stat(
     future_y = slope * future_x + intercept
     ci = 1.96 * rmse
 
-    forecasts = []
+    forecast_path = []
     for i, yr in enumerate(range(last_year + 1, last_year + 1 + horizon)):
-        forecasts.append({
-            "시점": str(yr),
-            "예측값": round(float(future_y[i]), 2),
-            "하한": round(float(future_y[i] - ci), 2),
-            "상한": round(float(future_y[i] + ci), 2),
+        forecast_path.append({
+            "period": str(yr),
+            "value": round(float(future_y[i]), 8),
+            "lower": round(float(future_y[i] - ci), 8),
+            "upper": round(float(future_y[i] + ci), 8),
+            "interval_method": "linear_example_rmse_1.96",
         })
 
-    return {
+    characteristics = _series_characteristics(times, values, unit=series_result.get("단위"))
+    model_options = [
+        {
+            "model": "linear",
+            "computed": model_requested == "linear",
+            "suitable_for": "Short exploratory extrapolation when the observed trend is approximately linear.",
+            "caveats": ["Can produce impossible values outside the observed range, especially over long horizons."],
+        },
+        {
+            "model": "logistic_or_bounded_curve",
+            "computed": False,
+            "suitable_for": "Series with a natural lower or upper bound.",
+            "caveats": ["Requires caller-chosen bound/asymptote; MCP does not infer domain bounds."],
+        },
+        {
+            "model": "exponential_smoothing_or_arima",
+            "computed": False,
+            "suitable_for": "Longer or seasonal time series.",
+            "caveats": ["Needs enough observations and cadence-specific validation."],
+        },
+    ]
+
+    result = {
+        "status": "materials_ready",
         "통계명": series_result.get("통계명"), "지역": region,
         "과거_기간": f"{times[0]} ~ {times[-1]}",
-        "예측": forecasts, "모델": "선형회귀 외삽",
-        "RMSE": round(rmse, 4), "R제곱": round(r_value ** 2, 4),
-        "면책": "단순 추세 외삽. 정책·외부 충격 미반영. 보조 참고용.",
+        "must_know": _analysis_must_know(
+            series_result,
+            times,
+            values,
+            extra_limitations=[
+                "Forecast paths are computed examples, not final predictions.",
+                "Policy shocks, definition changes, and external variables are not modeled.",
+            ],
+        ),
+        "input": _analysis_input_materials(times, values),
+        "data_characteristics": characteristics,
+        "common_pitfalls": _analysis_common_pitfalls(series_result, values) + [
+            {
+                "pitfall": "Linear extrapolation may cross impossible natural bounds.",
+                "example_wrong": "Treating a negative long-run forecast as meaningful for a non-negative indicator.",
+                "example_right": "Use the linear example as a short-run reference or choose a bounded model.",
+            }
+        ],
+        "model_options": model_options,
+        "computed_examples": {
+            "linear": {
+                "formula": f"y = {float(slope):.12g} * x + {float(intercept):.12g}",
+                "parameters": {
+                    "slope": round(float(slope), 8),
+                    "intercept": round(float(intercept), 8),
+                    "r_value": round(float(r_value), 8),
+                    "r_squared": round(float(r_value ** 2), 8),
+                    "p_value": round(float(p_value), 8),
+                    "std_err": round(float(std_err), 8),
+                    "rmse": round(rmse, 8),
+                },
+                "residuals": [round(float(v), 8) for v in residuals],
+                "forecast_path": forecast_path if model_requested == "linear" else [],
+            }
+        },
+        "analysis_materials": {
+            "caller_can_recompute": True,
+            "available_models": valid_models,
+            "requested_model": model_requested,
+            "legacy_forecast_included": include_legacy_forecast,
+        },
         "단위": series_result.get("단위"),
     }
+    if include_legacy_forecast:
+        result["예측"] = [
+            {
+                "시점": row["period"],
+                "예측값": round(row["value"], 2),
+                "하한": round(row["lower"], 2),
+                "상한": round(row["upper"], 2),
+            }
+            for row in forecast_path
+        ]
+        result["모델"] = "linear_regression_example"
+        result["RMSE"] = round(rmse, 4)
+        result["R제곱"] = round(r_value ** 2, 4)
+    return result
 
 
 @mcp.tool()
 async def detect_outliers(
     query: str, region: str = "전국", years: int = 20,
     api_key: Optional[str] = None,
+    method: str = "detrended_zscore",
+    threshold: float = 2.5,
+    iqr_multiplier: float = 1.5,
 ) -> dict:
-    """[📊] Z-score 기반 이상치 탐지 (|z| > 2.5)."""
+    """[📊] 시계열 이상치 탐지.
+
+    method:
+    - detrended_zscore (default): 선형 추세 제거 후 잔차 Z-score
+    - zscore: 원값 Z-score
+    - iqr: 원값 IQR fence
+    - stl: statsmodels가 설치된 경우 STL residual Z-score
+    - all: 지원 method를 함께 실행
+    """
     series_result = await quick_trend(query, region, years, api_key)
     if "오류" in series_result:
         return series_result
     times, values = _values_from_series(series_result["시계열"])
     if len(values) < 5:
-        return {"오류": "탐지에 데이터 부족"}
-
-    y = np.array(values)
-    mean, std = float(np.mean(y)), float(np.std(y))
-    if std == 0:
-        return {"이상치": [], "안내": "변동성 없음"}
-
-    z_scores = (y - mean) / std
-    outliers = [
-        {
-            "시점": times[i], "값": values[i],
-            "z_score": round(float(z), 2),
-            "평균_대비_편차": round((values[i] - mean) / mean * 100, 1),
+        return {
+            "status": "invalid_input",
+            "오류": "탐지에 데이터 부족",
+            "error": "At least 5 observations are required for outlier detection.",
+            "observation_count": len(values),
+            "valid_methods": ["detrended_zscore", "zscore", "iqr", "stl", "all"],
         }
-        for i, z in enumerate(z_scores) if abs(z) > 2.5
-    ]
+
+    y = np.array(values, dtype=float)
+    method_requested = str(method or "detrended_zscore").lower().strip()
+    valid_methods = ["detrended_zscore", "zscore", "iqr", "stl", "all"]
+    if method_requested not in valid_methods:
+        return {
+            "status": "invalid_input",
+            "오류": f"알 수 없는 이상치 탐지 method: {method}",
+            "error": f"Unknown outlier detection method: {method}",
+            "method_requested": method,
+            "valid_methods": valid_methods,
+        }
+
+    def _zscore_result(
+        *,
+        method_name: str,
+        score_values: np.ndarray,
+        baseline: Optional[np.ndarray] = None,
+        notes: Optional[list[str]] = None,
+        extra: Optional[dict[str, Any]] = None,
+        scale_method: str = "std",
+    ) -> dict[str, Any]:
+        center = float(np.mean(score_values))
+        scale = float(np.std(score_values))
+        scale_method_used = "std"
+        if scale_method == "mad":
+            robust_center = float(np.median(score_values))
+            mad = float(np.median(np.abs(score_values - robust_center)))
+            robust_scale = 1.4826 * mad
+            if robust_scale > 0:
+                center = robust_center
+                scale = robust_scale
+                scale_method_used = "mad"
+        if scale == 0:
+            return {
+                "status": "executed",
+                "method": method_name,
+                "outliers": [],
+                "이상치": [],
+                "center": round(center, 6),
+                "scale": round(scale, 6),
+                "scale_method": scale_method_used,
+                "threshold": threshold,
+                "notes": (notes or []) + ["No variation in the scoring series."],
+                **(extra or {}),
+            }
+        z_scores = (score_values - center) / scale
+        outliers = []
+        for i, z in enumerate(z_scores):
+            if abs(float(z)) <= threshold:
+                continue
+            row = {
+                "period": times[i],
+                "시점": times[i],
+                "value": values[i],
+                "값": values[i],
+                "z_score": round(float(z), 4),
+                "threshold": threshold,
+            }
+            if baseline is not None:
+                row["expected_value"] = round(float(baseline[i]), 6)
+                row["residual"] = round(float(score_values[i]), 6)
+            outliers.append(row)
+        return {
+            "status": "executed",
+            "method": method_name,
+            "outliers": outliers,
+            "이상치": outliers,
+            "center": round(center, 6),
+            "scale": round(scale, 6),
+            "scale_method": scale_method_used,
+            "threshold": threshold,
+            "notes": notes or [],
+            **(extra or {}),
+        }
+
+    def _raw_zscore() -> dict[str, Any]:
+        return _zscore_result(
+            method_name="zscore",
+            score_values=y,
+            notes=["Uses raw values. For strong trends, detrended_zscore is usually safer."],
+        )
+
+    def _detrended_zscore() -> dict[str, Any]:
+        x = np.arange(len(y), dtype=float)
+        slope, intercept = np.polyfit(x, y, 1)
+        trend = slope * x + intercept
+        residuals = y - trend
+        return _zscore_result(
+            method_name="detrended_zscore",
+            score_values=residuals,
+            baseline=trend,
+            notes=["Uses residuals after removing a fitted linear trend; scores use robust MAD scaling when possible."],
+            extra={
+                "trend_model": "linear",
+                "trend_slope_per_period": round(float(slope), 6),
+                "trend_intercept": round(float(intercept), 6),
+            },
+            scale_method="mad",
+        )
+
+    def _iqr() -> dict[str, Any]:
+        q1, q3 = np.percentile(y, [25, 75])
+        iqr = float(q3 - q1)
+        lower = float(q1 - iqr_multiplier * iqr)
+        upper = float(q3 + iqr_multiplier * iqr)
+        if iqr == 0:
+            outliers: list[dict[str, Any]] = []
+        else:
+            outliers = [
+                {
+                    "period": times[i],
+                    "시점": times[i],
+                    "value": values[i],
+                    "값": values[i],
+                    "lower_fence": round(lower, 6),
+                    "upper_fence": round(upper, 6),
+                }
+                for i, value in enumerate(values)
+                if float(value) < lower or float(value) > upper
+            ]
+        return {
+            "status": "executed",
+            "method": "iqr",
+            "outliers": outliers,
+            "이상치": outliers,
+            "q1": round(float(q1), 6),
+            "q3": round(float(q3), 6),
+            "iqr": round(iqr, 6),
+            "iqr_multiplier": iqr_multiplier,
+            "lower_fence": round(lower, 6),
+            "upper_fence": round(upper, 6),
+            "notes": ["Uses raw value IQR fences; trend removal is not applied."],
+        }
+
+    def _stl() -> dict[str, Any]:
+        try:
+            from statsmodels.tsa.seasonal import STL  # type: ignore
+        except Exception:
+            return {
+                "status": "unsupported",
+                "method": "stl",
+                "outliers": [],
+                "이상치": [],
+                "notes": ["STL requires optional dependency statsmodels; use detrended_zscore or iqr."],
+            }
+        period = 12 if len(y) >= 24 else max(2, min(7, len(y) // 2))
+        fitted = STL(y, period=period, robust=True).fit()
+        residuals = np.asarray(fitted.resid, dtype=float)
+        baseline = y - residuals
+        return _zscore_result(
+            method_name="stl",
+            score_values=residuals,
+            baseline=baseline,
+            notes=[f"Uses STL residuals with period={period}."],
+            extra={"stl_period": period},
+        )
+
+    method_map = {
+        "detrended_zscore": _detrended_zscore,
+        "zscore": _raw_zscore,
+        "iqr": _iqr,
+        "stl": _stl,
+    }
+    if method_requested == "all":
+        method_results = {name: fn() for name, fn in method_map.items()}
+        primary = method_results["detrended_zscore"]
+        return {
+            **primary,
+            "method": "all",
+            "primary_method": "detrended_zscore",
+            "method_results": method_results,
+            "통계명": series_result.get("통계명"),
+            "stat_name": series_result.get("통계명"),
+            "region": region,
+            "must_know": _analysis_must_know(series_result, times, values),
+            "input": _analysis_input_materials(times, values),
+            "data_characteristics": _series_characteristics(times, values, unit=series_result.get("단위")),
+            "common_pitfalls": _analysis_common_pitfalls(series_result, values),
+            "observation_count": len(values),
+            "period_range": [times[0], times[-1]],
+            "valid_methods": valid_methods,
+        }
+
+    result = method_map[method_requested]()
     return {
-        "통계명": series_result.get("통계명"), "이상치": outliers,
-        "평균": round(mean, 2), "표준편차": round(std, 2),
-        "방법": "Z-score (|z| > 2.5)",
+        **result,
+        "통계명": series_result.get("통계명"),
+        "stat_name": series_result.get("통계명"),
+        "region": region,
+        "must_know": _analysis_must_know(series_result, times, values),
+        "input": _analysis_input_materials(times, values),
+        "data_characteristics": _series_characteristics(times, values, unit=series_result.get("단위")),
+        "common_pitfalls": _analysis_common_pitfalls(series_result, values),
+        "observation_count": len(values),
+        "period_range": [times[0], times[-1]],
+        "valid_methods": valid_methods,
+        "method_requested": method,
     }
 
 
@@ -3389,7 +3882,7 @@ async def chart_correlation(
     )
     summary = (
         f"Pearson r={corr['Pearson']['상관계수']}, "
-        f"p={corr['Pearson']['p_value']} ({corr['Pearson']['해석']})"
+        f"p={corr['Pearson']['p_value']}"
     )
     return [_svg_to_image(svg), TextContent(type="text", text=summary)]
 
@@ -3606,8 +4099,17 @@ async def chart_dashboard(
     forecast_pts: list[tuple[str, float, float, float]] = []
     if len(values) >= 4:
         forecast = await forecast_stat(query, region, 15, 5, api_key)
-        if "예측" in forecast:
-            for f in forecast["예측"]:
+        forecast_path = (
+            ((forecast.get("computed_examples") or {}).get("linear") or {}).get("forecast_path")
+            or forecast.get("예측")
+            or []
+        )
+        for f in forecast_path:
+            if "period" in f:
+                forecast_pts.append(
+                    (f["period"], f["value"], f["lower"], f["upper"])
+                )
+            else:
                 forecast_pts.append(
                     (f["시점"], f["예측값"], f["하한"], f["상한"])
                 )
@@ -3649,7 +4151,8 @@ async def chart_dashboard(
     if "극값" in trend:
         max_point = trend["극값"]["최댓값"]
         summary["분석기간 내 최댓값"] = f"{max_point['시점']}: {max_point['값']}"
-    summary["해석"] = trend.get("해석", "")
+    if trend.get("해석"):
+        summary["해석"] = trend.get("해석", "")
 
     svg = chart_dashboard_svg(
         title=f"{param.description} ({region}) — 종합",
@@ -3681,9 +4184,9 @@ async def chain_full_analysis(
     query: str, region: str = "전국",
     api_key: Optional[str] = None,
 ) -> list:
-    """[⛓] 종합 분석: 통계+추세+예측+이상치+차트 한 번에.
+    """[⛓] 종합 분석 재료 번들: 통계+추세+예측재료+이상치+차트.
 
-    "출산율 분석해줘", "청년 실업률 봐줘" 같은 요청에 사용.
+    LLM이 필요한 부분만 골라 해석하도록 계산 재료를 묶어 반환한다.
     """
     latest = await quick_stat(query, region, "latest", api_key)
     if "오류" in latest:
@@ -3706,12 +4209,17 @@ async def chain_full_analysis(
     summary = {
         "주제": query, "지역": region,
         "최신값": latest.get("answer"),
-        "추세_분석": {
-            "라벨": trend.get("추세_라벨"),
-            "해석": trend.get("해석"),
+        "trend_materials": {
+            "model_parameters": trend.get("model_parameters"),
+            "formula": trend.get("formula"),
+            "period": trend.get("기간"),
         },
-        "5년_예측": forecast.get("예측", [])[:5] if "예측" in forecast else None,
+        "forecast_materials": {
+            "model_options": forecast.get("model_options"),
+            "linear_example": ((forecast.get("computed_examples") or {}).get("linear") or {}),
+        },
         "이상치": outliers.get("이상치", [])[:3],
+        "must_know": trend.get("must_know") or forecast.get("must_know"),
         "출처": "통계청 KOSIS",
     }
 
@@ -3745,29 +4253,30 @@ async def answer_query(
     query: str,
     region: str = "전국",
     api_key: Optional[str] = None,
+    verbose: bool = False,
 ) -> dict:
-    """[🤖][Deprecated for Gemma chatbot manifests] 자연어 질문을 실제 답변 또는 안전한 분석계획으로 생성.
+    """[🤖] 자연어 질문을 실제 답변 또는 안전한 분석계획으로 생성.
 
-    검증된 Tier A 질문은 KOSIS API를 호출해 수치·표·계산·해석을 반환하고,
+    검증된 Tier A 질문은 KOSIS API를 호출해 수치·표·계산 재료를 반환하고,
     복합/상위어 질문은 실제 KOSIS 검색 후보와 분석계획을 반환한다.
-    Gemma 기반 챗봇에서는 silent failure를 줄이기 위해 plan_query →
-    select_table_for_query → resolve_concepts → query_table → compute_indicator
-    절차형 파이프라인을 우선 사용한다.
+    verbose=False를 지정하면 data/metadata/notes 중심의 슬림 응답을 반환한다.
     """
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
         if _is_missing_key_error(exc):
-            return _attach_gemma_deprecation_warning(
+            result = _attach_gemma_deprecation_warning(
                 _missing_api_key_response("answer_query", query=query, region=region)
             )
+            return result if verbose else _compact_answer_query_response(result, query=query, region=region)
         raise
     engine = NaturalLanguageAnswerEngine(key)
     try:
         result = await engine.answer(query, region)
-        return _attach_gemma_deprecation_warning(result)
+        result = _attach_gemma_deprecation_warning(result)
+        return result if verbose else _compact_answer_query_response(result, query=query, region=region)
     except RuntimeError as e:
-        return _attach_gemma_deprecation_warning({
+        result = _attach_gemma_deprecation_warning({
             "상태": "failed",
             "status": "failed",
             "코드": STATUS_RUNTIME_ERROR,
@@ -3775,6 +4284,7 @@ async def answer_query(
             "오류": str(e),
             "질문": query,
         })
+        return result if verbose else _compact_answer_query_response(result, query=query, region=region)
 
 
 @mcp.tool()

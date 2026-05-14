@@ -1,12 +1,13 @@
 # Gemma 챗봇 통합 가이드
 
 이 문서는 Gemma 4 26B 챗봇에서 KOSIS MCP 서버를 붙일 때의 권장 도구
-manifest와 운영 규칙을 정리합니다. 목표는 Gemma가 많은 도구 중 즉흥적으로
-고르는 구조가 아니라, 실패하기 어려운 절차형 레일을 따르도록 만드는 것입니다.
+manifest와 운영 규칙을 정리합니다. 목표는 LLM의 선택 자유도를 줄이는 것이
+아니라, 선택에 필요한 원자료·메타데이터·한계 정보를 충분히 제공해 실수를
+줄이는 것입니다.
 
 ## 기본 Manifest
 
-Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다.
+정밀 검증을 중시하는 manifest에는 아래 도구를 중심으로 노출하는 것을 권장합니다.
 
 - `plan_query`: 모든 통계 질문의 첫 호출입니다. 의도, 지표, 차원, 시간,
   다음 단계만 만들고 실제 값을 조회하지 않습니다.
@@ -16,21 +17,21 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
   선택된 표의 코드 후보로 변환합니다.
 - `explore_table`: 표의 축과 코드 메타데이터가 더 필요할 때 사용합니다.
 - `query_table`: 검증된 `OBJ_ID`/`ITM_ID` 필터로 KOSIS 원자료를 추출합니다.
-- `compute_indicator`: `query_table.rows`에 허용된 산식 enum만 적용합니다.
+- `compute_indicator`: `query_table.rows`에 검산 가능한 산식과 단위 추적 정보를 붙입니다.
 - `search_kosis`: 표 후보가 필요하지만 `select_table_for_query`가 충분하지
   않을 때만 사용합니다.
+- `answer_query`: 빠른 자연어 편의 도구입니다. 기본값은 `verbose=false`라서
+  얇은 `data`/`metadata`/`notes` 응답을 반환합니다.
 
-전문가 또는 분석용 manifest에만 선택적으로 노출할 도구:
+전문가 또는 분석용 manifest에 선택적으로 노출할 도구:
 
-- `analyze_trend`, `chain_full_analysis`
+- `analyze_trend`, `forecast_stat`, `correlate_stats`, `detect_outliers`, `chain_full_analysis`
 - `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_dashboard`
 
 기본 manifest에서 숨길 도구:
 
-- `answer_query`: deprecated shortcut입니다. 직접 답변을 생성할 수 있어
-  partial fulfillment를 숨길 수 있습니다.
-- `quick_stat`, `quick_trend`, `quick_region_compare`: 빠르지만 절차형 검증
-  레일을 우회합니다.
+- `quick_stat`, `quick_trend`, `quick_region_compare`: 빠른 편의 도구입니다.
+  정밀한 표/코드 검증이 필요한 챗봇에서는 절차형 도구를 우선합니다.
 - `verify_stat_claims`, `decode_error`, 일회성 진단 helper
 
 기본 manifest 예시는 [gemma_manifest.default.json](gemma_manifest.default.json)을
@@ -39,7 +40,8 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
 ## 운영 흐름
 
 1. 챗봇 라우터가 사용자 질문이 통계 질문인지 먼저 판단합니다.
-2. 통계 질문이면 항상 `plan_query(query)`를 먼저 호출합니다.
+2. 단순 질문이면 `answer_query(query)` 또는 `quick_*`로 빠르게 처리할 수 있습니다.
+   복합 질문, 다중 지표, 산식, 표 선택 근거가 중요한 질문이면 `plan_query(query)`를 먼저 호출합니다.
 3. `plan_query.next_call`, `suggested_workflow`, `evidence_workflow` 중 가장
    구체적인 레일을 따릅니다.
 4. `metrics`는 요청 지표, `quarantined_metrics`는 충돌 또는 오염 의심 지표입니다.
@@ -51,12 +53,25 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
    KOSIS 표 메타 축 매칭용 표현입니다. 후속 표 선택에는 `table_required_dimensions`
    를 사용합니다.
 7. `query_table`에는 메타데이터 기반 도구가 반환한 코드만 넣습니다.
-8. 산식은 `compute_indicator`에 위임합니다. `query_table.rows`를 그대로
-   `input_rows`로 넘기고, 허용된 enum(`per_capita`, `share`, `ratio`,
-   `growth_rate`, `cagr`, `yoy_pct`, `yoy_diff`, `sum_additive_rows`)만
-   사용합니다. 단위 변환·가법성 판단은 caller가 책임지며 응답 markers
+8. 산식은 `compute_indicator`를 쓰거나 LLM이 직접 계산할 수 있습니다.
+   `compute_indicator`를 쓰면 `query_table.rows`를 그대로 `input_rows`로 넘기고,
+   허용된 enum(`per_capita`, `share`, `ratio`, `growth_rate`, `cagr`,
+   `yoy_pct`, `yoy_diff`, `sum_additive_rows`)을 사용합니다. 단위 변환·가법성 판단은 caller가 책임지며 응답 markers
    (`denominator_zero`, `period_or_group_mismatch`, `additivity_caller_asserted`,
    `partial_computation`)로 한계를 표시합니다.
+
+## 분석 도구 원칙
+
+분석 도구는 최종 결론을 대신 쓰지 않습니다. 기본 응답은 아래 재료를 제공합니다.
+
+- `input.data`, `input.x`, `input.y`: LLM이 직접 재계산할 수 있는 원자료 배열
+- `must_know`: 단위, 최신 시점, 데이터 나이, 비교/해석 한계
+- `data_characteristics`: 단조성, 변동성, 음수/0 포함 여부, index 여부
+- `common_pitfalls`: 지수/절대값 혼동, 작은 표본, 상관과 인과 혼동 같은 구체적 함정
+- `model_parameters`, `formula`, `residuals`, `fitted_values`: MCP가 계산한 경우 재현 가능한 계산 흔적
+- `model_options`: forecast 등에서 LLM이 선택할 수 있는 모델 후보와 caveat
+
+자연어 `해석`은 기본적으로 포함하지 않습니다. 필요할 때만 `include_interpretation=true`를 사용합니다.
 
 ## 응답 계약
 

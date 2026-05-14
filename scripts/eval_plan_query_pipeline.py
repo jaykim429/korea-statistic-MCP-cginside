@@ -540,15 +540,20 @@ async def main() -> None:
 
     warned = _attach_gemma_deprecation_warning({"status": "executed"})
     warning_problems: list[Any] = []
-    if (warned.get("deprecation_warning") or {}).get("recommended_replacement") != "plan_query":
-        warning_problems.append({"deprecation_warning": warned.get("deprecation_warning")})
-    replacement = warned.get("recommended_replacement") or {}
-    if replacement.get("tool") != "plan_query":
-        warning_problems.append({"recommended_replacement": replacement})
-    if not warned.get("llm_guardrails"):
-        warning_problems.append({"llm_guardrails": warned.get("llm_guardrails")})
+    if warned.get("deprecation_warning") or warned.get("llm_guardrails"):
+        warning_problems.append({
+            "removed_control_fields": {
+                "deprecation_warning": warned.get("deprecation_warning"),
+                "llm_guardrails": warned.get("llm_guardrails"),
+            }
+        })
+    if warned.get("tool_mode") != "convenience":
+        warning_problems.append({"tool_mode": warned.get("tool_mode")})
+    contract = warned.get("mcp_output_contract") or {}
+    if contract.get("role") != "convenience_tool":
+        warning_problems.append({"contract_role": contract.get("role")})
     rows.append({
-        "name": "answer_query_self_announces_deprecation",
+        "name": "answer_query_is_convenience_tool",
         "status": "PASS" if not warning_problems else "FAIL",
         "problems": warning_problems,
     })

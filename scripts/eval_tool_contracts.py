@@ -795,17 +795,39 @@ async def test_resolve_concepts_empty_list_has_contract() -> None:
     assert "invalid_input" in markers, markers
 
 
-def test_answer_query_deprecated_contract() -> None:
+def test_answer_query_convenience_contract() -> None:
     result = kosis_mcp_server._attach_gemma_deprecation_warning({
         "status": "partial",
         "dropped_dimensions": ["aggregation"],
         "부분충족_사유": ["합계 의도가 단일값으로 축소됨"],
     })
     contract = result["mcp_output_contract"]
-    assert contract["role"] == "deprecated_shortcut", result
+    assert contract["role"] == "convenience_tool", result
+    assert result["tool_mode"] == "convenience", result
+    assert "deprecation_warning" not in result, result
+    assert "llm_guardrails" not in result, result
     markers = contract["current_signals"]["markers_present"]
+    assert "convenience_response" in markers, markers
     assert "partial_fulfillment" in markers, markers
     assert contract["current_signals"]["dropped_dimensions"] == ["aggregation"], contract
+
+
+def test_answer_query_compact_response_hides_control_contract() -> None:
+    verbose = kosis_mcp_server._attach_gemma_deprecation_warning({
+        "상태": "executed",
+        "status": "executed",
+        "answer": "stub answer",
+        "통계명": "stub stat",
+        "단위": "명",
+        "시점": "2024",
+        "검증_주의": ["freshness check"],
+    })
+    compact = kosis_mcp_server._compact_answer_query_response(verbose, query="인구", region="전국")
+    assert compact["status"] == "executed", compact
+    assert compact["answer"] == "stub answer", compact
+    assert compact["metadata"]["unit"] == "명", compact
+    assert "mcp_output_contract" not in compact, compact
+    assert "llm_guardrails" not in compact, compact
 
 
 def test_marker_guidance_in_contract() -> None:
@@ -836,10 +858,107 @@ async def test_quick_stat_shortcut_contract() -> None:
         kosis_mcp_server._quick_stat_core = original_core  # type: ignore[assignment]
 
     contract = result["mcp_output_contract"]
-    assert contract["role"] == "deprecated_shortcut", result
+    assert contract["role"] == "shortcut_tool", result
     markers = contract["current_signals"]["markers_present"]
-    assert "deprecation" in markers, markers
+    assert "shortcut_response" in markers, markers
     assert "dropped_dimensions" in markers, markers
+
+
+async def test_detect_outliers_detrended_default() -> None:
+    original_quick_trend = kosis_mcp_server.quick_trend
+
+    async def fake_quick_trend(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "통계명": "fake_trend",
+            "시계열": [
+                {"PRD_DE": "2018", "DT": "100"},
+                {"PRD_DE": "2019", "DT": "105"},
+                {"PRD_DE": "2020", "DT": "110"},
+                {"PRD_DE": "2021", "DT": "250"},
+                {"PRD_DE": "2022", "DT": "120"},
+                {"PRD_DE": "2023", "DT": "125"},
+                {"PRD_DE": "2024", "DT": "130"},
+            ],
+        }
+
+    try:
+        kosis_mcp_server.quick_trend = fake_quick_trend  # type: ignore[assignment]
+        result = await kosis_mcp_server.detect_outliers("fake", api_key="dummy")
+    finally:
+        kosis_mcp_server.quick_trend = original_quick_trend  # type: ignore[assignment]
+
+    assert result["method"] == "detrended_zscore", result
+    assert result["trend_model"] == "linear", result
+    assert result["outliers"], result
+    assert result["outliers"][0]["period"] == "2021", result
+
+
+async def test_detect_outliers_all_methods_documents_stl_optional() -> None:
+    original_quick_trend = kosis_mcp_server.quick_trend
+
+    async def fake_quick_trend(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "통계명": "fake_trend",
+            "시계열": [
+                {"PRD_DE": "2018", "DT": "10"},
+                {"PRD_DE": "2019", "DT": "11"},
+                {"PRD_DE": "2020", "DT": "12"},
+                {"PRD_DE": "2021", "DT": "13"},
+                {"PRD_DE": "2022", "DT": "40"},
+                {"PRD_DE": "2023", "DT": "15"},
+            ],
+        }
+
+    try:
+        kosis_mcp_server.quick_trend = fake_quick_trend  # type: ignore[assignment]
+        result = await kosis_mcp_server.detect_outliers("fake", api_key="dummy", method="all")
+    finally:
+        kosis_mcp_server.quick_trend = original_quick_trend  # type: ignore[assignment]
+
+    assert result["method"] == "all", result
+    assert result["primary_method"] == "detrended_zscore", result
+    assert set(result["method_results"]) == {"detrended_zscore", "zscore", "iqr", "stl"}, result
+
+
+async def test_analysis_tools_return_materials_not_interpretation() -> None:
+    original_quick_trend = kosis_mcp_server.quick_trend
+
+    async def fake_quick_trend(query: str, *_: Any, **__: Any) -> dict[str, Any]:
+        base = 10 if query == "a" else 20
+        return {
+            "통계명": query,
+            "단위": "명",
+            "period_age_years": 0.5,
+            "시계열": [
+                {"PRD_DE": "2020", "DT": str(base + 0)},
+                {"PRD_DE": "2021", "DT": str(base + 2)},
+                {"PRD_DE": "2022", "DT": str(base + 4)},
+                {"PRD_DE": "2023", "DT": str(base + 6)},
+                {"PRD_DE": "2024", "DT": str(base + 8)},
+            ],
+        }
+
+    try:
+        kosis_mcp_server.quick_trend = fake_quick_trend  # type: ignore[assignment]
+        trend = await kosis_mcp_server.analyze_trend("a", api_key="dummy")
+        forecast = await kosis_mcp_server.forecast_stat("a", api_key="dummy")
+        corr = await kosis_mcp_server.correlate_stats("a", "b", api_key="dummy")
+    finally:
+        kosis_mcp_server.quick_trend = original_quick_trend  # type: ignore[assignment]
+
+    assert "해석" not in trend, trend
+    assert trend["input"]["x"] == [0, 1, 2, 3, 4], trend
+    assert "residuals" in trend, trend
+    assert "must_know" in trend, trend
+
+    assert "예측" not in forecast, forecast
+    linear = forecast["computed_examples"]["linear"]
+    assert linear["forecast_path"], forecast
+    assert forecast["model_options"], forecast
+
+    assert "해석" not in corr["Pearson"], corr
+    assert "kendall" in corr["correlations"], corr
+    assert corr["must_know"]["correlation_is_not_causation"] is True, corr
 
 
 async def test_indicator_dependency_map_is_advisory_contract() -> None:
@@ -1148,9 +1267,13 @@ async def main() -> None:
         ("plan_heuristic_extraction_marker", lambda: test_plan_query_heuristic_extraction_is_marked()),
         ("resolve_ambiguity_reason", lambda: test_resolve_concepts_ambiguity_best_selection_reason()),
         ("resolve_empty_contract", lambda: test_resolve_concepts_empty_list_has_contract()),
-        ("answer_query_deprecated_contract", lambda: test_answer_query_deprecated_contract()),
+        ("answer_query_convenience_contract", lambda: test_answer_query_convenience_contract()),
+        ("answer_query_compact_response", lambda: test_answer_query_compact_response_hides_control_contract()),
         ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
         ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),
+        ("detect_outliers_detrended_default", lambda: test_detect_outliers_detrended_default()),
+        ("detect_outliers_all_methods", lambda: test_detect_outliers_all_methods_documents_stl_optional()),
+        ("analysis_tools_materials", lambda: test_analysis_tools_return_materials_not_interpretation()),
         ("indicator_dependency_advisory_contract", lambda: test_indicator_dependency_map_is_advisory_contract()),
         ("query_table_invalid_filter_contract", lambda: test_query_table_invalid_filter_has_contract()),
         ("query_table_period_error_contract", lambda: test_query_table_period_error_has_contract_and_format_guidance()),

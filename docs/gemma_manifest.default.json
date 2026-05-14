@@ -2,8 +2,9 @@
   "profile": "gemma_default",
   "version": "1.0",
   "compatible_with": ">=0.6.0",
-  "description": "Recommended KOSIS MCP tool exposure for Gemma chatbot integrations.",
+  "description": "Recommended KOSIS MCP tool exposure for Gemma chatbot integrations. Prefer transparent data/materials over forced final-answer control.",
   "expose": [
+    "answer_query",
     "plan_query",
     "select_table_for_query",
     "resolve_concepts",
@@ -14,6 +15,9 @@
   ],
   "expert_optional": [
     "analyze_trend",
+    "forecast_stat",
+    "correlate_stats",
+    "detect_outliers",
     "chain_full_analysis",
     "chart_line",
     "chart_compare_regions",
@@ -21,17 +25,17 @@
     "chart_dashboard"
   ],
   "hide_by_default": [
-    "answer_query",
     "quick_stat",
     "quick_trend",
     "quick_region_compare",
     "verify_stat_claims",
     "decode_error"
   ],
-  "entrypoint": "plan_query",
+  "entrypoint": "answer_query_or_plan_query",
   "rules": [
-    "Call plan_query first for every statistics question.",
+    "Use answer_query for simple natural-language lookups; use plan_query for composite, multi-metric, ambiguous, or high-stakes statistical questions.",
     "Do not present plan_query output as a final answer.",
+    "For analysis tools, use input arrays, must_know, data_characteristics, model_options, and common_pitfalls before choosing an interpretation.",
     "Use metrics, quarantined_metrics, conflict_decisions, semantic_dimensions, and table_required_dimensions to decide follow-up calls.",
     "Do not infer missing KOSIS values from model knowledge.",
     "Report unsupported, missing, or low-coverage metrics explicitly."
