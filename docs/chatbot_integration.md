@@ -44,11 +44,14 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
    구체적인 레일을 따릅니다.
 4. `metrics`는 요청 지표, `quarantined_metrics`는 충돌 또는 오염 의심 지표입니다.
    quarantined 지표를 답변에 포함하지 않습니다.
-5. `semantic_dimensions`는 LLM 친화 의미 표현이고, `table_required_dimensions`는
+5. `multi_metric_request` marker가 있으면 `metrics[]`의 각 지표를 별도
+   `select_table_for_query` 경로로 처리합니다. KOSIS 메타가 같은 표를 증명할
+   때만 하나의 표를 공유합니다.
+6. `semantic_dimensions`는 LLM 친화 의미 표현이고, `table_required_dimensions`는
    KOSIS 표 메타 축 매칭용 표현입니다. 후속 표 선택에는 `table_required_dimensions`
    를 사용합니다.
-6. `query_table`에는 메타데이터 기반 도구가 반환한 코드만 넣습니다.
-7. 산식은 `compute_indicator`에 위임합니다. `query_table.rows`를 그대로
+7. `query_table`에는 메타데이터 기반 도구가 반환한 코드만 넣습니다.
+8. 산식은 `compute_indicator`에 위임합니다. `query_table.rows`를 그대로
    `input_rows`로 넘기고, 허용된 enum(`per_capita`, `share`, `ratio`,
    `growth_rate`, `cagr`, `yoy_pct`, `yoy_diff`, `sum_additive_rows`)만
    사용합니다. 단위 변환·가법성 판단은 caller가 책임지며 응답 markers
@@ -64,6 +67,7 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
 - `mcp_output_contract.follow_up_required`: 후속 도구 호출 필요 여부
 - `mcp_output_contract.failure_markers`: LLM이 실패·부분충족을 감지해야 하는 필드
 - `mcp_output_contract.current_signals`: 현재 응답에서 실제로 켜진 caveat 요약
+- `mcp_output_contract.current_signals.marker_guidance`: 켜진 marker별 후속 행동 안내
 - `recommended_tool_manifest`: 기본/전문가/숨김 도구 목록
 - `canonical_fields`: Gemma가 우선 읽어야 하는 정규 필드
 - `deprecated_fields`: 호환을 위해 남긴 구 필드와 대체 필드 안내
@@ -80,6 +84,10 @@ Gemma는 `answer`가 `null`인 계획 응답을 사용자에게 최종 답처럼
 - `validation_errors`
 - `missing_metrics`
 - `quarantined_metrics`
+- `multi_metric_request`: 지표별 표 선택/코드 해소를 분리해야 합니다.
+- `heuristic_extraction`: KOSIS 메타로 검증되기 전까지 후보로만 취급합니다.
+- `unit_caller_resolution_required`: 계산 결과 단위를 caller가 해석해야 합니다.
+- `projection_data`: 미래 추계값입니다. 실측값처럼 단정하지 않습니다.
 - `coverage_ratio`가 낮은 결과
 - `row_count: 0`
 - `availability: "missing"` 또는 `availability: "not_matched"`
@@ -131,6 +139,7 @@ Gemma는 `metrics`만 후속 조회 대상으로 사용하고, `quarantined_metr
 
 ```text
 최근 5년간 소상공인 사업체 수, 종사자 수, 매출액, 폐업률을 한 표로 정리해줘.
+경제성장률, 인구 변화율, 합계출산율 추이를 비교해줘.
 ```
 
 권장 처리:
