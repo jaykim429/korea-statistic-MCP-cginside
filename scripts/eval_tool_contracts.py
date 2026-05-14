@@ -120,6 +120,93 @@ async def test_select_table_falls_back_to_query_indicator() -> None:
     assert rejected and rejected[0]["status"] == "not_matched_indicator", rejected
 
 
+async def test_resolve_concepts_contract_on_unresolved() -> None:
+    """resolve_concepts must surface unresolved/ambiguous concepts via mcp_output_contract."""
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "임의 표"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "A", "OBJ_NM": "지역별", "ITM_ID": "00", "ITM_NM": "전국"},
+                {"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": "지표A"},
+            ]
+        return []
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server.resolve_concepts(
+            "101",
+            "TBL_FAKE",
+            ["수도권", "반도체 산업"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["status"] == "needs_concept_selection", result
+    contract = result["mcp_output_contract"]
+    markers = contract["current_signals"]["markers_present"]
+    assert "not_matched" in markers, markers
+    assert "concept_unresolved" in markers, markers
+    assert contract["current_signals"]["has_failures"] is True, contract
+    assert contract["current_signals"]["unresolved_concept_count"] == 2, contract
+
+
+async def test_explore_table_contract_on_stale_period() -> None:
+    """explore_table must mark stale_metadata when latest period is over a year old."""
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str, extra: Any = None) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "임의 표"}]
+        if kind == "ITM":
+            return [{"OBJ_ID": "A", "OBJ_NM": "지역별", "ITM_ID": "00", "ITM_NM": "전국"}]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2010", "END_PRD_DE": "2020"}]
+        if kind == "SOURCE":
+            return [{"DEPT_NM": "x"}]
+        return []
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server.explore_table("101", "TBL_FAKE", api_key="dummy")
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    contract = result["mcp_output_contract"]
+    markers = contract["current_signals"]["markers_present"]
+    assert "stale_metadata" in markers, markers
+    assert contract["current_signals"]["period_age_years"] is not None, contract
+    assert contract["current_signals"]["period_age_years"] >= 1.0, contract
+
+
+async def test_search_kosis_contract_on_empty_results() -> None:
+    """search_kosis must surface search_empty marker when no candidates are returned."""
+    original_hints = kosis_mcp_server._routing_hints
+    original_call = kosis_mcp_server._kosis_call
+
+    def fake_hints(query: str) -> list[str]:
+        return []
+
+    async def fake_call(client: Any, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
+    try:
+        kosis_mcp_server._routing_hints = fake_hints  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_kosis("zzz_no_match_zzz", api_key="dummy")
+    finally:
+        kosis_mcp_server._routing_hints = original_hints  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    contract = result["mcp_output_contract"]
+    markers = contract["current_signals"]["markers_present"]
+    assert "search_empty" in markers, markers
+    assert contract["current_signals"]["result_count"] == 0, contract
+
+
 async def test_search_kosis_preserves_original_query() -> None:
     calls: list[str] = []
     original_hints = kosis_mcp_server._routing_hints
@@ -152,6 +239,9 @@ async def main() -> None:
         ("indicator_evidence_required", lambda: test_indicator_evidence_required_when_indicator_supplied()),
         ("axis_only_exploration", lambda: test_indicator_evidence_not_required_for_axis_only_exploration()),
         ("select_table_query_fallback", lambda: test_select_table_falls_back_to_query_indicator()),
+        ("resolve_concepts_contract", lambda: test_resolve_concepts_contract_on_unresolved()),
+        ("explore_table_stale_contract", lambda: test_explore_table_contract_on_stale_period()),
+        ("search_kosis_empty_contract", lambda: test_search_kosis_contract_on_empty_results()),
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
     ]
     passed = 0

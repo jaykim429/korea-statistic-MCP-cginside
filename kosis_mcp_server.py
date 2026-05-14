@@ -3772,6 +3772,20 @@ async def _search_kosis_keywords(
             ),
         }
 
+    search_markers: list[str] = []
+    if not unique:
+        search_markers.append("search_empty")
+    if used_routing:
+        search_markers.append("routing_expanded")
+    if tier_a_hint is not None:
+        search_markers.append("tier_a_available")
+    search_explanation = (
+        "Search returned no candidate tables; LLM should broaden the query or rely on the planner workflow."
+        if not unique else
+        "Tier A direct mapping is available; prefer it over re-ranking the search list."
+        if tier_a_hint is not None else
+        "Search returned candidate tables; verify each candidate via select_table_for_query before use."
+    )
     return {
         "입력": query,
         "라우팅_사용": used_routing,
@@ -3791,6 +3805,18 @@ async def _search_kosis_keywords(
             }
             for r in unique[:limit]
         ],
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="table_search",
+            final_answer_expected=False,
+            markers=search_markers,
+            explanation=search_explanation,
+            extra_signals={
+                "result_count": len(unique),
+                "routing_used": used_routing,
+                "tier_a_match": tier_a_hint is not None,
+                "original_query_preserved": bool(keywords and keywords[0] == query),
+            },
+        ),
     }
 
 
@@ -3964,6 +3990,22 @@ async def resolve_concepts(
                 filters[str(best["OBJ_ID"])].append(str(best["ITM_ID"]))
 
     status = "resolved" if filters and not unresolved else "partial" if filters else "needs_concept_selection"
+    concept_markers: list[str] = []
+    if status == "needs_concept_selection":
+        concept_markers.append("not_matched")
+    elif status == "partial":
+        concept_markers.append("concept_partial_resolution")
+    if unresolved:
+        concept_markers.append("concept_unresolved")
+    if ambiguities:
+        concept_markers.append("concept_ambiguous")
+    concept_explanation = (
+        "No concept was resolved to a metadata code; caller must refine the concept strings or pick from matches_by_concept."
+        if status == "needs_concept_selection" else
+        "Some concepts were resolved while others remain unresolved or ambiguous; inspect unresolved/ambiguities before using filters."
+        if status == "partial" or unresolved or ambiguities else
+        "All concepts resolved to metadata codes valid for this table."
+    )
     return {
         "상태": status,
         "status": status,
@@ -3982,6 +4024,18 @@ async def resolve_concepts(
             {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM"), "item_count": len(axes[obj_id].get("items") or {})}
             for obj_id in axis_order
         ],
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="concept_resolution",
+            final_answer_expected=False,
+            markers=concept_markers,
+            explanation=concept_explanation,
+            extra_signals={
+                "resolved_concept_count": sum(1 for entry in matches_by_concept if entry.get("matches")),
+                "unresolved_concept_count": len(unresolved),
+                "ambiguous_concept_count": len(ambiguities),
+                "valid_only_for": tbl_id,
+            },
+        ),
         "주의": [
             "resolve_concepts는 표 메타 안에서 문자열 후보를 찾을 뿐, 수도권·산업군·가법성 같은 도메인 정의를 만들지 않습니다.",
             "filters는 같은 tbl_id에만 유효합니다. 다른 표에는 재사용하지 마세요.",
@@ -4815,6 +4869,31 @@ async def explore_table(
                 "안내": "분류축에서 일치하는 항목을 찾지 못했습니다. 분류축 리스트를 확인해 입력 표현을 조정하세요.",
             }
 
+    explore_markers: list[str] = []
+    if meta_errors:
+        explore_markers.append("metadata_partial")
+    if period_age is not None and period_age >= 1.0:
+        explore_markers.append("stale_metadata")
+    if industry_term and not result.get("resolved_industry", {}).get("ITM_ID"):
+        explore_markers.append("industry_unresolved")
+    explore_explanation = (
+        f"Latest period is {used_period} (~{period_age:.1f} years old); disclose staleness before quoting figures."
+        if "stale_metadata" in explore_markers else
+        "Some metadata endpoints failed; treat missing axes/items as unknown rather than absent."
+        if meta_errors else
+        "Metadata snapshot returned for the requested table."
+    )
+    result["mcp_output_contract"] = _mcp_tool_output_contract(
+        role="table_metadata",
+        final_answer_expected=False,
+        markers=explore_markers,
+        explanation=explore_explanation,
+        extra_signals={
+            "period_age_years": period_age,
+            "axis_count": len(classifications),
+            "metadata_errors": list(meta_errors.keys()),
+        },
+    )
     return result
 
 
