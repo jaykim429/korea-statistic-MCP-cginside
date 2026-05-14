@@ -89,6 +89,10 @@ from kosis_analysis.periods import (
     _relative_year,
     _validate_query_period_range,
 )
+from kosis_analysis.indicators import (
+    OPERATIONS as INDICATOR_OPERATIONS,
+    operation_catalog as _indicator_operation_catalog,
+)
 from kosis_analysis.planner import QueryWorkflowPlanner
 from kosis_analysis.quick import (
     _attach_ignored_params,
@@ -4625,6 +4629,139 @@ async def query_table(
     }
     result.update({key: value for key, value in nature.items() if value is not None})
     return result
+
+
+@mcp.tool()
+async def compute_indicator(
+    operation: str,
+    input_rows: list[dict],
+    denominator_rows: Optional[list[dict]] = None,
+    group_by: Optional[list[str]] = None,
+    match_keys: Optional[list[str]] = None,
+    scale_factor: Optional[float] = None,
+    decimals: int = 4,
+) -> dict:
+    """[🧮] 허용된 산식 enum만 사용해 query_table rows에 산술을 수행한다.
+
+    이 도구는 caller(LLM)가 제공한 raw 값에 산술과 구조 검증만 수행한다.
+    가법성 판단, 단위 변환, 지표 정의는 caller 책임이다. 입력은 query_table
+    응답의 rows를 그대로 넘긴다 (필드: period/value/unit/dimensions/raw).
+
+    operation:
+        - growth_rate         : 그룹 내 인접 period 변화율 (%)
+        - cagr                : 그룹 내 시작/끝 period 사이 연평균 복합 성장률 (%)
+        - yoy_pct             : 같은 intra-year period의 전년 대비 변화율 (%)
+        - yoy_diff            : 같은 intra-year period의 전년 대비 변화량 (단위 보존)
+        - share               : input_rows 합 또는 denominator_rows 매칭 분모 대비 비율 (%)
+        - per_capita          : numerator/denominator * scale_factor (단위는 caller 책임)
+        - ratio               : 단순 A/B (단위 없음)
+        - sum_additive_rows   : group_by별 행 합산. caller가 가법성 책임 명시.
+
+    Args:
+        operation: 산식 enum 이름.
+        input_rows: query_table.rows 호환 list.
+        denominator_rows: per_capita/ratio/share에 사용되는 분모 list (선택).
+        group_by: 그룹화 축 (OBJ_ID 리스트). 미지정 시 dimensions의 non-ITEM 축 자동 사용.
+        match_keys: per_capita/ratio/share의 분자/분모 매칭 축. 미지정 시 group_by 규칙 따름.
+        scale_factor: per_capita/ratio 결과에 곱할 단위 스케일 (예: 1000). share는 무시.
+        decimals: 결과 반올림 자릿수.
+    """
+    op = INDICATOR_OPERATIONS.get(operation) if isinstance(operation, str) else None
+    if op is None:
+        return {
+            "status": "invalid_input",
+            "상태": "invalid_input",
+            "error": f"Unknown operation: {operation!r}",
+            "오류": f"알 수 없는 operation: {operation!r}",
+            "valid_operations": list(INDICATOR_OPERATIONS.keys()),
+            "operation_catalog": _indicator_operation_catalog(),
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="indicator_computation",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="operation must be one of the allowed enum names.",
+                extra_signals={
+                    "valid_operations": list(INDICATOR_OPERATIONS.keys()),
+                },
+            ),
+        }
+    if not isinstance(input_rows, list) or not input_rows:
+        return {
+            "status": "invalid_input",
+            "상태": "invalid_input",
+            "error": "input_rows must be a non-empty list.",
+            "오류": "input_rows는 비어 있지 않은 리스트여야 합니다.",
+            "operation": operation,
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="indicator_computation",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="input_rows is empty; nothing to compute.",
+                extra_signals={"operation": operation, "result_count": 0},
+            ),
+        }
+    if op.requires_denominator and not denominator_rows:
+        return {
+            "status": "invalid_input",
+            "상태": "invalid_input",
+            "error": f"{operation} requires denominator_rows.",
+            "오류": f"{operation}은(는) denominator_rows가 필요합니다.",
+            "operation": operation,
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="indicator_computation",
+                final_answer_expected=False,
+                markers=["invalid_input", "missing_denominator"],
+                explanation=f"{operation} cannot run without denominator_rows.",
+                extra_signals={"operation": operation, "result_count": 0},
+            ),
+        }
+
+    outcome = op.compute(
+        input_rows,
+        denominator_rows=denominator_rows,
+        match_keys=match_keys,
+        group_by=group_by,
+        scale_factor=scale_factor,
+        decimals=int(decimals) if decimals is not None else 4,
+    )
+    markers = list(outcome.markers)
+    if outcome.unmatched:
+        markers.append("period_or_group_mismatch")
+    if outcome.status == "invalid_input":
+        markers.append("invalid_input")
+    elif outcome.status == "partial":
+        markers.append("partial_computation")
+
+    explanation = (
+        f"compute_indicator({operation}) produced {len(outcome.results)} value(s)"
+        + (f"; {len(outcome.unmatched)} unmatched/skipped." if outcome.unmatched else ".")
+    )
+    return {
+        "status": outcome.status,
+        "상태": outcome.status,
+        "operation": operation,
+        "verification_level": "caller_inputs_only",
+        "confidence": "medium" if outcome.results else "low",
+        "results": [r.to_dict() for r in outcome.results],
+        "unmatched": outcome.unmatched,
+        "validation_errors": outcome.validation_errors,
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="indicator_computation",
+            final_answer_expected=False,
+            markers=markers,
+            explanation=explanation,
+            extra_signals={
+                "operation": operation,
+                "result_count": len(outcome.results),
+                "unmatched_count": len(outcome.unmatched),
+                "additivity_caller_asserted": op.aggregation_caller_asserted,
+            },
+        ),
+        "주의": [
+            "compute_indicator는 caller가 제공한 값에 산술만 수행합니다. 가법성/단위/지표 정의는 caller(LLM) 책임입니다.",
+            "input_rows·denominator_rows의 시점·축 정합성은 caller가 사전에 확인하세요. 일치하지 않는 항목은 unmatched로 반환됩니다.",
+        ],
+    }
 
 
 @mcp.tool()

@@ -207,6 +207,100 @@ async def test_search_kosis_contract_on_empty_results() -> None:
     assert contract["current_signals"]["result_count"] == 0, contract
 
 
+def _make_row(period: str, value: Any, region_code: str, region_label: str, item_code: str = "T1", item_label: str = "지표", unit: str = "명") -> dict[str, Any]:
+    return {
+        "period": period,
+        "value": value,
+        "unit": unit,
+        "dimensions": {
+            "ITEM": {"code": item_code, "label": item_label, "unit": unit},
+            "A": {"code": region_code, "label": region_label, "unit": None},
+        },
+        "raw": {},
+    }
+
+
+async def test_compute_indicator_growth_rate() -> None:
+    rows = [
+        _make_row("2020", "100", "11", "서울"),
+        _make_row("2021", "110", "11", "서울"),
+        _make_row("2022", "121", "11", "서울"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="growth_rate", input_rows=rows)
+    assert result["status"] == "ok", result
+    assert len(result["results"]) == 2, result
+    assert result["results"][0]["value"] == 10.0, result
+    assert result["results"][1]["value"] == 10.0, result
+    contract = result["mcp_output_contract"]
+    assert contract["current_signals"]["result_count"] == 2, contract
+
+
+async def test_compute_indicator_per_capita_with_denominator_zero() -> None:
+    numerator = [
+        _make_row("2023", "1000", "11", "서울", unit="명"),
+        _make_row("2023", "2000", "21", "부산", unit="명"),
+    ]
+    denominator = [
+        _make_row("2023", "10", "11", "서울", item_code="POP", item_label="인구", unit="천명"),
+        _make_row("2023", "0", "21", "부산", item_code="POP", item_label="인구", unit="천명"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(
+        operation="per_capita",
+        input_rows=numerator,
+        denominator_rows=denominator,
+        match_keys=["A"],
+    )
+    assert result["status"] == "partial", result
+    assert len(result["results"]) == 1, result
+    assert result["results"][0]["value"] == 100.0, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "denominator_zero" in markers, markers
+    assert "period_or_group_mismatch" in markers, markers
+
+
+async def test_compute_indicator_share_uses_input_total() -> None:
+    rows = [
+        _make_row("2023", "25", "11", "서울"),
+        _make_row("2023", "75", "21", "부산"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="share", input_rows=rows)
+    assert result["status"] == "ok", result
+    assert {r["value"] for r in result["results"]} == {25.0, 75.0}, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "share_total_from_input_rows" in markers, markers
+
+
+async def test_compute_indicator_yoy_pct_matches_intra_year() -> None:
+    rows = [
+        _make_row("202301", "100", "11", "서울"),
+        _make_row("202401", "120", "11", "서울"),
+        _make_row("202304", "200", "11", "서울"),
+        _make_row("202404", "210", "11", "서울"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="yoy_pct", input_rows=rows)
+    assert result["status"] in ("ok", "partial"), result
+    values_by_period = {r["period"]: r["value"] for r in result["results"]}
+    assert values_by_period.get("202401") == 20.0, result
+    assert values_by_period.get("202404") == 5.0, result
+
+
+async def test_compute_indicator_unknown_operation_is_rejected() -> None:
+    result = await kosis_mcp_server.compute_indicator(
+        operation="median",
+        input_rows=[_make_row("2023", "1", "11", "서울")],
+    )
+    assert result["status"] == "invalid_input", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "invalid_input" in markers, markers
+    assert "growth_rate" in result["valid_operations"], result
+
+
+def test_compute_indicator_in_planner_available_tools() -> None:
+    """planner must advertise compute_indicator as available_now once the tool exists."""
+    from kosis_analysis.planner import QueryWorkflowPlanner
+    assert "compute_indicator" in QueryWorkflowPlanner.AVAILABLE_TOOLS
+
+
 async def test_search_kosis_preserves_original_query() -> None:
     calls: list[str] = []
     original_hints = kosis_mcp_server._routing_hints
@@ -242,6 +336,12 @@ async def main() -> None:
         ("resolve_concepts_contract", lambda: test_resolve_concepts_contract_on_unresolved()),
         ("explore_table_stale_contract", lambda: test_explore_table_contract_on_stale_period()),
         ("search_kosis_empty_contract", lambda: test_search_kosis_contract_on_empty_results()),
+        ("compute_growth_rate", lambda: test_compute_indicator_growth_rate()),
+        ("compute_per_capita_denominator_zero", lambda: test_compute_indicator_per_capita_with_denominator_zero()),
+        ("compute_share_input_total", lambda: test_compute_indicator_share_uses_input_total()),
+        ("compute_yoy_pct_intra_year", lambda: test_compute_indicator_yoy_pct_matches_intra_year()),
+        ("compute_unknown_operation", lambda: test_compute_indicator_unknown_operation_is_rejected()),
+        ("compute_indicator_in_planner", lambda: test_compute_indicator_in_planner_available_tools()),
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
     ]
     passed = 0

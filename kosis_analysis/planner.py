@@ -49,6 +49,7 @@ class QueryWorkflowPlanner:
         "resolve_concepts",
         "explore_table",
         "query_table",
+        "compute_indicator",
         "search_kosis",
     ]
     GEMMA_EXPERT_TOOLS = [
