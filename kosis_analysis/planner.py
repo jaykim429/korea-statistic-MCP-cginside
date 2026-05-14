@@ -158,6 +158,7 @@ class QueryWorkflowPlanner:
         evidence_bundle = analysis_mode == "composite_analysis"
         conflict_decisions = metric_decisions + self._time_conflict_decisions(dimensions, route_payload)
         consistency_warnings = self._legacy_consistency_warnings(conflict_decisions)
+        heuristic_extraction_warnings = self._heuristic_extraction_warnings(raw_metrics, dimensions)
 
         confidence = "medium"
         if dimensions.get("indicator") and table_required:
@@ -188,6 +189,7 @@ class QueryWorkflowPlanner:
             "evidence_bundle": evidence_bundle,
             "metrics": metrics,
             "raw_metric_candidates": raw_metrics,
+            "heuristic_extraction_warnings": heuristic_extraction_warnings,
             "quarantined_metrics": quarantined_metrics,
             "dimensions": bundle_dimensions,
             "comparison_targets": comparison_targets,
@@ -209,6 +211,7 @@ class QueryWorkflowPlanner:
                 quarantined_metrics=quarantined_metrics,
                 conflict_decisions=conflict_decisions,
                 analysis_tasks=analysis_tasks,
+                heuristic_extraction_warnings=heuristic_extraction_warnings,
             ),
             "recommended_tool_manifest": self._tool_manifest_profile(),
             "canonical_fields": {
@@ -388,6 +391,7 @@ class QueryWorkflowPlanner:
         quarantined_metrics: list[dict[str, Any]],
         conflict_decisions: list[dict[str, Any]],
         analysis_tasks: list[dict[str, Any]],
+        heuristic_extraction_warnings: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         current_signals = QueryWorkflowPlanner._current_failure_signals(
             metrics=metrics,
@@ -395,6 +399,7 @@ class QueryWorkflowPlanner:
             conflict_decisions=conflict_decisions,
             analysis_tasks=analysis_tasks,
             role=role,
+            heuristic_extraction_warnings=heuristic_extraction_warnings or [],
         )
         return {
             "role": role,
@@ -427,6 +432,7 @@ class QueryWorkflowPlanner:
         conflict_decisions: list[dict[str, Any]],
         analysis_tasks: list[dict[str, Any]],
         role: str,
+        heuristic_extraction_warnings: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         unknown_metrics = [
             metric.get("name")
@@ -444,6 +450,14 @@ class QueryWorkflowPlanner:
             markers.append("conflict_decisions")
         if unknown_metrics:
             markers.append("metric_availability_unverified")
+        heuristic_metrics = [
+            metric.get("name")
+            for metric in metrics
+            if metric.get("caller_must_verify_with_kosis_meta")
+        ]
+        heuristic_warnings = heuristic_extraction_warnings or []
+        if heuristic_metrics or heuristic_warnings:
+            markers.append("heuristic_extraction")
         return {
             "has_failures": bool(quarantined_metrics or not metrics or role == "clarification_required"),
             "has_caveats": bool(markers),
@@ -453,6 +467,14 @@ class QueryWorkflowPlanner:
             "unknown_metric_count": len(unknown_metrics),
             "analysis_task_count": len(analysis_tasks),
             "unknown_metrics": unknown_metrics,
+            "heuristic_metrics": heuristic_metrics,
+            "heuristic_extraction_warning_count": len(heuristic_warnings),
+            "marker_guidance": {
+                "heuristic_extraction": "Treat extracted metrics/dimensions as candidates only; verify with KOSIS metadata before using as evidence.",
+                "metric_availability_unverified": "Call select_table_for_query and resolve_concepts before query_table.",
+                "missing_metrics": "Ask for or infer a statistical metric before selecting a table.",
+                "quarantined_metrics": "Do not use quarantined metrics unless the user explicitly confirms them.",
+            },
             "explanation": (
                 "The planner could not identify an executable metric. Ask a more specific statistical question."
                 if not metrics else
@@ -1220,18 +1242,21 @@ class QueryWorkflowPlanner:
         metrics: list[dict[str, Any]] = []
         seen: set[str] = set()
 
-        def add(name: Any, role: str, source: str) -> None:
+        def add(name: Any, role: str, source: str, method: str = "structured_slot") -> None:
             if not isinstance(name, str) or not name.strip():
                 return
             key = self._metric_key(name)
             if not key or key in seen:
                 return
             seen.add(key)
+            heuristic = method != "structured_slot" or source in {"query_phrase", "query_rank_phrase", "intended_dimensions.event"}
             metrics.append({
                 "name": self._metric_display_name(name),
                 "role": role,
                 "source": source,
                 "availability": "unknown",
+                "extraction_method": method,
+                "caller_must_verify_with_kosis_meta": heuristic,
             })
 
         add(dimensions.get("indicator"), "primary", "intended_dimensions")
@@ -1249,14 +1274,14 @@ class QueryWorkflowPlanner:
         compact_query = _compact_text(query)
         for phrase in metric_phrases:
             if _compact_text(phrase) in compact_query:
-                add(phrase, "mentioned", "query_phrase")
+                add(phrase, "mentioned", "query_phrase", "heuristic_phrase_match")
 
         if not metrics and dimensions.get("event"):
-            add(dimensions["event"], "primary", "intended_dimensions.event")
+            add(dimensions["event"], "primary", "intended_dimensions.event", "event_fallback")
         if not metrics and "통계" in compact_query:
             match = re.search(r"([가-힣A-Za-z0-9·/()]+통계)", str(query))
             if match:
-                add(match.group(1), "mentioned", "query_phrase")
+                add(match.group(1), "mentioned", "query_phrase", "heuristic_regex")
         if not metrics and any(term in compact_query for term in ("상위", "하위", "순위", "top")):
             match = re.search(
                 r"^\s*(.+?)\s*(?:상위|하위|순위|Top|TOP|top)",
@@ -1265,8 +1290,36 @@ class QueryWorkflowPlanner:
             if match:
                 candidate = re.sub(r"^(시도별|지역별|업종별|산업별|성별|연령별)\s*", "", match.group(1).strip())
                 candidate = re.sub(r"\s+(기준|관련)$", "", candidate).strip(" -·/")
-                add(candidate, "mentioned", "query_rank_phrase")
+                add(candidate, "mentioned", "query_rank_phrase", "heuristic_rank_phrase")
         return metrics
+
+    @staticmethod
+    def _heuristic_extraction_warnings(
+        raw_metrics: list[dict[str, Any]],
+        dimensions: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        for metric in raw_metrics:
+            if metric.get("caller_must_verify_with_kosis_meta"):
+                warnings.append({
+                    "field": "metrics",
+                    "value": metric.get("name"),
+                    "source": metric.get("source"),
+                    "extraction_method": metric.get("extraction_method"),
+                    "marker": "heuristic_extraction",
+                    "caller_action": "verify against KOSIS metadata via select_table_for_query/resolve_concepts before using as evidence",
+                })
+        for key in ("region_group", "industry", "event"):
+            if dimensions.get(key):
+                warnings.append({
+                    "field": f"intended_dimensions.{key}",
+                    "value": dimensions.get(key),
+                    "source": "planner_extraction",
+                    "extraction_method": "semantic_candidate",
+                    "marker": "heuristic_extraction",
+                    "caller_action": "treat as a search/concept candidate, not a KOSIS code or domain definition",
+                })
+        return warnings
 
     @staticmethod
     def _bundle_dimensions(

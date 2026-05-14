@@ -212,6 +212,33 @@ def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Optional[list[str]] = None) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    result = dict(payload)
+    existing_contract = result.get("mcp_output_contract") if isinstance(result.get("mcp_output_contract"), dict) else {}
+    existing_signals = existing_contract.get("current_signals") if isinstance(existing_contract, dict) else {}
+    markers = list(existing_signals.get("markers_present") or []) if isinstance(existing_signals, dict) else []
+    markers.append("deprecation")
+    if ignored_params:
+        markers.append("dropped_dimensions")
+        markers.append("partial_fulfillment")
+    if result.get("오류") or result.get("status") in {"failed", "unsupported"}:
+        markers.append("unsupported")
+    result["mcp_output_contract"] = _mcp_tool_output_contract(
+        role="deprecated_shortcut",
+        final_answer_expected=False,
+        markers=markers,
+        explanation=f"{tool} is a shortcut compatibility tool; prefer the stepwise evidence pipeline for chatbot answers.",
+        extra_signals={
+            "tool": tool,
+            "recommended_replacement": "plan_query",
+            "ignored_params": ignored_params or [],
+        },
+    )
+    return result
+
+
 def _mcp_tool_output_contract(
     *,
     role: str,
@@ -222,6 +249,40 @@ def _mcp_tool_output_contract(
 ) -> dict[str, Any]:
     """Machine-readable contract shared by non-planner MCP tool outputs."""
     clean_markers = list(dict.fromkeys(markers or []))
+    marker_guidance_catalog = {
+        "unsupported": "Do not synthesize an answer; correct the request or choose another tool.",
+        "invalid_input": "Fix the caller-provided arguments before retrying.",
+        "missing_api_key": "Configure KOSIS_API_KEY or pass api_key; do not fabricate data.",
+        "missing_denominator": "Provide denominator_rows from verified raw data before calculating ratios.",
+        "not_matched": "Treat the result as no verified match; search or ask for clarification.",
+        "search_empty": "Report that no KOSIS search candidates were found; do not invent a table.",
+        "concept_unresolved": "Use matches_by_concept/ambiguities or ask for a more specific concept.",
+        "missing_metrics": "Ask for or infer a statistical metric before selecting a table.",
+        "validation_errors": "Inspect validation_errors and retry with corrected structured arguments.",
+        "partial_fanout_coverage": "Disclose missing filter sets and avoid treating returned rows as complete coverage.",
+        "complete_fanout_miss": "Report that verified calls returned no rows; do not backfill from model knowledge.",
+        "max_fanout_exceeded": "Reduce filters or split the query into smaller calls.",
+        "fanout_call_failed": "Inspect fanout.call_details errors/timeouts before using any partial rows.",
+        "period_not_found": "Use available_period_range or suggested_period_range before retrying.",
+        "period_type_mismatch": "Convert the requested period to the table cadence shown in period_format_examples.",
+        "invalid_period_format": "Normalize natural-language time to KOSIS period codes before retrying query_table.",
+        "duplicate_denominator_key": "Resolve duplicate denominator rows; do not choose one silently.",
+        "non_numeric_aggregation_input": "Disclose dropped rows and avoid presenting aggregation as complete.",
+        "aggregation_dropped_rows": "Inspect aggregation_report before using summed values.",
+        "period_metadata_missing": "Treat period validation as unavailable and disclose the limitation.",
+        "projection_data": "Label values as projection/forecast when answering.",
+        "unit_caller_resolution_required": "Resolve the computed unit from unit_transformation before quoting.",
+        "share_total_from_input_rows": "Disclose that the denominator was derived from input_rows, not an external total.",
+        "share_total_grouped_by_period": "Interpret share results within each period group, not across all periods.",
+        "deprecation": "Prefer the recommended replacement workflow/tool.",
+        "formula_advisory_only": "Treat formula guidance as advisory; verify numerator/denominator from KOSIS metadata/raw rows.",
+        "heuristic_extraction": "Treat extracted concepts as candidates only; verify with KOSIS metadata before use.",
+    }
+    marker_guidance = {
+        marker: marker_guidance_catalog[marker]
+        for marker in clean_markers
+        if marker in marker_guidance_catalog
+    }
     has_failures = any(marker in {
         "unsupported",
         "invalid_input",
@@ -258,6 +319,8 @@ def _mcp_tool_output_contract(
     }
     if extra_signals:
         current_signals.update(extra_signals)
+    if marker_guidance:
+        current_signals["marker_guidance"] = marker_guidance
     return {
         "role": role,
         "final_answer_expected": final_answer_expected,
@@ -265,6 +328,7 @@ def _mcp_tool_output_contract(
         "current_signals": current_signals,
         "llm_rules": [
             "Do not hide unsupported, not_matched, empty_rows, validation_errors, or partial_fanout_coverage markers.",
+            "Follow current_signals.marker_guidance for every marker before synthesizing a user-facing answer.",
             "If coverage_ratio is below 1.0, disclose partial coverage before using the returned rows.",
             "Do not fill missing rows from model knowledge.",
             "If unit_caller_should_label is null, resolve the unit before quoting; do not reuse unit_raw as the computed result unit.",
@@ -2528,7 +2592,8 @@ async def quick_stat(
     """
     ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_stat_core(query, region, period, api_key)
-    return _attach_ignored_params(result, ignored_params, "quick_stat")
+    result = _attach_ignored_params(result, ignored_params, "quick_stat")
+    return _attach_shortcut_contract(result, tool="quick_stat", ignored_params=ignored_params)
 
 
 async def _quick_stat_core(
@@ -3983,6 +4048,12 @@ async def indicator_dependency_map(indicator: str) -> dict:
                 "필요_통계": spec["required_stats"],
                 "검증_포인트": spec["checks"],
                 "주의": spec["caution"],
+                "advisory_scope": "formula_dependency_only",
+                "caller_must_verify": [
+                    "KOSIS metadata contains the numerator and denominator concepts",
+                    "query_table raw rows share compatible period, unit, and population scope",
+                    "caller has selected the correct formula operation before compute_indicator",
+                ],
             }
             subgroup = next((label for term, label in subgroup_terms if term in indicator), None)
             if subgroup and key == "unemployment_rate":
@@ -3996,6 +4067,16 @@ async def indicator_dependency_map(indicator: str) -> dict:
                     f"{subgroup} 실업자",
                     f"{subgroup} 경제활동인구",
                 ]
+            result["mcp_output_contract"] = _mcp_tool_output_contract(
+                role="dependency_advisory",
+                final_answer_expected=False,
+                markers=["formula_advisory_only"],
+                explanation="indicator_dependency_map only suggests formula dependencies; it does not verify a table, concept code, or raw value.",
+                extra_signals={
+                    "dependency_key": key,
+                    "caller_must_verify": result["caller_must_verify"],
+                },
+            )
             return result
 
     route_payload = _route_query(indicator).to_agent_payload()
@@ -4007,6 +4088,15 @@ async def indicator_dependency_map(indicator: str) -> dict:
         "추천_검색어": route_payload["route"].get("search_terms", []),
         "의도": route_payload.get("intents", []),
         "검증": route_payload.get("validation", {}),
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="dependency_advisory",
+            final_answer_expected=False,
+            markers=["missing_denominator", "formula_advisory_only"],
+            explanation="The formula dependency could not be determined from advisory patterns; caller must define numerator/denominator explicitly.",
+            extra_signals={
+                "recommended_next_step": "Use plan_query/select_table_for_query/resolve_concepts to verify concepts from KOSIS metadata.",
+            },
+        ),
     }
 
 

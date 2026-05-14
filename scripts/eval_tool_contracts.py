@@ -683,6 +683,16 @@ async def test_plan_query_empty_and_nonstat_need_clarification() -> None:
     assert weather["evidence_workflow"] == [], weather
 
 
+async def test_plan_query_heuristic_extraction_is_marked() -> None:
+    result = await kosis_mcp_server.plan_query("반도체 수출액 알려줘")
+    warnings = result.get("heuristic_extraction_warnings") or []
+    assert warnings, result
+    assert any(warning.get("field") == "intended_dimensions.industry" for warning in warnings), result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "heuristic_extraction" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["marker_guidance"]["heuristic_extraction"], result
+
+
 async def test_resolve_concepts_ambiguity_best_selection_reason() -> None:
     original_fetch_meta = kosis_mcp_server._fetch_meta
 
@@ -735,6 +745,49 @@ def test_answer_query_deprecated_contract() -> None:
     markers = contract["current_signals"]["markers_present"]
     assert "partial_fulfillment" in markers, markers
     assert contract["current_signals"]["dropped_dimensions"] == ["aggregation"], contract
+
+
+def test_marker_guidance_in_contract() -> None:
+    contract = kosis_mcp_server._mcp_tool_output_contract(
+        role="test",
+        final_answer_expected=False,
+        markers=["invalid_period_format", "duplicate_denominator_key"],
+    )
+    guidance = contract["current_signals"]["marker_guidance"]
+    assert "invalid_period_format" in guidance, contract
+    assert "duplicate_denominator_key" in guidance, contract
+
+
+async def test_quick_stat_shortcut_contract() -> None:
+    original_core = kosis_mcp_server._quick_stat_core
+
+    async def fake_core(*_: Any, **__: Any) -> dict[str, Any]:
+        return {"상태": "executed", "answer": "stub"}
+
+    try:
+        kosis_mcp_server._quick_stat_core = fake_core  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_stat(
+            "인구",
+            extra_params={"industry": "반도체"},
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._quick_stat_core = original_core  # type: ignore[assignment]
+
+    contract = result["mcp_output_contract"]
+    assert contract["role"] == "deprecated_shortcut", result
+    markers = contract["current_signals"]["markers_present"]
+    assert "deprecation" in markers, markers
+    assert "dropped_dimensions" in markers, markers
+
+
+async def test_indicator_dependency_map_is_advisory_contract() -> None:
+    result = await kosis_mcp_server.indicator_dependency_map("폐업률")
+    contract = result["mcp_output_contract"]
+    assert contract["role"] == "dependency_advisory", result
+    markers = contract["current_signals"]["markers_present"]
+    assert "formula_advisory_only" in markers, markers
+    assert result["advisory_scope"] == "formula_dependency_only", result
 
 
 async def test_query_table_invalid_filter_has_contract() -> None:
@@ -1029,9 +1082,13 @@ async def main() -> None:
         ("plan_normalized_metric_refs", lambda: test_plan_query_normalized_metric_references_are_synced()),
         ("plan_change_inference_log", lambda: test_plan_query_change_implication_inference_log()),
         ("plan_empty_nonstat_clarification", lambda: test_plan_query_empty_and_nonstat_need_clarification()),
+        ("plan_heuristic_extraction_marker", lambda: test_plan_query_heuristic_extraction_is_marked()),
         ("resolve_ambiguity_reason", lambda: test_resolve_concepts_ambiguity_best_selection_reason()),
         ("resolve_empty_contract", lambda: test_resolve_concepts_empty_list_has_contract()),
         ("answer_query_deprecated_contract", lambda: test_answer_query_deprecated_contract()),
+        ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
+        ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),
+        ("indicator_dependency_advisory_contract", lambda: test_indicator_dependency_map_is_advisory_contract()),
         ("query_table_invalid_filter_contract", lambda: test_query_table_invalid_filter_has_contract()),
         ("query_table_period_error_contract", lambda: test_query_table_period_error_has_contract_and_format_guidance()),
         ("query_table_invalid_period_format", lambda: test_query_table_rejects_unparsed_period_text()),
