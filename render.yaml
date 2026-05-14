@@ -8,3 +8,13 @@ services:
     envVars:
       - key: KOSIS_API_KEY
         sync: false
+      - key: KOSIS_MCP_AUTH_TOKEN
+        sync: false
+      - key: KOSIS_MCP_META_CACHE_TTL
+        value: "3600"
+      - key: KOSIS_MCP_QUERY_TABLE_MAX_FANOUT
+        value: "80"
+      - key: KOSIS_MCP_QUERY_TABLE_CONCURRENCY
+        value: "8"
+      - key: KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT
+        value: "15"

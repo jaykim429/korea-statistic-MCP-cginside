@@ -597,13 +597,17 @@ def _fanout_coverage_report(
     missing_filter_sets: list[dict[str, list[str]]] = []
     missing_codes_by_axis: dict[str, list[str]] = {}
     successful_calls = 0
+    failed_calls = 0
 
     for filter_set, group in zip(fanout_filters, row_groups):
         row_count = len(group) if isinstance(group, list) else 0
-        status = "returned_rows" if row_count > 0 else "empty_result"
+        error = group.get("_error") if isinstance(group, dict) else None
+        status = "returned_rows" if row_count > 0 else "failed" if error else "empty_result"
         if row_count > 0:
             successful_calls += 1
         else:
+            if error:
+                failed_calls += 1
             missing_filter_sets.append(filter_set)
             for axis, codes in filter_set.items():
                 bucket = missing_codes_by_axis.setdefault(axis, [])
@@ -614,6 +618,8 @@ def _fanout_coverage_report(
             "filters": filter_set,
             "row_count": row_count,
             "status": status,
+            **({"error": error} if error else {}),
+            **({"timeout_seconds": group.get("_timeout_seconds")} if isinstance(group, dict) and group.get("_timeout_seconds") else {}),
         })
 
     call_count = len(fanout_filters)
@@ -623,6 +629,7 @@ def _fanout_coverage_report(
     return {
         "call_count": call_count,
         "successful_calls": successful_calls,
+        "failed_calls": failed_calls,
         "empty_results": empty_results,
         "coverage_ratio": round(coverage_ratio, 4),
         "partial_coverage": partial_coverage,

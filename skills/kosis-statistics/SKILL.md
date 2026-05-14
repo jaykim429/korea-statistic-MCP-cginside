@@ -6,7 +6,11 @@ policy/business interpretation.
 
 ## Tool Routing
 
-- Start with `answer_query` for natural-language questions.
+- Start with `plan_query` for chatbot-style natural-language statistics questions,
+  then follow `select_table_for_query`, `resolve_concepts`, `query_table`, and
+  `compute_indicator` when the plan asks for evidence collection.
+- Use `answer_query` only as a quick Tier A compatibility shortcut. Treat its
+  `deprecation_warning` and `검증_주의` fields as load-bearing.
 - Use `verify_stat_claims` after `answer_query` when a numeric answer is used in
   a report, policy memo, or user-facing conclusion.
 - Use `indicator_dependency_map` before answering ratio/rate questions such as

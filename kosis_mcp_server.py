@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Any, Optional
@@ -119,6 +120,27 @@ STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
 STATUS_INVALID_PERIOD_RANGE = "INVALID_PERIOD_RANGE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
 STATUS_RUNTIME_ERROR = "RUNTIME_ERROR"
+STATUS_MISSING_API_KEY = "MISSING_KEY"
+STATUS_FANOUT_LIMIT_EXCEEDED = "FANOUT_LIMIT_EXCEEDED"
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+QUERY_TABLE_MAX_FANOUT = _env_int("KOSIS_MCP_QUERY_TABLE_MAX_FANOUT", 80)
+QUERY_TABLE_CONCURRENCY = _env_int("KOSIS_MCP_QUERY_TABLE_CONCURRENCY", 8)
+QUERY_TABLE_CALL_TIMEOUT = _env_float("KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT", 15.0)
 
 GEMMA_DEPRECATED_TOOL_WARNING = {
     "tool": "answer_query",
@@ -168,11 +190,21 @@ def _mcp_tool_output_contract(
     clean_markers = list(dict.fromkeys(markers or []))
     has_failures = any(marker in {
         "unsupported",
+        "invalid_input",
+        "missing_api_key",
+        "missing_denominator",
         "not_matched",
+        "search_empty",
+        "concept_unresolved",
         "missing_metrics",
         "validation_errors",
         "partial_fanout_coverage",
+        "complete_fanout_miss",
+        "max_fanout_exceeded",
+        "runtime_error",
+        "metadata_failed",
         "empty_rows",
+        "partial_computation",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -197,13 +229,46 @@ def _mcp_tool_output_contract(
         ],
         "failure_markers": [
             "unsupported",
+            "invalid_input",
+            "missing_api_key",
+            "missing_denominator",
             "not_matched",
+            "search_empty",
             "validation_errors",
             "partial_fanout_coverage",
+            "complete_fanout_miss",
+            "max_fanout_exceeded",
             "empty_rows",
             "coverage_ratio",
         ],
     }
+
+
+def _missing_api_key_response(tool: str, **context: Any) -> dict[str, Any]:
+    """Return a structured MCP payload instead of surfacing a ToolError."""
+    clean_context = {k: v for k, v in context.items() if v not in (None, "")}
+    return {
+        "상태": "failed",
+        "status": "failed",
+        "코드": STATUS_MISSING_API_KEY,
+        "code": STATUS_MISSING_API_KEY,
+        "tool": tool,
+        "error": "KOSIS_API_KEY is required.",
+        "오류": "KOSIS_API_KEY 설정 필요",
+        "권고": "서버 환경변수 KOSIS_API_KEY를 설정하거나 도구 호출에 api_key를 전달하세요.",
+        **clean_context,
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="configuration_error",
+            final_answer_expected=False,
+            markers=["missing_api_key"],
+            explanation="The tool cannot call KOSIS without an API key.",
+            extra_signals={"tool": tool},
+        ),
+    }
+
+
+def _is_missing_key_error(exc: Exception) -> bool:
+    return "KOSIS_API_KEY" in str(exc)
 
 FORMULA_DEPENDENCIES: dict[str, dict[str, Any]] = {
     "share_ratio": {
@@ -2244,7 +2309,7 @@ _QUICK_STAT_SUPPORTED_PARAMS = frozenset({"query", "region", "period", "api_key"
 async def quick_stat(
     query: str, region: str = "전국", period: str = "latest",
     api_key: Optional[str] = None,
-    **unsupported: Any,
+    extra_params: Optional[dict[str, Any]] = None,
 ) -> dict:
     """[⚡] 자연어로 통계 단일값 즉시 조회.
 
@@ -2259,12 +2324,11 @@ async def quick_stat(
                 (Seoul, 서울특별시, 서울시 → 서울).
         period: "latest" 또는 "2023", "2023.03", "작년", "올해"
 
-    지원하지 않는 파라미터(예: industry, scale, sector)는 응답의
-    `⚠️ 무시된_파라미터` 필드에 노출됩니다. 해당 슬라이싱은 자연어
-    `query`에 키워드를 포함하거나 search_kosis로 통계표를 직접
-    선택해야 합니다.
+    extra_params: 빠른 단일값 도구가 직접 지원하지 않는 보조 조건.
+        예: {"industry": "제조업"}. 실제 슬라이싱에는 사용하지 않고,
+        응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
     """
-    ignored_params = sorted(k for k in unsupported if k not in _QUICK_STAT_SUPPORTED_PARAMS)
+    ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_stat_core(query, region, period, api_key)
     return _attach_ignored_params(result, ignored_params, "quick_stat")
 
@@ -2273,7 +2337,12 @@ async def _quick_stat_core(
     query: str, region: str = "전국", period: str = "latest",
     api_key: Optional[str] = None,
 ) -> dict:
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("quick_stat", query=query, region=region, period=period)
+        raise
     param = _lookup_quick(query)
     query_region = _extract_single_region_from_query(query)
     if region == "전국" and query_region:
@@ -2500,7 +2569,7 @@ async def _quick_stat_core(
 async def quick_trend(
     query: str, region: str = "전국", years: int = 10,
     api_key: Optional[str] = None,
-    **unsupported: Any,
+    extra_params: Optional[dict[str, Any]] = None,
 ) -> dict:
     """[⚡] 시계열 데이터 조회 (분석/시각화 입력으로 사용).
 
@@ -2509,10 +2578,10 @@ async def quick_trend(
         region: 지역 (영문·풀네임 자동 정규화)
         years: 최근 N년 (기본 10)
 
-    지원하지 않는 파라미터는 quick_stat과 동일하게 응답의
-    `⚠️ 무시된_파라미터` 필드에 노출됩니다.
+    extra_params는 quick_stat과 동일하게 실제 슬라이싱에 사용하지 않고
+    응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
     """
-    ignored_params = sorted(k for k in unsupported if k not in {"query", "region", "years", "api_key"})
+    ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_trend_core(query, region, years, api_key)
     return _attach_ignored_params(result, ignored_params, "quick_trend")
 
@@ -2523,7 +2592,12 @@ async def _quick_trend_core(
     start_year: Optional[str] = None,
     end_year: Optional[str] = None,
 ) -> dict:
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("quick_trend", query=query, region=region, years=years)
+        raise
     param = _lookup_quick(query)
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
@@ -2593,14 +2667,14 @@ async def quick_region_compare(
     period: str = "latest",
     sort: str = "desc",
     api_key: Optional[str] = None,
-    **unsupported: Any,
+    extra_params: Optional[dict[str, Any]] = None,
 ) -> dict:
     """[⚡] 지역/시도별 값을 한 번에 비교.
 
     지역 분류가 검증된 Tier A 통계만 지원합니다. 예:
     "중소기업 사업체수", "소상공인 사업체수", "실업률".
     """
-    ignored_params = sorted(k for k in unsupported if k not in {"query", "period", "sort", "api_key"})
+    ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_region_compare_core(query, period, sort, api_key)
     return _attach_ignored_params(result, ignored_params, "quick_region_compare")
 
@@ -2609,7 +2683,12 @@ async def _quick_region_compare_core(
     query: str, period: str = "latest", sort: str = "desc",
     api_key: Optional[str] = None,
 ) -> dict:
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("quick_region_compare", query=query, period=period, sort=sort)
+        raise
     param = _lookup_quick(query)
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
@@ -3411,7 +3490,14 @@ async def answer_query(
     select_table_for_query → resolve_concepts → query_table → compute_indicator
     절차형 파이프라인을 우선 사용한다.
     """
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _attach_gemma_deprecation_warning(
+                _missing_api_key_response("answer_query", query=query, region=region)
+            )
+        raise
     engine = NaturalLanguageAnswerEngine(key)
     try:
         result = await engine.answer(query, region)
@@ -3522,7 +3608,18 @@ async def stat_time_compare(
     """
     explicit_periods = bool(start_period and end_period)
     if explicit_periods:
-        key = _resolve_key(api_key)
+        try:
+            key = _resolve_key(api_key)
+        except RuntimeError as exc:
+            if _is_missing_key_error(exc):
+                return _missing_api_key_response(
+                    "stat_time_compare",
+                    query=query,
+                    region=region,
+                    start_period=start_period,
+                    end_period=end_period,
+                )
+            raise
         param = _lookup_quick(query)
         if not param:
             return {
@@ -3723,7 +3820,12 @@ async def _search_kosis_keywords(
     api_key: Optional[str] = None,
     used_routing: bool = False,
 ) -> dict:
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("search_kosis", query=query, limit=limit)
+        raise
     keywords = [
         keyword.strip()
         for keyword in keywords
@@ -3904,7 +4006,17 @@ async def resolve_concepts(
             "오류": "concepts는 비어 있지 않은 리스트여야 합니다.",
         }
 
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response(
+                "resolve_concepts",
+                org_id=org_id,
+                tbl_id=tbl_id,
+                concepts=concepts,
+            )
+        raise
     async with httpx.AsyncClient() as client:
         try:
             name_rows, item_rows = await asyncio.gather(
@@ -4071,7 +4183,17 @@ async def select_table_for_query(
         *(required_dimensions or []),
         *inferred_dimensions,
     ])
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response(
+                "select_table_for_query",
+                query=query,
+                required_dimensions=required,
+                indicator=indicator,
+            )
+        raise
     explicit_indicator = indicator.strip() if isinstance(indicator, str) and indicator.strip() else None
     query_text = query.strip() if isinstance(query, str) else ""
     if explicit_indicator:
@@ -4393,7 +4515,18 @@ async def query_table(
             "allowed_aggregations": ["none", "sum_by_group"],
         }
 
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response(
+                "query_table",
+                org_id=org_id,
+                tbl_id=tbl_id,
+                filters=filters,
+                period_range=period_range,
+            )
+        raise
     fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     async with httpx.AsyncClient() as client:
         try:
@@ -4491,22 +4624,68 @@ async def query_table(
         normalized_rows_from_fanout: list[dict[str, Any]] = []
         try:
             fanout_filters = _fanout_filter_sets(normalized_filters)
-            row_groups = await asyncio.gather(*[
-                _kosis_call(
-                    client,
-                    "Param/statisticsParameterData.do",
-                    {
-                        **_query_table_params(
-                            org_id,
-                            tbl_id,
-                            filter_set,
-                            axis_order,
-                            effective_period_range,
-                            period_type,
-                        ),
-                        "apiKey": key,
+            if len(fanout_filters) > QUERY_TABLE_MAX_FANOUT:
+                return {
+                    "상태": "failed",
+                    "status": "unsupported",
+                    "코드": STATUS_FANOUT_LIMIT_EXCEEDED,
+                    "code": STATUS_FANOUT_LIMIT_EXCEEDED,
+                    "error": (
+                        f"query_table fan-out would create {len(fanout_filters)} KOSIS calls, "
+                        f"above the configured limit {QUERY_TABLE_MAX_FANOUT}."
+                    ),
+                    "오류": (
+                        f"query_table fan-out 호출 수가 {len(fanout_filters)}개로 제한 "
+                        f"{QUERY_TABLE_MAX_FANOUT}개를 초과합니다."
+                    ),
+                    "filters_used": normalized_filters,
+                    "fanout": {
+                        "planned_call_count": len(fanout_filters),
+                        "max_allowed": QUERY_TABLE_MAX_FANOUT,
+                        "concurrency": QUERY_TABLE_CONCURRENCY,
+                        "per_call_timeout_seconds": QUERY_TABLE_CALL_TIMEOUT,
                     },
-                )
+                    "권고": "필터 코드를 줄여 나눠 호출하거나 KOSIS_MCP_QUERY_TABLE_MAX_FANOUT 값을 조정하세요.",
+                    "metadata_source": metadata_source,
+                    "mcp_output_contract": _mcp_tool_output_contract(
+                        role="raw_extraction",
+                        final_answer_expected=False,
+                        markers=["max_fanout_exceeded"],
+                        explanation="The requested raw extraction was rejected before KOSIS calls to prevent call explosion.",
+                        extra_signals={
+                            "planned_call_count": len(fanout_filters),
+                            "max_allowed": QUERY_TABLE_MAX_FANOUT,
+                        },
+                    ),
+                }
+
+            semaphore = asyncio.Semaphore(QUERY_TABLE_CONCURRENCY)
+
+            async def fetch_filter_set(filter_set: dict[str, list[str]]) -> Any:
+                params = {
+                    **_query_table_params(
+                        org_id,
+                        tbl_id,
+                        filter_set,
+                        axis_order,
+                        effective_period_range,
+                        period_type,
+                    ),
+                    "apiKey": key,
+                }
+                async with semaphore:
+                    try:
+                        return await asyncio.wait_for(
+                            _kosis_call(client, "Param/statisticsParameterData.do", params),
+                            timeout=QUERY_TABLE_CALL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        return {"_error": "timeout", "_timeout_seconds": QUERY_TABLE_CALL_TIMEOUT}
+                    except Exception as exc:
+                        return {"_error": f"{type(exc).__name__}: {exc}"}
+
+            row_groups = await asyncio.gather(*[
+                fetch_filter_set(filter_set)
                 for filter_set in fanout_filters
             ])
             for filter_set, group in zip(fanout_filters, row_groups):
@@ -4553,6 +4732,10 @@ async def query_table(
     contract_markers: list[str] = []
     if fanout_report.get("partial_coverage"):
         contract_markers.append("partial_fanout_coverage")
+    if fanout_report.get("complete_miss"):
+        contract_markers.append("complete_fanout_miss")
+    if fanout_report.get("failed_calls"):
+        contract_markers.append("fanout_call_failed")
     if not normalized_rows:
         contract_markers.append("empty_rows")
     result = {
@@ -4582,6 +4765,9 @@ async def query_table(
         "fanout": {
             "enabled": any(len(codes) > 1 for codes in normalized_filters.values()),
             **fanout_report,
+            "max_allowed": QUERY_TABLE_MAX_FANOUT,
+            "concurrency": QUERY_TABLE_CONCURRENCY,
+            "per_call_timeout_seconds": QUERY_TABLE_CALL_TIMEOUT,
             "reason": "KOSIS multi-code parameters can fail with code 21, so the server uses verified single-code calls.",
         },
         "rows": normalized_rows,
@@ -4623,6 +4809,7 @@ async def query_table(
             extra_signals={
                 "coverage_ratio": fanout_report.get("coverage_ratio"),
                 "successful_calls": fanout_report.get("successful_calls"),
+                "failed_calls": fanout_report.get("failed_calls"),
                 "empty_results": fanout_report.get("empty_results"),
             },
         ),
@@ -4806,7 +4993,12 @@ async def explore_table(
             "오류": "org_id와 tbl_id가 모두 필요합니다.",
             "권고": "search_kosis 응답의 통계표ID·기관ID 필드를 사용",
         }
-    key = _resolve_key(api_key)
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("explore_table", org_id=org_id, tbl_id=tbl_id)
+        raise
     async with httpx.AsyncClient() as client:
         async def safe_fetch(meta_type: str, extra: Optional[dict] = None) -> Any:
             try:

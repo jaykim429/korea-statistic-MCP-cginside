@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Optional
 
 import httpx
@@ -8,6 +9,17 @@ import httpx
 KOSIS_BASE = "https://kosis.kr/openapi"
 API_KEY_DEFAULT = os.environ.get("KOSIS_API_KEY", "")
 HTTP_TIMEOUT = 30.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default) or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+META_CACHE_TTL = _env_float("KOSIS_MCP_META_CACHE_TTL", 3600.0)
+_META_CACHE: dict[tuple[Any, ...], tuple[float, list[dict]]] = {}
 
 ERROR_MAP = {
     # Official KOSIS API error codes
@@ -88,7 +100,21 @@ async def _fetch_meta(
     }
     if extra_params:
         params.update(extra_params)
-    return await _kosis_call(client, "statisticsData.do", params)
+    cache_key = (
+        org_id,
+        tbl_id,
+        meta_type,
+        tuple((key, str(value)) for key, value in sorted((extra_params or {}).items())),
+    )
+    now = time.time()
+    if META_CACHE_TTL > 0:
+        cached = _META_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return [dict(row) for row in cached[1]]
+    rows = await _kosis_call(client, "statisticsData.do", params)
+    if META_CACHE_TTL > 0:
+        _META_CACHE[cache_key] = (now + META_CACHE_TTL, [dict(row) for row in rows])
+    return rows
 
 
 async def _fetch_classifications(

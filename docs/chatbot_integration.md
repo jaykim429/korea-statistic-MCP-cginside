@@ -16,6 +16,7 @@ Gemma 기본 manifest에는 아래 도구만 노출하는 것을 권장합니다
   선택된 표의 코드 후보로 변환합니다.
 - `explore_table`: 표의 축과 코드 메타데이터가 더 필요할 때 사용합니다.
 - `query_table`: 검증된 `OBJ_ID`/`ITM_ID` 필터로 KOSIS 원자료를 추출합니다.
+- `compute_indicator`: `query_table.rows`에 허용된 산식 enum만 적용합니다.
 - `search_kosis`: 표 후보가 필요하지만 `select_table_for_query`가 충분하지
   않을 때만 사용합니다.
 

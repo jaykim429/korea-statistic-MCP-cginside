@@ -292,6 +292,7 @@ async def test_compute_indicator_unknown_operation_is_rejected() -> None:
     assert result["status"] == "invalid_input", result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "invalid_input" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["has_failures"] is True, result
     assert "growth_rate" in result["valid_operations"], result
 
 
@@ -327,6 +328,97 @@ async def test_search_kosis_preserves_original_query() -> None:
     assert result["original_query_preserved"] is True, result
 
 
+async def test_quick_tool_schemas_do_not_require_unsupported() -> None:
+    tools = await kosis_mcp_server.mcp.list_tools()
+    by_name = {tool.name: tool.inputSchema for tool in tools}
+    for name in ("quick_stat", "quick_trend", "quick_region_compare"):
+        schema = by_name[name]
+        assert "unsupported" not in (schema.get("required") or []), schema
+        assert "unsupported" not in (schema.get("properties") or {}), schema
+        assert "extra_params" in (schema.get("properties") or {}), schema
+
+
+async def test_missing_api_key_returns_structured_payload() -> None:
+    import kosis_analysis.client as client_mod
+
+    original_default = client_mod.API_KEY_DEFAULT
+    try:
+        client_mod.API_KEY_DEFAULT = ""
+        result = await kosis_mcp_server.search_kosis("인구")
+    finally:
+        client_mod.API_KEY_DEFAULT = original_default
+
+    assert result["status"] == "failed", result
+    assert result["code"] == "MISSING_KEY", result
+    assert result["mcp_output_contract"]["current_signals"]["has_failures"] is True, result
+
+
+async def test_query_table_fanout_limit_rejects_before_raw_call() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+    original_call = kosis_mcp_server._kosis_call
+    original_limit = kosis_mcp_server.QUERY_TABLE_MAX_FANOUT
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "임의 표"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": "지표"},
+                {"OBJ_ID": "A", "OBJ_NM": "지역", "ITM_ID": "11", "ITM_NM": "서울"},
+                {"OBJ_ID": "A", "OBJ_NM": "지역", "ITM_ID": "21", "ITM_NM": "부산"},
+                {"OBJ_ID": "B", "OBJ_NM": "성별", "ITM_ID": "1", "ITM_NM": "남자"},
+                {"OBJ_ID": "B", "OBJ_NM": "성별", "ITM_ID": "2", "ITM_NM": "여자"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}]
+        return []
+
+    async def fake_call(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        raise AssertionError("raw KOSIS call should not run after fanout-limit rejection")
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        kosis_mcp_server.QUERY_TABLE_MAX_FANOUT = 2
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_FAKE",
+            filters={"ITEM": ["T1"], "A": ["11", "21"], "B": ["1", "2"]},
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+        kosis_mcp_server.QUERY_TABLE_MAX_FANOUT = original_limit
+
+    assert result["code"] == "FANOUT_LIMIT_EXCEEDED", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "max_fanout_exceeded" in markers, markers
+
+
+async def test_http_auth_middleware_requires_token_when_configured() -> None:
+    from kosis_http_server import OptionalBearerAuthMiddleware
+
+    async def dummy_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run_scope(headers: list[tuple[bytes, bytes]], path: str = "/mcp") -> int:
+        statuses: list[int] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                statuses.append(int(message["status"]))
+
+        app = OptionalBearerAuthMiddleware(dummy_app, "secret")
+        await app({"type": "http", "path": path, "headers": headers}, None, send)
+        return statuses[0]
+
+    assert await run_scope([]) == 401
+    assert await run_scope([(b"authorization", b"Bearer secret")]) == 204
+    assert await run_scope([], "/healthz") == 200
+
+
 async def main() -> None:
     tests = [
         ("fanout_partial_coverage", lambda: test_fanout_partial_coverage()),
@@ -343,6 +435,10 @@ async def main() -> None:
         ("compute_unknown_operation", lambda: test_compute_indicator_unknown_operation_is_rejected()),
         ("compute_indicator_in_planner", lambda: test_compute_indicator_in_planner_available_tools()),
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
+        ("quick_schema_no_unsupported", lambda: test_quick_tool_schemas_do_not_require_unsupported()),
+        ("missing_key_structured", lambda: test_missing_api_key_returns_structured_payload()),
+        ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
+        ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
     ]
     passed = 0
     for name, fn in tests:
