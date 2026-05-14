@@ -687,6 +687,31 @@ async def test_plan_query_extracts_multiple_indicators() -> None:
     assert "indicator_candidates" not in single.get("intended_dimensions", {}), single
 
 
+async def test_plan_query_marks_unsupported_request_shapes() -> None:
+    cases = [
+        ("내일 서울 인구 알려줘", "near_future_period_requested"),
+        ("2050년 실제 출생아 수 알려줘", "future_actual_requested"),
+        ("전국 모든 산업의 실시간 매출 알려줘", "realtime_not_supported"),
+        ("윤석열 정부 정책 때문에 폐업률이 얼마나 올랐는지 증명해줘", "causal_claim_requested"),
+        ("다음 달 물가 상승률 예측값을 공식 통계로 알려줘", "forecast_requested_as_official"),
+        ("2024년 1분기 연간 합계출산율 알려줘", "period_granularity_conflict"),
+        ("GDP랑 월급이랑 출산율이랑 날씨를 합쳐서 하나의 점수로 계산해줘", "custom_composite_score_requested"),
+    ]
+    for query, expected_marker in cases:
+        result = await kosis_mcp_server.plan_query(query)
+        signals = result["mcp_output_contract"]["current_signals"]
+        markers = signals["markers_present"]
+        assert expected_marker in markers, result
+        assert expected_marker in signals["request_risk_markers"], result
+        assert signals["marker_guidance"].get(expected_marker), result
+        assert result.get("request_risk_signals"), result
+
+    composite = await kosis_mcp_server.plan_query("GDP랑 월급이랑 출산율이랑 날씨를 합쳐서 하나의 점수로 계산해줘")
+    composite_markers = composite["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "multi_metric_request" in composite_markers, composite
+    assert len(composite.get("metrics") or []) >= 2, composite
+
+
 async def test_plan_query_change_implication_inference_log() -> None:
     original_normalize = kosis_mcp_server._normalize_indicator_from_kosis_meta
 
@@ -1117,6 +1142,7 @@ async def main() -> None:
         ("plan_indicator_normalization", lambda: test_plan_query_indicator_normalization_from_kosis_meta()),
         ("plan_normalized_metric_refs", lambda: test_plan_query_normalized_metric_references_are_synced()),
         ("plan_multi_indicator_extraction", lambda: test_plan_query_extracts_multiple_indicators()),
+        ("plan_request_risk_markers", lambda: test_plan_query_marks_unsupported_request_shapes()),
         ("plan_change_inference_log", lambda: test_plan_query_change_implication_inference_log()),
         ("plan_empty_nonstat_clarification", lambda: test_plan_query_empty_and_nonstat_need_clarification()),
         ("plan_heuristic_extraction_marker", lambda: test_plan_query_heuristic_extraction_is_marked()),

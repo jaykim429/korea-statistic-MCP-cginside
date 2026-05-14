@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 from kosis_curation import (
@@ -115,7 +116,7 @@ class QueryWorkflowPlanner:
     }
     GENERIC_ROUTER_INDICATORS = {"비중", "비율", "구성비", "증가율", "감소율", "변화율"}
     MULTI_INDICATOR_SPLIT_RE = re.compile(
-        r"[,;/|·\n]+|\s+(?:그리고|및|또는|또|랑|하고)\s+",
+        r"[,;/|·\n]+|\s*(?:그리고|및|또는|또|이랑|랑|하고)\s+",
         re.IGNORECASE,
     )
     TIME_GROUP_BY_TERMS = {
@@ -163,6 +164,7 @@ class QueryWorkflowPlanner:
         conflict_decisions = metric_decisions + self._time_conflict_decisions(dimensions, route_payload)
         consistency_warnings = self._legacy_consistency_warnings(conflict_decisions)
         heuristic_extraction_warnings = self._heuristic_extraction_warnings(raw_metrics, dimensions)
+        request_risk_signals = self._request_risk_signals(query, dimensions, metrics, calculations)
 
         confidence = "medium"
         if dimensions.get("indicator") and table_required:
@@ -170,7 +172,14 @@ class QueryWorkflowPlanner:
         elif route_payload.get("route", {}).get("type") == "miss":
             confidence = "low"
         if self._needs_clarification(dimensions, concepts, calculations, route_payload, metrics, analysis_tasks):
-            return self._clarification_response(query, dimensions, concepts, calculations, route_payload)
+            return self._clarification_response(
+                query,
+                dimensions,
+                concepts,
+                calculations,
+                route_payload,
+                request_risk_signals=request_risk_signals,
+            )
 
         workflow = self._workflow(query, intent, table_required, concepts, dimensions, calculations)
 
@@ -194,6 +203,7 @@ class QueryWorkflowPlanner:
             "metrics": metrics,
             "raw_metric_candidates": raw_metrics,
             "heuristic_extraction_warnings": heuristic_extraction_warnings,
+            "request_risk_signals": request_risk_signals,
             "quarantined_metrics": quarantined_metrics,
             "dimensions": bundle_dimensions,
             "comparison_targets": comparison_targets,
@@ -216,6 +226,7 @@ class QueryWorkflowPlanner:
                 conflict_decisions=conflict_decisions,
                 analysis_tasks=analysis_tasks,
                 heuristic_extraction_warnings=heuristic_extraction_warnings,
+                request_risk_signals=request_risk_signals,
             ),
             "recommended_tool_manifest": self._tool_manifest_profile(),
             "canonical_fields": {
@@ -289,6 +300,7 @@ class QueryWorkflowPlanner:
         concepts: list[str],
         calculations: list[str],
         route_payload: dict[str, Any],
+        request_risk_signals: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         route = route_payload.get("route") or {}
         route_intents = (
@@ -311,6 +323,7 @@ class QueryWorkflowPlanner:
             "analysis_mode": "needs_clarification",
             "evidence_bundle": False,
             "metrics": [],
+            "request_risk_signals": request_risk_signals or [],
             "dimensions": [],
             "comparison_targets": [],
             "time_request": None,
@@ -333,6 +346,7 @@ class QueryWorkflowPlanner:
                 quarantined_metrics=[],
                 conflict_decisions=[],
                 analysis_tasks=[],
+                request_risk_signals=request_risk_signals or [],
             ),
             "recommended_tool_manifest": QueryWorkflowPlanner._tool_manifest_profile(),
             "canonical_fields": {
@@ -396,6 +410,7 @@ class QueryWorkflowPlanner:
         conflict_decisions: list[dict[str, Any]],
         analysis_tasks: list[dict[str, Any]],
         heuristic_extraction_warnings: Optional[list[dict[str, Any]]] = None,
+        request_risk_signals: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         current_signals = QueryWorkflowPlanner._current_failure_signals(
             metrics=metrics,
@@ -404,6 +419,7 @@ class QueryWorkflowPlanner:
             analysis_tasks=analysis_tasks,
             role=role,
             heuristic_extraction_warnings=heuristic_extraction_warnings or [],
+            request_risk_signals=request_risk_signals or [],
         )
         return {
             "role": role,
@@ -416,6 +432,7 @@ class QueryWorkflowPlanner:
                 "Do not invent values for metrics whose availability is unknown, weak, missing, or unsupported.",
                 "Use metrics, quarantined_metrics, conflict_decisions, and time_request when deciding the next tool call.",
                 "If a follow-up tool returns unsupported or empty rows, report that limitation instead of filling the gap from prior knowledge.",
+                "If request_risk_signals is non-empty, disclose the limitation and do not satisfy unsupported inference, realtime, future-actual, or custom-score requests as official statistics.",
             ],
             "failure_markers": [
                 "needs_clarification",
@@ -437,6 +454,7 @@ class QueryWorkflowPlanner:
         analysis_tasks: list[dict[str, Any]],
         role: str,
         heuristic_extraction_warnings: Optional[list[dict[str, Any]]] = None,
+        request_risk_signals: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         unknown_metrics = [
             metric.get("name")
@@ -464,6 +482,15 @@ class QueryWorkflowPlanner:
         heuristic_warnings = heuristic_extraction_warnings or []
         if heuristic_metrics or heuristic_warnings:
             markers.append("heuristic_extraction")
+        risk_signals = request_risk_signals or []
+        risk_markers = [
+            str(signal.get("marker"))
+            for signal in risk_signals
+            if isinstance(signal, dict) and signal.get("marker")
+        ]
+        for marker in risk_markers:
+            if marker not in markers:
+                markers.append(marker)
         return {
             "has_failures": bool(quarantined_metrics or not metrics or role == "clarification_required"),
             "has_caveats": bool(markers),
@@ -476,12 +503,23 @@ class QueryWorkflowPlanner:
             "unknown_metrics": unknown_metrics,
             "heuristic_metrics": heuristic_metrics,
             "heuristic_extraction_warning_count": len(heuristic_warnings),
+            "request_risk_signal_count": len(risk_signals),
+            "request_risk_markers": risk_markers,
+            "request_risk_signals": risk_signals,
             "marker_guidance": {
                 "heuristic_extraction": "Treat extracted metrics/dimensions as candidates only; verify with KOSIS metadata before using as evidence.",
                 "metric_availability_unverified": "Call select_table_for_query and resolve_concepts before query_table.",
                 "multi_metric_request": "Treat each metric as a separate table-selection/query path unless KOSIS metadata proves they share one table.",
                 "missing_metrics": "Ask for or infer a statistical metric before selecting a table.",
                 "quarantined_metrics": "Do not use quarantined metrics unless the user explicitly confirms them.",
+                "future_actual_requested": "Official observed statistics cannot answer future actual values; use projection data only if explicitly selected and label it as projection.",
+                "near_future_period_requested": "Near-future periods such as tomorrow or next month are unlikely to exist in KOSIS; verify period availability before answering.",
+                "realtime_not_supported": "KOSIS is not a realtime feed; do not present realtime values unless a source explicitly supports them.",
+                "causal_claim_requested": "KOSIS descriptive statistics alone cannot prove causality; report association or raw evidence only.",
+                "forecast_requested_as_official": "Do not label forecasts or predictions as official observed statistics unless the table metadata identifies projection data.",
+                "custom_composite_score_requested": "Do not invent a composite score formula; require caller/user-defined weights and formula before computing.",
+                "period_granularity_conflict": "The query mixes incompatible period granularities; verify table cadence and ask for a clear period if needed.",
+                "dimension_scope_mismatch_possible": "Requested demographic/industry dimensions may not belong to the same statistical population; verify table axes before querying.",
             },
             "explanation": (
                 "The planner could not identify an executable metric. Ask a more specific statistical question."
@@ -1409,6 +1447,100 @@ class QueryWorkflowPlanner:
                     "caller_action": "treat as a search/concept candidate, not a KOSIS code or domain definition",
                 })
         return warnings
+
+    @staticmethod
+    def _request_risk_signals(
+        query: str,
+        dimensions: dict[str, Any],
+        metrics: list[dict[str, Any]],
+        calculations: list[str],
+    ) -> list[dict[str, Any]]:
+        """Surface unsupported request shapes without deciding the final answer."""
+        text = str(query or "")
+        compact = _compact_text(text)
+        signals: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(marker: str, reason: str, evidence: str, caller_action: str) -> None:
+            if marker in seen:
+                return
+            seen.add(marker)
+            signals.append({
+                "marker": marker,
+                "reason": reason,
+                "evidence": evidence,
+                "caller_action": caller_action,
+            })
+
+        current_year = datetime.now().year
+        years = [
+            int(match)
+            for match in re.findall(r"(?:19|20)\d{2}", text)
+            if match.isdigit()
+        ]
+        future_years = [year for year in years if year > current_year]
+        actual_terms = ("실제", "실측", "확정", "관측", "공식")
+        if future_years and any(term in compact for term in actual_terms):
+            add(
+                "future_actual_requested",
+                "The query asks for observed/official actual values in a future period.",
+                f"future_years={future_years}",
+                "Do not answer as observed data; verify projection metadata or ask for an available observed period.",
+            )
+        if any(term in compact for term in ("내일", "다음달", "다음월", "익월", "다음분기")):
+            add(
+                "near_future_period_requested",
+                "The query asks for a near-future period that KOSIS usually cannot contain as observed data.",
+                "near-future temporal expression",
+                "Verify period availability; if unavailable, say the official statistic is not yet available.",
+            )
+        if any(term in compact for term in ("실시간", "현재실시간", "라이브", "즉시")):
+            add(
+                "realtime_not_supported",
+                "The query asks for realtime data, but KOSIS tables are periodic official statistics.",
+                "realtime cue",
+                "Do not present KOSIS as realtime; query only published periods.",
+            )
+        if any(term in compact for term in ("때문", "인과", "원인", "영향", "효과", "증명", "입증")):
+            add(
+                "causal_claim_requested",
+                "The query asks to prove a cause/effect claim from descriptive statistics.",
+                "causal/proof cue",
+                "Provide descriptive evidence only; do not claim causality without an external causal design.",
+            )
+        if any(term in compact for term in ("예측", "전망", "forecast", "prediction")) and any(term in compact for term in ("공식", "통계", "확정", "실제")):
+            add(
+                "forecast_requested_as_official",
+                "The query asks for a forecast while also requesting official/actual statistics.",
+                "forecast plus official-stat cue",
+                "Use projection tables only when metadata identifies them; label forecasts separately from observed statistics.",
+            )
+        if any(term in compact for term in ("합쳐서", "종합", "하나의점수", "점수", "스코어", "지수화")) and (
+            len(metrics) > 1 or "score" in compact.lower() or "점수" in compact
+        ):
+            add(
+                "custom_composite_score_requested",
+                "The query asks for a custom composite score without a verified formula or weights.",
+                "custom score/composite cue",
+                "Do not invent weights or formulas; ask caller/user to define the formula before compute_indicator.",
+            )
+        if any(term in compact for term in ("1분기", "2분기", "3분기", "4분기", "분기")) and any(term in compact for term in ("연간", "연도", "년간")):
+            add(
+                "period_granularity_conflict",
+                "The query mixes quarterly and annual period granularity.",
+                "quarterly and annual cues both present",
+                "Verify table cadence or ask whether the caller wants quarterly data or annual data.",
+            )
+        has_person_dimension = bool(dimensions.get("age") or dimensions.get("sex"))
+        has_scope_dimension = bool(dimensions.get("industry") or dimensions.get("region_group"))
+        if has_person_dimension and has_scope_dimension:
+            add(
+                "dimension_scope_mismatch_possible",
+                "The query combines person-level demographic dimensions with industry/group scope dimensions.",
+                "age/sex plus industry/region_group dimensions",
+                "Verify that a single KOSIS table supports all requested axes before querying.",
+            )
+        return signals
 
     @staticmethod
     def _bundle_dimensions(
