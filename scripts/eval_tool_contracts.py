@@ -182,6 +182,31 @@ async def test_explore_table_contract_on_stale_period() -> None:
     assert contract["current_signals"]["period_age_years"] >= 1.0, contract
 
 
+async def test_explore_table_marks_period_metadata_inconsistent() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str, extra: Any = None) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "fake"}]
+        if kind == "ITM":
+            return [{"OBJ_ID": "A", "OBJ_NM": "item", "ITM_ID": "T1", "ITM_NM": "value"}]
+        if kind == "PRD":
+            return [{"PRD_SE": "M", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}]
+        if kind == "SOURCE":
+            return [{"DEPT_NM": "x"}]
+        return []
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server.explore_table("101", "TBL_FAKE", api_key="dummy")
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "period_type_inconsistent" in markers, markers
+    assert result["period_metadata_inconsistencies"], result
+
+
 async def test_search_kosis_contract_on_empty_results() -> None:
     """search_kosis must surface search_empty marker when no candidates are returned."""
     original_hints = kosis_mcp_server._routing_hints
@@ -359,6 +384,17 @@ async def test_compute_indicator_sum_rejects_mixed_units() -> None:
     assert "unit_mismatch" in markers, markers
     assert "unit_conversion_required" in markers, markers
     assert result["computation_metadata"]["unit_profile"]["mixed_source_systems"] is True, result
+
+
+async def test_compute_indicator_sum_labels_multiple_items() -> None:
+    rows = [
+        _make_row("2024", "10", "00", "All", item_code="A", item_label="Revenue", unit="억원"),
+        _make_row("2024", "20", "00", "All", item_code="B", item_label="Expense", unit="억원"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="sum_additive_rows", input_rows=rows)
+    assert result["status"] == "ok", result
+    assert result["results"][0]["label"] == "sum: Revenue + Expense", result
+    assert result["results"][0]["inputs"]["summed_labels"] == ["Revenue", "Expense"], result
 
 
 async def test_compute_indicator_share_rejects_mixed_input_total_units() -> None:
@@ -1401,6 +1437,50 @@ async def test_nabo_search_uses_catalog_fallback_for_contained_table_name() -> N
     assert "catalog_fallback_search" in markers, markers
 
 
+async def test_nabo_search_uses_item_catalog_fallback() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+    kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+    kosis_mcp_server.NABO_ITEM_CATALOG_CACHE.clear()
+
+    async def fake_fetch(service: str, key: str, params: Any = None, *, max_rows: int = 5000) -> dict[str, Any]:
+        if service == "Sttsapitbl":
+            params = params or {}
+            if params.get("STATBL_NM"):
+                return {"status": "executed", "total_count": 0, "rows": []}
+            return {
+                "status": "executed",
+                "total_count": 1,
+                "rows": [{"STATBL_ID": "N1", "STATBL_NM": "Fiscal Accounts", "DTACYCLE_NM": "Year"}],
+            }
+        if service == "Sttsapitblitm":
+            return {
+                "status": "executed",
+                "total_count": 1,
+                "rows": [{
+                    "STATBL_ID": "N1",
+                    "ITM_ID": "I1",
+                    "ITM_NM": "Integrated Fiscal Balance",
+                    "ITM_FULLNM": "Fiscal balance>Integrated Fiscal Balance",
+                    "UI_NM": "trillion KRW",
+                }],
+            }
+        return {"status": "executed", "total_count": 0, "rows": []}
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_nabo_tables("Integrated Fiscal Balance", api_key="dummy")
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+        kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+        kosis_mcp_server.NABO_ITEM_CATALOG_CACHE.clear()
+
+    assert result["status"] == "executed", result
+    assert result["tables"][0]["table_id"] == "N1", result
+    assert result["tables"][0]["matched_items"][0]["item_name"] == "Integrated Fiscal Balance", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "item_catalog_search" in markers, markers
+
+
 def test_nabo_table_search_metric_promotion_requires_metadata_support() -> None:
     assert kosis_mcp_server._nabo_table_candidates_support_query(
         "national debt",
@@ -1466,6 +1546,32 @@ async def test_nabo_query_marks_missing_values() -> None:
     assert result["mcp_output_contract"]["current_signals"]["has_failures"] is True, result
 
 
+async def test_nabo_terms_marks_definition_quality() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+
+    async def fake_fetch(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "status": "executed",
+            "total_count": 1,
+            "rows": [{
+                "DIC_SEQ": "D1",
+                "DIC_TITLE": "Fiscal Balance Ratio",
+                "DIC_CONTENT": "Fiscal Balance Ratio",
+            }],
+        }
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_nabo_terms("Fiscal Balance Ratio", api_key="dummy")
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "truncated_definition" in markers, markers
+    assert "low_definition_specificity" in markers, markers
+    assert result["terms"][0]["definition_quality"]["markers"], result
+
+
 async def test_plan_query_routes_explicit_nabo_source() -> None:
     original_search_terms = kosis_mcp_server.search_nabo_terms
     original_search_tables = kosis_mcp_server.search_nabo_tables
@@ -1517,11 +1623,13 @@ async def test_plan_query_routes_explicit_nabo_source() -> None:
     assert {"관리재정수지", "국가채무"} <= metric_names, result
     assert "GDP디플레이터" not in metric_names, result
     assert result["next_call"]["tool"] == "search_nabo_tables", result
+    assert "fiscal balance" in result["suggested_clarification_questions"][0], result
     workflow_tools = {step.get("tool") for step in result["evidence_workflow"] if step.get("tool")}
     assert {"search_nabo_tables", "explore_nabo_table", "query_nabo_table"} <= workflow_tools, result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "source_preference_nabo" in markers, markers
     assert "nabo_routing" in markers, markers
+    assert "router_intended_dim_mismatch" in markers, markers
 
 
 async def test_nabo_query_accepts_period_range_forms() -> None:
@@ -1858,6 +1966,7 @@ async def test_nabo_query_truncation_does_not_claim_dataset_latest() -> None:
     assert result["latest_period_is_complete"] is False, result
     assert "truncated_by_max_rows" in markers, markers
     assert "partial_fanout_coverage" not in markers, markers
+    assert result["pagination"]["next_call_hint"]["args"]["max_rows"] == 20, result
 
 
 async def test_nabo_query_marks_partial_filter_match() -> None:
@@ -1977,6 +2086,7 @@ async def main() -> None:
         ("select_table_query_fallback", lambda: test_select_table_falls_back_to_query_indicator()),
         ("resolve_concepts_contract", lambda: test_resolve_concepts_contract_on_unresolved()),
         ("explore_table_stale_contract", lambda: test_explore_table_contract_on_stale_period()),
+        ("explore_table_period_inconsistent", lambda: test_explore_table_marks_period_metadata_inconsistent()),
         ("search_kosis_empty_contract", lambda: test_search_kosis_contract_on_empty_results()),
         ("compute_growth_rate", lambda: test_compute_indicator_growth_rate()),
         ("compute_growth_rate_single_row_reason", lambda: test_compute_indicator_growth_rate_single_row_has_reason()),
@@ -1986,6 +2096,7 @@ async def main() -> None:
         ("compute_share_input_total", lambda: test_compute_indicator_share_uses_input_total()),
         ("compute_share_period_grouping", lambda: test_compute_indicator_share_groups_input_total_by_period()),
         ("compute_sum_mixed_units", lambda: test_compute_indicator_sum_rejects_mixed_units()),
+        ("compute_sum_labels", lambda: test_compute_indicator_sum_labels_multiple_items()),
         ("compute_share_mixed_units", lambda: test_compute_indicator_share_rejects_mixed_input_total_units()),
         ("compute_duplicate_denominator", lambda: test_compute_indicator_duplicate_denominator_key_is_not_silent()),
         ("compute_yoy_pct_intra_year", lambda: test_compute_indicator_yoy_pct_matches_intra_year()),
@@ -2027,9 +2138,11 @@ async def main() -> None:
         ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
         ("nabo_search_query_normalization", lambda: test_nabo_search_and_query_normalization()),
         ("nabo_catalog_fallback_search", lambda: test_nabo_search_uses_catalog_fallback_for_contained_table_name()),
+        ("nabo_item_catalog_fallback_search", lambda: test_nabo_search_uses_item_catalog_fallback()),
         ("nabo_table_search_metric_support", lambda: test_nabo_table_search_metric_promotion_requires_metadata_support()),
         ("nabo_unknown_filter", lambda: test_nabo_query_rejects_unknown_filter_key()),
         ("nabo_missing_values", lambda: test_nabo_query_marks_missing_values()),
+        ("nabo_term_definition_quality", lambda: test_nabo_terms_marks_definition_quality()),
         ("nabo_period_range_forms", lambda: test_nabo_query_accepts_period_range_forms()),
         ("nabo_nullish_period", lambda: test_nabo_query_rejects_nullish_period_string_without_raw_exception()),
         ("nabo_invalid_filters_shape", lambda: test_nabo_query_rejects_invalid_filters_shape_without_raw_exception()),

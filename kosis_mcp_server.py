@@ -187,6 +187,7 @@ NABO_DTACYCLE_GUIDANCE = {
 }
 NABO_ITEM_META_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 NABO_TABLE_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
+NABO_ITEM_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
 
 ANSWER_QUERY_CONVENIENCE_NOTE = {
     "tool": "answer_query",
@@ -383,6 +384,12 @@ def _mcp_tool_output_contract(
         "nabo_metadata_candidate": "NABO metadata supplied candidate metrics; verify table/items before values.",
         "nabo_metadata_partial": "NABO metadata lookup was partial; treat candidates as unverified.",
         "catalog_fallback_search": "NABO API table-name search was empty; candidates came from local catalog substring/metadata scoring.",
+        "item_catalog_search": "NABO table candidates were found through item-name metadata, not table title alone.",
+        "metric_extraction_low_confidence": "Metric candidates came from weak search evidence; verify with metadata before querying values.",
+        "router_intended_dim_mismatch": "Planner router slots and intended dimensions disagree or one side is missing; prefer metadata-verified metrics.",
+        "truncated_definition": "Dictionary definition appears incomplete; avoid treating it as authoritative without another source.",
+        "low_definition_specificity": "Dictionary definition is too short or generic for high-stakes distinction; verify scope/standard.",
+        "period_type_inconsistent": "Period metadata cadence and period-code shape disagree; inspect period rows before choosing period format.",
     }
     marker_guidance = {
         marker: marker_guidance_catalog[marker]
@@ -424,6 +431,7 @@ def _mcp_tool_output_contract(
         "unit_mismatch",
         "unit_conversion_required",
         "unsupported_source_system",
+        "period_type_inconsistent",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -652,6 +660,40 @@ def _period_error_guidance(
             "auto_aggregation_not_supported": True,
         },
     }
+
+
+def _period_code_shape(period_code: Any) -> Optional[str]:
+    text = re.sub(r"\D", "", str(period_code or ""))
+    if len(text) == 4:
+        return "Y"
+    if len(text) == 5:
+        suffix = text[4:]
+        if suffix in {"1", "2", "3", "4"}:
+            return "Q"
+        return "H"
+    if len(text) == 6:
+        return "M"
+    return None
+
+
+def _period_metadata_inconsistencies(period_rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(period_rows, list):
+        return []
+    issues: list[dict[str, Any]] = []
+    for row in period_rows:
+        if not isinstance(row, dict):
+            continue
+        cadence = _api_period_type(row.get("PRD_SE") or row.get("prdSe"))
+        for field in ("STRT_PRD_DE", "END_PRD_DE", "PRD_DE", "strtPrdDe", "endPrdDe", "prdDe"):
+            shape = _period_code_shape(row.get(field))
+            if shape and cadence and shape != cadence:
+                issues.append({
+                    "field": field,
+                    "period_code": row.get(field),
+                    "declared_cadence": cadence,
+                    "period_code_shape": shape,
+                })
+    return issues
 
 
 def _period_range_format_error(
@@ -1535,19 +1577,85 @@ async def _nabo_table_catalog(key: str) -> list[dict[str, Any]]:
     return tables
 
 
+async def _nabo_item_catalog(key: str) -> list[dict[str, Any]]:
+    cache_key = "all"
+    if cache_key in NABO_ITEM_CATALOG_CACHE:
+        return NABO_ITEM_CATALOG_CACHE[cache_key]
+    payload = await _nabo_fetch_rows("Sttsapitblitm", key, {"pSize": NABO_MAX_PAGE_SIZE}, max_rows=50000)
+    items = [_nabo_item_record(row) for row in payload.get("rows", [])]
+    NABO_ITEM_CATALOG_CACHE[cache_key] = items
+    return items
+
+
+def _nabo_item_match_score(query: Any, item: dict[str, Any]) -> int:
+    q = _compact_text(str(query or ""))
+    if len(q) < 2:
+        return 0
+    name = _compact_text(str(item.get("item_name") or ""))
+    full_name = _compact_text(str(item.get("item_full_name") or ""))
+    for text, exact_score, contains_score in ((full_name, 98, 90), (name, 96, 88)):
+        if not text:
+            continue
+        if text == q:
+            return exact_score
+        if len(text) >= 2 and text in q:
+            return contains_score
+        if len(q) >= 3 and q in text:
+            return contains_score - 4
+    return 0
+
+
 async def _nabo_catalog_fallback_search(query: str, key: str, limit: int) -> dict[str, Any]:
     catalog = await _nabo_table_catalog(key)
+    by_table_id = {str(table.get("table_id") or ""): table for table in catalog}
     scored = [
         {**table, "catalog_match_score": score, "search_match_source": "nabo_table_catalog"}
         for table in catalog
         for score in [_nabo_catalog_match_score(query, table)]
         if score > 0
     ]
+    item_error = None
+    try:
+        item_matches: dict[str, dict[str, Any]] = {}
+        for item in await _nabo_item_catalog(key):
+            score = _nabo_item_match_score(query, item)
+            if score <= 0:
+                continue
+            table_id = str(item.get("table_id") or "")
+            if not table_id:
+                continue
+            base = by_table_id.get(table_id) or {"table_id": table_id, "source_system": "NABO"}
+            entry = item_matches.setdefault(table_id, {
+                **base,
+                "catalog_match_score": score,
+                "search_match_source": "nabo_item_catalog",
+                "matched_items": [],
+            })
+            entry["catalog_match_score"] = max(int(entry.get("catalog_match_score") or 0), score)
+            entry["matched_items"].append({
+                "item_id": item.get("item_id"),
+                "item_name": item.get("item_name"),
+                "item_full_name": item.get("item_full_name"),
+                "unit": item.get("unit"),
+                "match_score": score,
+            })
+        by_scored_id = {str(table.get("table_id") or ""): table for table in scored}
+        for table_id, item_table in item_matches.items():
+            existing = by_scored_id.get(table_id)
+            if existing:
+                existing["catalog_match_score"] = max(int(existing.get("catalog_match_score") or 0), int(item_table.get("catalog_match_score") or 0))
+                existing["search_match_source"] = "nabo_table_and_item_catalog"
+                existing["matched_items"] = item_table.get("matched_items") or []
+            else:
+                scored.append(item_table)
+    except Exception as exc:
+        item_error = str(exc)
     scored.sort(key=lambda table: (-int(table.get("catalog_match_score") or 0), str(table.get("table_name") or ""), str(table.get("table_id") or "")))
     return {
         "tables": scored[:limit],
         "total_count": len(scored),
         "catalog_size": len(catalog),
+        "item_catalog_error": item_error,
     }
 
 
@@ -6260,6 +6368,23 @@ async def _apply_nabo_source_routing(plan: dict[str, Any], query: str, nabo_api_
     }
     metric_names = [metric.get("name") for metric in plan.get("metrics") or [] if isinstance(metric, dict) and metric.get("name")]
     if metric_names:
+        router_indicator = str(slots.get("indicator") or "").strip()
+        if router_indicator and _metric_name_key(router_indicator) != _metric_name_key(metric_names[0]):
+            plan.setdefault("conflict_decisions", []).append({
+                "type": "router_intended_dim_mismatch",
+                "router_indicator": router_indicator,
+                "metadata_metric": metric_names[0],
+                "resolution": "metadata_verified_metric_preferred",
+                "policy": "explicit_source_metadata_over_router_slot",
+            })
+        elif not router_indicator and (match_info.get("term_matches") or match_info.get("table_matches")):
+            plan.setdefault("conflict_decisions", []).append({
+                "type": "router_intended_dim_mismatch",
+                "router_indicator": None,
+                "metadata_metric": metric_names[0],
+                "resolution": "metadata_metric_used_with_verification_required",
+                "policy": "explicit_source_metadata_candidate",
+            })
         dimensions["indicator"] = metric_names[0]
         dimensions["indicator_candidates"] = [
             {
@@ -6274,6 +6399,11 @@ async def _apply_nabo_source_routing(plan: dict[str, Any], query: str, nabo_api_
     _sync_analysis_tasks_to_metrics(plan)
     workflow = _nabo_suggested_workflow(plan, query)
     plan["suggested_workflow"] = workflow
+    plan["suggested_clarification_questions"] = [
+        "Which NABO fiscal/economic indicator should be used? Examples: fiscal balance, national debt, expenditure budget, debt-to-GDP ratio.",
+        "Which period do you want? Examples: latest, 2020-2024, recent 5 years.",
+        "Which basis should be preserved? Examples: settlement, budget, supplementary budget, GDP ratio.",
+    ]
     plan["next_call"] = workflow[0] if workflow else None
     plan["evidence_workflow"] = _nabo_evidence_workflow(plan)
     policy = plan.setdefault("metric_availability_policy", {})
@@ -6283,6 +6413,11 @@ async def _apply_nabo_source_routing(plan: dict[str, Any], query: str, nabo_api_
     markers = ["source_preference_nabo", "nabo_routing"]
     if match_info.get("term_matches") or match_info.get("table_matches"):
         markers.append("nabo_metadata_candidate")
+    if any(metric.get("source") in {"nabo_table_search", "nabo_query_candidate"} for metric in plan.get("metrics") or [] if isinstance(metric, dict)):
+        markers.append("metric_extraction_low_confidence")
+    if plan.get("conflict_decisions"):
+        if any(item.get("type") == "router_intended_dim_mismatch" for item in plan.get("conflict_decisions") or [] if isinstance(item, dict)):
+            markers.append("router_intended_dim_mismatch")
     if match_info.get("errors"):
         markers.append("nabo_metadata_partial")
     return markers
@@ -6539,12 +6674,24 @@ async def search_nabo_tables(
     markers = ["search_empty"] if not tables else []
     if catalog_fallback.get("tables"):
         markers.append("catalog_fallback_search")
+        if any(str(table.get("search_match_source") or "").find("item_catalog") >= 0 for table in tables):
+            markers.append("item_catalog_search")
     search_diagnostics = {
         "api_table_name_result_count": len(api_tables),
         "catalog_fallback_used": bool(catalog_fallback),
         "catalog_fallback_result_count": len(catalog_fallback.get("tables") or []),
         "catalog_size": catalog_fallback.get("catalog_size"),
         "catalog_fallback_error": catalog_fallback.get("error"),
+        "item_catalog_error": catalog_fallback.get("item_catalog_error"),
+    }
+    pagination = {
+        "result_count": len(tables),
+        "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
+        "truncated": payload.get("truncated", False),
+        "next_call_hint": {
+            "tool": "search_nabo_tables",
+            "args": {"query": query, "limit": min(NABO_MAX_PAGE_SIZE, max(safe_limit * 2, safe_limit + 1))},
+        } if (catalog_fallback.get("total_count", payload.get("total_count", len(tables))) or 0) > len(tables) else None,
     }
     return {
         "status": "executed" if tables else "needs_table_selection",
@@ -6554,6 +6701,7 @@ async def search_nabo_tables(
         "result_count": len(tables),
         "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
         "truncated": payload.get("truncated", False),
+        "pagination": pagination,
         "search_diagnostics": search_diagnostics,
         "tables": tables,
         "results": tables,
@@ -6572,6 +6720,7 @@ async def search_nabo_tables(
                 "result_count": len(tables),
                 "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
                 "search_diagnostics": search_diagnostics,
+                "pagination": pagination,
             },
         ),
     }
@@ -7058,6 +7207,23 @@ async def query_nabo_table(
             markers.append("all_values_missing")
     if payload.get("truncated"):
         markers.append("truncated_by_max_rows")
+    pagination = {
+        "row_count": len(rows),
+        "total_count": payload.get("total_count"),
+        "max_rows": payload.get("max_rows"),
+        "truncated": payload.get("truncated", False),
+        "next_call_hint": {
+            "tool": "query_nabo_table",
+            "args": {
+                "statbl_id": statbl_id,
+                "dtacycle_cd": cycle,
+                "period": period,
+                "period_range": period_range,
+                "filters": filters or {},
+                "max_rows": min(50000, max(int(payload.get("max_rows") or max_rows) * 2, int(payload.get("max_rows") or max_rows) + 1)),
+            },
+        } if payload.get("truncated") else None,
+    }
     status = "executed" if rows else "empty"
     return {
         "status": status,
@@ -7084,6 +7250,7 @@ async def query_nabo_table(
         "total_count": payload.get("total_count"),
         "max_rows": payload.get("max_rows"),
         "truncated": payload.get("truncated", False),
+        "pagination": pagination,
         "filters_applied": filters or {},
         "filter_coverage": filter_coverage,
         "missing_value_count": missing_value_count,
@@ -7114,6 +7281,7 @@ async def query_nabo_table(
                 "latest_period_is_complete": not bool(payload.get("truncated")),
                 "truncated": payload.get("truncated", False),
                 "truncated_by_max_rows": payload.get("truncated", False),
+                "pagination": pagination,
                 "missing_value_count": missing_value_count,
                 "missing_value_examples": missing_value_examples,
                 "dtacycle_resolution": cycle_resolution,
@@ -7125,6 +7293,32 @@ async def query_nabo_table(
                 "table_exists": table_exists,
             },
         ),
+    }
+
+
+def _nabo_definition_quality(title: Any, content: Any) -> dict[str, Any]:
+    title_text = str(title or "").strip()
+    content_text = str(content or "").strip()
+    markers: list[str] = []
+    reasons: list[str] = []
+    if content_text:
+        terminal = content_text[-1]
+        if terminal not in ".。.!?)]}다음함" and _compact_text(content_text).endswith(_compact_text(title_text)):
+            markers.append("truncated_definition")
+            reasons.append("definition_ends_with_term_title_without_sentence_boundary")
+        elif terminal not in ".。.!?)]}다음함" and len(content_text) >= 20:
+            markers.append("truncated_definition")
+            reasons.append("definition_has_no_terminal_sentence_boundary")
+        if len(_compact_text(content_text)) < 25:
+            markers.append("low_definition_specificity")
+            reasons.append("definition_is_short")
+    else:
+        markers.append("low_definition_specificity")
+        reasons.append("definition_empty")
+    return {
+        "markers": list(dict.fromkeys(markers)),
+        "reasons": reasons,
+        "content_length": len(content_text),
     }
 
 
@@ -7163,17 +7357,24 @@ async def search_nabo_terms(
                 extra_signals={"source_system": "NABO"},
             ),
         }
-    terms = [
-        {
+    terms = []
+    for row in payload.get("rows", []):
+        quality = _nabo_definition_quality(row.get("DIC_TITLE"), row.get("DIC_CONTENT"))
+        terms.append({
             "source_system": "NABO",
             "term_id": str(row.get("DIC_SEQ") or ""),
             "title": row.get("DIC_TITLE"),
             "content": row.get("DIC_CONTENT"),
+            "definition_quality": quality,
             "raw": row,
-        }
-        for row in payload.get("rows", [])
-    ]
+        })
     markers = ["search_empty"] if not terms else []
+    quality_markers = sorted({
+        marker
+        for term_row in terms
+        for marker in ((term_row.get("definition_quality") or {}).get("markers") or [])
+    })
+    markers.extend(quality_markers)
     return {
         "status": "executed" if terms else "empty",
         "source_system": "NABO",
@@ -7186,7 +7387,11 @@ async def search_nabo_terms(
             final_answer_expected=False,
             markers=markers,
             explanation="NABO dictionary search returns term definitions only.",
-            extra_signals={"source_system": "NABO", "result_count": len(terms)},
+            extra_signals={
+                "source_system": "NABO",
+                "result_count": len(terms),
+                "definition_quality_markers": quality_markers,
+            },
         ),
     }
 
@@ -8686,6 +8891,7 @@ async def explore_table(
 
     period_summary = None
     used_period = None
+    period_metadata_inconsistencies = _period_metadata_inconsistencies(period_rows)
     if isinstance(period_rows, list) and period_rows:
         latest = _pick_finest_period(period_rows)
         used_period = str(
@@ -8742,6 +8948,7 @@ async def explore_table(
         "수록기간": period_summary,
         "used_period": used_period,
         "period_age_years": period_age,
+        "period_metadata_inconsistencies": period_metadata_inconsistencies,
         "출처": contact,
         "분류축": classifications,
         "메타_완성도": metadata_coverage,
@@ -8796,6 +9003,8 @@ async def explore_table(
         explore_markers.append("metadata_partial")
     if period_age is not None and period_age >= 1.0:
         explore_markers.append("stale_metadata")
+    if period_metadata_inconsistencies:
+        explore_markers.append("period_type_inconsistent")
     if industry_term and not result.get("resolved_industry", {}).get("ITM_ID"):
         explore_markers.append("industry_unresolved")
     explore_explanation = (
@@ -8814,6 +9023,7 @@ async def explore_table(
             "period_age_years": period_age,
             "axis_count": len(classifications),
             "metadata_errors": list(meta_errors.keys()),
+            "period_metadata_inconsistencies": period_metadata_inconsistencies,
         },
     )
     return result

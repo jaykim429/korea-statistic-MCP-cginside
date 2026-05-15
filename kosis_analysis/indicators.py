@@ -85,6 +85,35 @@ def _row_label(row: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _item_label(row: dict[str, Any]) -> Optional[str]:
+    item = _row_dimensions(row).get("ITEM") or {}
+    return (
+        item.get("full_label")
+        or item.get("label")
+        or row.get("item_full_name")
+        or row.get("label")
+    )
+
+
+def _summed_rows_label(rows: Sequence[dict[str, Any]], fallback: Optional[str]) -> Optional[str]:
+    labels = []
+    seen = set()
+    for row in rows:
+        label = _item_label(row) or _row_label(row)
+        if not label:
+            continue
+        text = str(label)
+        if text in seen:
+            continue
+        seen.add(text)
+        labels.append(text)
+    if len(labels) >= 2:
+        shown = labels[:4]
+        suffix = f" + {len(labels) - len(shown)} more" if len(labels) > len(shown) else ""
+        return "sum: " + " + ".join(shown) + suffix
+    return labels[0] if labels else fallback
+
+
 def _row_unit(row: dict[str, Any]) -> Optional[str]:
     unit = row.get("unit")
     if unit:
@@ -835,10 +864,17 @@ class SumAdditiveRows(IndicatorOperation):
             outcome.results.append(IndicatorResult(
                 value=_round(bucket["total"], decimals),
                 period=period,
-                label=_row_label(sample),
+                label=_summed_rows_label(bucket["rows"], _row_label(sample)),
                 unit=bucket["unit"],
                 dimensions=projected_dims or sample_dims,
-                inputs={"row_count": bucket["count"], "group_codes": list(codes)},
+                inputs={
+                    "row_count": bucket["count"],
+                    "group_codes": list(codes),
+                    "summed_labels": [
+                        label for row in bucket["rows"]
+                        if (label := (_item_label(row) or _row_label(row)))
+                    ],
+                },
                 note="Caller asserted additivity; do not use this for rates/indices/averages.",
             ))
         outcome.markers.append("additivity_caller_asserted")
