@@ -556,12 +556,13 @@ def _normalize_query_table_rows(
                 "unit": meta.get("unit"),
             }
 
+        value_info = _normalize_stat_value(row.get("DT"))
         normalized_rows.append({
             "period": row.get("PRD_DE"),
-            "value": row.get("DT"),
             "unit": row.get("UNIT_NM") or (dimensions.get("ITEM") or {}).get("unit"),
             "dimensions": dimensions,
             "raw": row,
+            **value_info,
         })
     return normalized_rows
 
@@ -648,6 +649,38 @@ def _to_number(value: Any) -> Optional[float]:
         return float(text)
     except ValueError:
         return None
+
+
+def _normalize_stat_value(value: Any) -> dict[str, Any]:
+    """Split provider raw values from numeric values for safe downstream use."""
+    raw = value
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return {
+            "value": None,
+            "value_raw": raw,
+            "value_numeric": None,
+            "missing_reason": "empty",
+        }
+    try:
+        number = float(text)
+    except ValueError:
+        symbol = text
+        reason = "suppressed" if symbol in {"*", "＊"} else "non_numeric_symbol"
+        return {
+            "value": None,
+            "value_raw": raw,
+            "value_numeric": None,
+            "missing_reason": reason,
+            "symbol": symbol,
+        }
+    normalized = int(number) if number.is_integer() else number
+    return {
+        "value": normalized,
+        "value_raw": raw,
+        "value_numeric": normalized,
+        "missing_reason": None,
+    }
 
 
 def _aggregate_rows_sum_by_group(

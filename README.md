@@ -694,7 +694,7 @@ chart_line("고령인구", region="전국", years=5)
 - `confidence`: 값의 품질이 아니라 코드 매핑과 호출 조건의 검증 수준
 - `aggregation: "none"`
 - `metadata_source`: 검증에 사용한 KOSIS 메타 엔드포인트, 조회 시각, 원본 URL
-- `rows[]`: KOSIS 원행을 기간·값·단위·분류 차원과 함께 반환
+- `rows[]`: KOSIS 원행을 기간·값·단위·분류 차원과 함께 반환. `"*"`, `"-"` 같은 비수치·비공개 값은 `value: null`, `value_raw`, `value_numeric`, `missing_reason`으로 분리합니다.
 - `data_nature`, `period_nature`: 장래인구추계 같은 미래 추계값은 `projection_data` marker와 함께 실측값처럼 쓰지 않도록 표시
 
 잘못된 `OBJ_ID`나 `ITM_ID`가 들어오면 KOSIS 값을 호출하지 않고 `status: "unsupported"`, `validation_errors`, `suggested_codes`를 반환합니다.
@@ -707,6 +707,7 @@ chart_line("고령인구", region="전국", years=5)
 - `KOSIS_MCP_QUERY_TABLE_MAX_FANOUT`: `query_table` 다중 코드 fan-out 최대 호출 수. 기본 `80`.
 - `KOSIS_MCP_QUERY_TABLE_CONCURRENCY`: fan-out 동시 호출 수. 기본 `8`.
 - `KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT`: fan-out 개별 호출 timeout 초. 기본 `15`.
+- `KOSIS_MCP_DATA_FRESHNESS_WARNING_YEARS`: `⚠️ 데이터_신선도` 경고를 붙일 경과 연수 기준. 기본 `2.0`.
 
 `plan_query`는 실패도 표면화합니다:
 
@@ -741,7 +742,7 @@ chart_line("고령인구", region="전국", years=5)
 
 - `used_period`: 실제 사용된 KOSIS 시점 (예: `"2023"`, `"202603"`)
 - `period_age_years`: 현재 시점 대비 경과 연수 (실수)
-- `검증_주의`: 1년 이상 경과한 데이터, 의도와 응답 유형 불일치 (RANKING/SHARE_RATIO/GROWTH_RATE/TIME_SERIES/AVERAGE), 명시 연도 미준수, 다지역 의도 누락, "기업 수 ↔ 사업체 수" 모집단 silent 매핑 등에 자동 경고 추가
+- `검증_주의`: 기본 2년 이상 경과한 데이터, 의도와 응답 유형 불일치 (RANKING/SHARE_RATIO/GROWTH_RATE/TIME_SERIES/AVERAGE), 명시 연도 미준수, 다지역 의도 누락, "기업 수 ↔ 사업체 수" 모집단 silent 매핑 등에 자동 경고 추가
 
 `quick_stat`·`quick_trend`·`quick_region_compare` 직접 호출도 0.4.0부터 동일하게 `used_period`/`period_age_years`/`⚠️ 데이터_신선도` 필드를 노출합니다. answer_query와 직접 호출의 메타 풍부도 비대칭을 해소했습니다.
 
@@ -775,7 +776,8 @@ chart_line("고령인구", region="전국", years=5)
 0.6.0부터 KOSIS `getMeta` 엔드포인트를 직접 활용하는 메타/원자료 도구가 추가되었습니다:
 
 - `explore_table(org_id, tbl_id, industry_term?)` — 통계표 한 개의 `TBL`/`ITM`/`PRD`/`SOURCE` 메타를 **병렬**로 가져와 분류축(objL1~3) 아이템 카탈로그, 수록기간, 작성기관 연락처를 단일 응답으로 반환합니다. `industry_term`을 넘기면 `ITM_NM` 매칭으로 `ITM_ID`를 동적으로 해결해 quick_stat·직접 KOSIS 호출에 산업 코드를 하드코딩하지 않아도 됩니다.
-- `check_stat_availability(query, live_period_check=True)` — Tier A curation 메모뿐 아니라 KOSIS 메타 API의 실제 최신 수록 시점을 같이 조회합니다. 메모 스냅샷과 라이브 수록 시점이 어긋나면 `⚠️ 메모_vs_KOSIS_drift`, 데이터가 1년 이상 정체돼 있으면 `⚠️ 데이터_신선도`를 자동 첨부합니다.
+- `check_stat_availability(query, live_period_check=True)` — Tier A curation 메모뿐 아니라 KOSIS 메타 API의 실제 최신 수록 시점을 같이 조회합니다. 메모 스냅샷과 라이브 수록 시점이 어긋나면 `⚠️ 메모_vs_KOSIS_drift`, 데이터가 기본 2년 이상 정체돼 있으면 `⚠️ 데이터_신선도`를 자동 첨부합니다.
+- `check_variable_compatibility(variables, regions?)` — 회귀·상관·패널 분석 전에 여러 지표의 공통 수록기간, 단위 혼재, 지역 지원 여부를 점검합니다. 이 도구는 회귀를 직접 실행하지 않고, LLM/Python이 분석 가능한 데이터셋을 만들기 전에 필요한 진단 재료만 제공합니다.
 - `query_table(org_id, tbl_id, filters, period_range?)` — `explore_table`로 검증 가능한 분류축 코드만 받아 KOSIS raw rows를 조회합니다. 여러 코드가 들어와도 서버는 합산하지 않고 개별 행을 반환하며, 잘못된 코드는 `suggested_codes`와 함께 거절합니다.
 
 NABOSTATS(국회예산정책처 재정경제통계시스템) OpenAPI도 같은 MCP에서 조회할 수 있습니다. NABO 도구는 KOSIS 도구와 별개 제공기관이므로, 응답의 `source_system: "NABO"`와 `provider`를 답변에 보존해야 합니다.

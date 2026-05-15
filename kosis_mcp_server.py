@@ -143,6 +143,7 @@ def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
 QUERY_TABLE_MAX_FANOUT = _env_int("KOSIS_MCP_QUERY_TABLE_MAX_FANOUT", 80)
 QUERY_TABLE_CONCURRENCY = _env_int("KOSIS_MCP_QUERY_TABLE_CONCURRENCY", 8)
 QUERY_TABLE_CALL_TIMEOUT = _env_float("KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT", 15.0)
+DATA_FRESHNESS_WARNING_YEARS = _env_float("KOSIS_MCP_DATA_FRESHNESS_WARNING_YEARS", 2.0, minimum=0.0)
 NABO_API_BASE = "https://www.nabostats.go.kr/openapi"
 NABO_MAX_PAGE_SIZE = 1000
 NABO_DEFAULT_MAX_ROWS = 5000
@@ -249,9 +250,12 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
     markers = list(existing_signals.get("markers_present") or []) if isinstance(existing_signals, dict) else []
     markers.append("shortcut_response")
     if ignored_params:
-        markers.append("dropped_dimensions")
-        markers.append("partial_fulfillment")
-    if result.get("오류") or result.get("status") in {"failed", "unsupported"}:
+        markers.append("ignored_params")
+    code = result.get("code") or result.get("코드")
+    status = result.get("status") or result.get("상태")
+    if code == STATUS_PERIOD_NOT_FOUND:
+        markers.append("period_not_found")
+    if result.get("오류") or status in {"failed", "unsupported"}:
         markers.append("unsupported")
     result["mcp_output_contract"] = _mcp_tool_output_contract(
         role="shortcut_tool",
@@ -376,6 +380,7 @@ def _mcp_tool_output_contract(
         "share_total_grouped_by_period": "Interpret share results within each period group, not across all periods.",
         "convenience_response": "Use compact metadata/notes first; request verbose=True only for diagnostics.",
         "shortcut_response": "Check ignored_params/dropped_dimensions before treating shortcut output as complete.",
+        "ignored_params": "The shortcut ignored unsupported optional parameters; returned values can still be valid for supported dimensions.",
         "deprecation": "Prefer the recommended replacement workflow/tool.",
         "formula_advisory_only": "Treat formula guidance as advisory; verify numerator/denominator from KOSIS metadata/raw rows.",
         "heuristic_extraction": "Treat extracted concepts as candidates only; verify with KOSIS metadata before use.",
@@ -397,6 +402,9 @@ def _mcp_tool_output_contract(
         "low_definition_specificity": "Dictionary definition is too short or generic for high-stakes distinction; verify scope/standard.",
         "period_type_inconsistent": "Period metadata cadence and period-code shape disagree; inspect period rows before choosing period format.",
         "possible_period_type_inconsistent": "Period metadata range codes look coarser than the declared cadence; verify actual data periods before querying.",
+        "variable_period_mismatch": "Variables have different available period ranges; use common_period_range before combined analysis.",
+        "no_common_period": "The requested variables have no overlapping period range; do not run combined analysis without changing variables or periods.",
+        "mixed_units": "Variables use different units; preserve unit columns and avoid direct arithmetic across variables.",
     }
     marker_guidance = {
         marker: marker_guidance_catalog[marker]
@@ -439,6 +447,7 @@ def _mcp_tool_output_contract(
         "unit_conversion_required",
         "unsupported_source_system",
         "period_type_inconsistent",
+        "no_common_period",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -1185,7 +1194,7 @@ def _analysis_must_know(
     ]
     if extra_limitations:
         limitations.extend(extra_limitations)
-    if age is not None and age >= 1.0:
+    if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
         limitations.append(f"Latest period is {latest_period} (~{age:.1f} years old).")
     return {
         "unit": unit,
@@ -3539,7 +3548,7 @@ class NaturalLanguageAnswerEngine:
             age = cls._period_age_years(used)
             if age is not None:
                 result["period_age_years"] = age
-                if age >= 1.0:
+                if age >= DATA_FRESHNESS_WARNING_YEARS:
                     warn = f"사용 시점 {used} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음"
                     if warn not in notes:
                         notes.append(warn)
@@ -3787,7 +3796,7 @@ async def _quick_stat_core(
             "지역": region, "통계표": param.tbl_nm,
             "출처": "통계청 KOSIS",
         }
-        if age is not None and age >= 1.0:
+        if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
             result["⚠️ 데이터_신선도"] = (
                 f"사용 시점 {used_period} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음. "
                 f"수록기간 메타는 explore_table('{param.org_id}', '{param.tbl_id}')로 확인하세요."
@@ -3953,7 +3962,7 @@ async def _quick_trend_core(
         result["⚠️ 기간_해석"] = (
             f"years={years} → {period_type} 주기 통계이므로 최근 {latest_count}개 {unit_label} 시점 조회"
         )
-    if age is not None and age >= 1.0:
+    if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
         result["⚠️ 데이터_신선도"] = (
             f"시계열 최신 시점 {used_period} (약 {age:.1f}년 경과) — "
             "최신 데이터가 아닐 수 있음"
@@ -4067,7 +4076,7 @@ async def _quick_region_compare_core(
         "표": rows,
         "출처": "통계청 KOSIS",
     }
-    if age is not None and age >= 1.0:
+    if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
         result["⚠️ 데이터_신선도"] = (
             f"비교 기준 시점 {used_period} (약 {age:.1f}년 경과) — "
             "최신 데이터가 아닐 수 있음"
@@ -8144,12 +8153,166 @@ async def check_stat_availability(
                     f"curation 메모 스냅샷={snapshot_period} → KOSIS 실제 최신={live_period}. "
                     "curation 메모 갱신이 필요할 수 있음."
                 )
-        if age is not None and age >= 1.0:
+        if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
             result["⚠️ 데이터_신선도"] = (
                 f"KOSIS 실제 최신 시점 {live_period} (약 {age:.1f}년 경과). "
                 "이 통계표가 갱신을 멈췄거나 갱신 주기가 깁니다."
             )
     return result
+
+
+def _period_year_key(period: Any) -> Optional[int]:
+    match = re.search(r"\d{4}", str(period or ""))
+    return int(match.group(0)) if match else None
+
+
+@mcp.tool()
+async def check_variable_compatibility(
+    variables: list[str],
+    regions: Optional[list[str]] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🛠] 다변수 분석 전 공통 기간·단위·지역 지원 여부를 점검.
+
+    이 도구는 회귀나 상관분석을 실행하지 않습니다. LLM/Python이 분석하기
+    전에 어떤 기간·지역·단위 조합으로 데이터셋을 만들어야 하는지 확인하는
+    사전 진단용 도구입니다.
+    """
+    requested = [str(item).strip() for item in variables or [] if str(item or "").strip()]
+    if not requested:
+        return {
+            "status": "invalid_input",
+            "error": "variables must contain at least one statistic query.",
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="compatibility_check",
+                final_answer_expected=False,
+                markers=["invalid_input"],
+                explanation="No variables were provided for compatibility checking.",
+            ),
+        }
+
+    variable_reports: list[dict[str, Any]] = []
+    markers: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    units: set[str] = set()
+    requested_regions = [str(item).strip() for item in regions or [] if str(item or "").strip()]
+
+    for variable in requested:
+        param = _curation_lookup(variable)
+        report: dict[str, Any] = {
+            "query": variable,
+            "matched": bool(param),
+            "source_system": "KOSIS",
+        }
+        if not param:
+            report["status"] = "not_matched"
+            report["recommendation"] = "Use plan_query/search_kosis/select_table_for_query to resolve this variable first."
+            markers.append("not_matched")
+            variable_reports.append(report)
+            continue
+
+        report.update({
+            "status": param.verification_status,
+            "indicator": param.description,
+            "org_id": param.org_id,
+            "tbl_id": param.tbl_id,
+            "table_name": param.tbl_nm,
+            "unit": param.unit,
+            "supported_region_count": len(param.region_scheme or {}),
+        })
+        if param.unit:
+            units.add(str(param.unit))
+        if requested_regions:
+            supported = set((param.region_scheme or {}).keys())
+            unsupported_regions = [
+                region for region in requested_regions
+                if region not in supported and (_canonical_region(region) or region) not in supported
+            ]
+            report["requested_regions"] = requested_regions
+            report["unsupported_regions"] = unsupported_regions
+            if unsupported_regions:
+                markers.append("validation_errors")
+
+        if param.verification_status == "broken":
+            report["period_metadata_status"] = "skipped_broken_mapping"
+            markers.append("not_matched")
+            variable_reports.append(report)
+            continue
+
+        try:
+            period_rows = await _fetch_period_range(param.org_id, param.tbl_id, api_key)
+            latest = _pick_finest_period(period_rows or [])
+        except Exception as exc:
+            report["period_metadata_status"] = "fetch_failed"
+            report["period_metadata_error"] = repr(exc)
+            markers.append("period_metadata_missing")
+            variable_reports.append(report)
+            continue
+
+        start_period = latest.get("STRT_PRD_DE") or latest.get("strtPrdDe") if latest else None
+        latest_period = (
+            latest.get("END_PRD_DE") or latest.get("endPrdDe") or
+            latest.get("PRD_DE") or latest.get("prdDe")
+        ) if latest else None
+        cadence = (latest.get("PRD_SE") or latest.get("prdSe")) if latest else None
+        start_year = _period_year_key(start_period)
+        latest_year = _period_year_key(latest_period)
+        report["period_metadata"] = {
+            "cadence": cadence,
+            "start_period": start_period,
+            "latest_period": latest_period,
+            "start_year": start_year,
+            "latest_year": latest_year,
+            "period_age_years": NaturalLanguageAnswerEngine._period_age_years(str(latest_period or "")),
+        }
+        if start_year is None or latest_year is None:
+            markers.append("period_metadata_missing")
+        else:
+            starts.append(start_year)
+            ends.append(latest_year)
+        variable_reports.append(report)
+
+    common_range = None
+    if starts and ends and len(starts) == len(ends) == sum(1 for report in variable_reports if (report.get("period_metadata") or {}).get("start_year") is not None):
+        common_start = max(starts)
+        common_end = min(ends)
+        if common_start <= common_end:
+            common_range = {"start_year": common_start, "end_year": common_end, "year_count": common_end - common_start + 1}
+            if any((report.get("period_metadata") or {}).get("start_year") != common_start or (report.get("period_metadata") or {}).get("latest_year") != common_end for report in variable_reports if report.get("period_metadata")):
+                markers.append("variable_period_mismatch")
+        else:
+            markers.append("no_common_period")
+    if len(units) > 1:
+        markers.append("mixed_units")
+
+    status = "compatible" if common_range and not any(marker in {"not_matched", "validation_errors", "no_common_period"} for marker in markers) else "needs_attention"
+    return {
+        "status": status,
+        "variables_requested": requested,
+        "variable_count": len(requested),
+        "variables": variable_reports,
+        "common_period_range": common_range,
+        "unit_profile": {
+            "distinct_units": sorted(units),
+            "mixed_units": len(units) > 1,
+        },
+        "dataset_guidance": {
+            "recommended_next_step": "Use query_table or a panel dataset builder to extract rows only over common_period_range before analysis.",
+            "analysis_boundary": "This MCP checks data compatibility only; run regression/VIF/residual diagnostics in Python/R from the returned dataset.",
+        },
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="compatibility_check",
+            final_answer_expected=False,
+            markers=markers,
+            explanation="Variable compatibility materials for downstream LLM/Python analysis.",
+            extra_signals={
+                "common_period_range": common_range,
+                "mixed_units": len(units) > 1,
+                "variable_count": len(requested),
+            },
+        ),
+    }
 
 
 
@@ -8536,6 +8699,22 @@ async def query_table(
     if aggregation_report and aggregation_report.get("dropped_row_count"):
         contract_markers.append("aggregation_dropped_rows")
         contract_markers.append("non_numeric_aggregation_input")
+    missing_value_examples = [
+        {
+            "period": row.get("period"),
+            "value_raw": row.get("value_raw"),
+            "symbol": row.get("symbol"),
+            "missing_reason": row.get("missing_reason"),
+            "dimensions": row.get("dimensions"),
+        }
+        for row in normalized_rows
+        if row.get("value") is None
+    ][:10]
+    missing_value_count = sum(1 for row in normalized_rows if row.get("value") is None)
+    if missing_value_count:
+        contract_markers.append("missing_values")
+        if missing_value_count == len(normalized_rows):
+            contract_markers.append("all_values_missing")
     result = {
         "상태": "executed",
         "status": "executed",
@@ -8571,6 +8750,8 @@ async def query_table(
         },
         "rows": normalized_rows,
         "row_count": len(normalized_rows),
+        "missing_value_count": missing_value_count,
+        "missing_value_examples": missing_value_examples,
         "metadata_source": metadata_source,
         "수록기간": {
             "주기": latest_period.get("PRD_SE") if latest_period else None,
@@ -8618,6 +8799,8 @@ async def query_table(
                 "period_nature": nature.get("period_nature"),
                 "projection_horizon_years": nature.get("projection_horizon_years"),
                 "period_metadata_available": latest_period is not None,
+                "missing_value_count": missing_value_count,
+                "missing_value_examples": missing_value_examples,
                 "aggregation_report": aggregation_report,
             },
         ),
@@ -9012,7 +9195,7 @@ async def explore_table(
         "출처_KOSIS_API": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD/SOURCE",
     }
 
-    if period_age is not None and period_age >= 1.0:
+    if period_age is not None and period_age >= DATA_FRESHNESS_WARNING_YEARS:
         result["⚠️ 데이터_신선도"] = (
             f"이 통계표의 최신 시점은 {used_period} (약 {period_age:.1f}년 경과)"
         )
@@ -9058,7 +9241,7 @@ async def explore_table(
     explore_markers: list[str] = []
     if meta_errors:
         explore_markers.append("metadata_partial")
-    if period_age is not None and period_age >= 1.0:
+    if period_age is not None and period_age >= DATA_FRESHNESS_WARNING_YEARS:
         explore_markers.append("stale_metadata")
     if period_metadata_inconsistencies:
         if any(item.get("severity") == "strong" for item in period_metadata_inconsistencies):

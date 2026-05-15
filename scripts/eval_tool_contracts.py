@@ -4,6 +4,7 @@ import asyncio
 import io
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -526,6 +527,59 @@ async def test_missing_api_key_returns_structured_payload() -> None:
     assert result["mcp_output_contract"]["current_signals"]["has_failures"] is True, result
 
 
+async def test_check_variable_compatibility_reports_common_period_and_units() -> None:
+    original_lookup = kosis_mcp_server._curation_lookup
+    original_fetch_period = kosis_mcp_server._fetch_period_range
+
+    def fake_lookup(query: str) -> Any:
+        fixtures = {
+            "중소기업수": SimpleNamespace(
+                verification_status="verified",
+                description="중소기업수",
+                org_id="101",
+                tbl_id="SME",
+                tbl_nm="중소기업수",
+                unit="개",
+                region_scheme={"서울": "11", "부산": "21"},
+            ),
+            "GRDP": SimpleNamespace(
+                verification_status="verified",
+                description="GRDP",
+                org_id="101",
+                tbl_id="GRDP",
+                tbl_nm="GRDP",
+                unit="억원",
+                region_scheme={"서울": "11", "부산": "21"},
+            ),
+        }
+        return fixtures.get(query)
+
+    async def fake_fetch_period(org_id: str, tbl_id: str, api_key: Any = None) -> list[dict[str, Any]]:
+        if tbl_id == "SME":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2018", "END_PRD_DE": "2023"}]
+        if tbl_id == "GRDP":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2022"}]
+        return []
+
+    try:
+        kosis_mcp_server._curation_lookup = fake_lookup  # type: ignore[assignment]
+        kosis_mcp_server._fetch_period_range = fake_fetch_period  # type: ignore[assignment]
+        result = await kosis_mcp_server.check_variable_compatibility(
+            ["중소기업수", "GRDP"],
+            regions=["서울", "부산"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._curation_lookup = original_lookup  # type: ignore[assignment]
+        kosis_mcp_server._fetch_period_range = original_fetch_period  # type: ignore[assignment]
+
+    assert result["common_period_range"] == {"start_year": 2020, "end_year": 2022, "year_count": 3}, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "variable_period_mismatch" in markers, markers
+    assert "mixed_units" in markers, markers
+    assert result["mcp_output_contract"]["current_signals"]["has_failures"] is False, result
+
+
 async def test_select_table_prefers_fresh_candidate_on_indicator_near_tie() -> None:
     original_search = kosis_mcp_server.search_kosis
     original_fetch_meta = kosis_mcp_server._fetch_meta
@@ -941,7 +995,26 @@ async def test_quick_stat_shortcut_contract() -> None:
     assert contract["role"] == "shortcut_tool", result
     markers = contract["current_signals"]["markers_present"]
     assert "shortcut_response" in markers, markers
-    assert "dropped_dimensions" in markers, markers
+    assert "ignored_params" in markers, markers
+    assert contract["current_signals"]["has_failures"] is False, contract
+
+
+async def test_quick_stat_period_not_found_is_failure() -> None:
+    original_core = kosis_mcp_server._quick_stat_core
+
+    async def fake_core(*_: Any, **__: Any) -> dict[str, Any]:
+        return {"상태": "failed", "코드": "PERIOD_NOT_FOUND", "결과": "데이터 없음"}
+
+    try:
+        kosis_mcp_server._quick_stat_core = fake_core  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_stat("인구", period="1990", api_key="dummy")
+    finally:
+        kosis_mcp_server._quick_stat_core = original_core  # type: ignore[assignment]
+
+    contract = result["mcp_output_contract"]
+    markers = contract["current_signals"]["markers_present"]
+    assert "period_not_found" in markers, markers
+    assert contract["current_signals"]["has_failures"] is True, contract
 
 
 async def test_detect_outliers_detrended_default() -> None:
@@ -1265,6 +1338,49 @@ async def test_query_table_aggregation_dropped_rows_are_marked() -> None:
     assert "aggregation_dropped_rows" in markers, markers
     assert "non_numeric_aggregation_input" in markers, markers
     assert result["aggregation_report"]["dropped_row_count"] == 1, result
+
+
+async def test_query_table_normalizes_suppressed_values() -> None:
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            return [{"TBL_NM": "임의 표"}]
+        if kind == "ITM":
+            return [
+                {"OBJ_ID": "ITEM", "OBJ_NM": "항목", "ITM_ID": "T1", "ITM_NM": "지표"},
+                {"OBJ_ID": "A", "OBJ_NM": "지역", "ITM_ID": "22", "ITM_NM": "대구"},
+            ]
+        if kind == "PRD":
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2019", "END_PRD_DE": "2024"}]
+        return []
+
+    async def fake_call(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        return [{"PRD_DE": "2019", "DT": "*", "ITM_ID": "T1", "C1": "22"}]
+
+    try:
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_table(
+            "101",
+            "TBL_SUPPRESSED",
+            filters={"ITEM": ["T1"], "A": ["22"]},
+            period_range=["2019", "2019"],
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    row = result["rows"][0]
+    assert row["value"] is None, result
+    assert row["value_raw"] == "*", result
+    assert row["value_numeric"] is None, result
+    assert row["missing_reason"] == "suppressed", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "missing_values" in markers, markers
+    assert "all_values_missing" in markers, markers
 
 
 async def test_query_table_fanout_limit_rejects_before_raw_call() -> None:
@@ -2109,6 +2225,7 @@ async def main() -> None:
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
         ("quick_schema_no_unsupported", lambda: test_quick_tool_schemas_do_not_require_unsupported()),
         ("missing_key_structured", lambda: test_missing_api_key_returns_structured_payload()),
+        ("variable_compatibility", lambda: test_check_variable_compatibility_reports_common_period_and_units()),
         ("select_table_freshness_near_tiebreak", lambda: test_select_table_prefers_fresh_candidate_on_indicator_near_tie()),
         ("indicator_normalization_parenthetical_acronym", lambda: test_indicator_normalization_prefers_parenthetical_acronym()),
         ("indicator_normalization_route_terms", lambda: test_indicator_normalization_uses_route_search_terms()),
@@ -2127,6 +2244,7 @@ async def main() -> None:
         ("answer_query_compact_response", lambda: test_answer_query_compact_response_hides_control_contract()),
         ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
         ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),
+        ("quick_stat_period_failure_contract", lambda: test_quick_stat_period_not_found_is_failure()),
         ("detect_outliers_detrended_default", lambda: test_detect_outliers_detrended_default()),
         ("detect_outliers_all_methods", lambda: test_detect_outliers_all_methods_documents_stl_optional()),
         ("analysis_tools_materials", lambda: test_analysis_tools_return_materials_not_interpretation()),
@@ -2138,6 +2256,7 @@ async def main() -> None:
         ("query_table_invalid_period_format", lambda: test_query_table_rejects_unparsed_period_text()),
         ("query_table_projection_marker", lambda: test_query_table_projection_data_marker()),
         ("query_table_aggregation_dropped_rows", lambda: test_query_table_aggregation_dropped_rows_are_marked()),
+        ("query_table_suppressed_values", lambda: test_query_table_normalizes_suppressed_values()),
         ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
         ("nabo_search_query_normalization", lambda: test_nabo_search_and_query_normalization()),
         ("nabo_catalog_fallback_search", lambda: test_nabo_search_uses_catalog_fallback_for_contained_table_name()),
