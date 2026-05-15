@@ -77,6 +77,36 @@ def test_indicator_evidence_not_required_for_axis_only_exploration() -> None:
     assert result["status"] == "selected", result
 
 
+def test_metadata_dimension_embedded_in_indicator_is_not_rejected() -> None:
+    profile = TableMetadataProfile(
+        org_id="101",
+        tbl_id="AGE_FIXED",
+        table_name="Age-specific unemployment rate by region",
+        axes={
+            "A": {
+                "OBJ_NM": "region",
+                "items": {"00": {"label": "All regions", "unit": "%"}},
+            },
+            "ITEM": {
+                "OBJ_NM": "item",
+                "items": {"T1": {"label": "Age-specific unemployment rate", "unit": "%"}},
+            },
+        },
+        axis_order=["ITEM", "A"],
+        period_rows=[{"PRD_SE": "Y", "STRT_PRD_DE": "2020", "END_PRD_DE": "2024"}],
+    )
+    scorer = MetadataCompatibilityScorer(
+        required_dimensions=["age", "region"],
+        indicator="age-specific unemployment rate",
+        reject_if_missing_dimensions=True,
+    )
+    result = scorer.evaluate(profile).to_response()
+    assert result["status"] == "selected", result
+    assert "age" in result["matched_dimensions"], result
+    assert not result["missing_dimensions"], result
+    assert result["axis_evidence"]["age"][0]["coverage_type"] == "fixed_in_indicator", result
+
+
 async def test_select_table_falls_back_to_query_indicator() -> None:
     """When indicator is omitted, query must drive evidence matching (no silent pass)."""
     original_search = kosis_mcp_server.search_kosis
@@ -119,7 +149,8 @@ async def test_select_table_falls_back_to_query_indicator() -> None:
     assert "indicator_evidence_empty" in markers, markers
     assert "indicator_inferred_from_query" in markers, markers
     rejected = result["rejected"]
-    assert rejected and rejected[0]["status"] == "not_matched_indicator", rejected
+    assert rejected["count"] == 1, rejected
+    assert rejected["examples"][0]["status"] == "not_matched_indicator", rejected
 
 
 async def test_resolve_concepts_contract_on_unresolved() -> None:
@@ -579,6 +610,68 @@ async def test_check_variable_compatibility_reports_common_period_and_units() ->
     assert "variable_period_mismatch" in markers, markers
     assert "mixed_units" in markers, markers
     assert result["mcp_output_contract"]["current_signals"]["has_failures"] is False, result
+
+
+async def test_check_variable_compatibility_surfaces_tier_a_miss_candidates() -> None:
+    original_lookup = kosis_mcp_server._curation_lookup
+    original_search = kosis_mcp_server.search_kosis
+
+    async def fake_search(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "寃곌낵": [
+                {"ORG_ID": "113", "TBL_ID": "HAPPY", "TBL_NM": "Happiness Index"}
+            ]
+        }
+
+    try:
+        kosis_mcp_server._curation_lookup = lambda query: None  # type: ignore[assignment]
+        kosis_mcp_server.search_kosis = fake_search  # type: ignore[assignment]
+        result = await kosis_mcp_server.check_variable_compatibility(["happiness"], api_key="dummy")
+    finally:
+        kosis_mcp_server._curation_lookup = original_lookup  # type: ignore[assignment]
+        kosis_mcp_server.search_kosis = original_search  # type: ignore[assignment]
+
+    assert result["status"] == "needs_attention", result
+    assert result["variables"][0]["match_scope"] == "tier_a_not_matched", result
+    assert result["variables"][0]["search_status"] == "candidates_found", result
+    assert result["variables"][0]["search_candidates"][0]["tbl_id"] == "HAPPY", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "tier_a_not_matched" in markers, markers
+    assert "not_matched" not in markers, markers
+
+
+async def test_check_variable_compatibility_marks_cadence_mismatch() -> None:
+    original_lookup = kosis_mcp_server._curation_lookup
+    original_fetch_period = kosis_mcp_server._fetch_period_range
+
+    def fake_lookup(query: str) -> Any:
+        return SimpleNamespace(
+            verification_status="verified",
+            description=query,
+            org_id="101",
+            tbl_id=query.upper(),
+            tbl_nm=query,
+            unit="%",
+            region_scheme={},
+        )
+
+    async def fake_fetch_period(org_id: str, tbl_id: str, api_key: Any = None) -> list[dict[str, Any]]:
+        cadence = "M" if tbl_id == "MONTHLY" else "Y"
+        latest = "202404" if cadence == "M" else "2024"
+        return [{"PRD_SE": cadence, "STRT_PRD_DE": "2020", "END_PRD_DE": latest}]
+
+    try:
+        kosis_mcp_server._curation_lookup = fake_lookup  # type: ignore[assignment]
+        kosis_mcp_server._fetch_period_range = fake_fetch_period  # type: ignore[assignment]
+        result = await kosis_mcp_server.check_variable_compatibility(["annual", "monthly"], api_key="dummy")
+    finally:
+        kosis_mcp_server._curation_lookup = original_lookup  # type: ignore[assignment]
+        kosis_mcp_server._fetch_period_range = original_fetch_period  # type: ignore[assignment]
+
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "cadence_mismatch" in markers, markers
+    assert result["cadence_profile"]["mixed_cadences"] is True, result
+    assert result["cadence_profile"]["guidance"], result
 
 
 async def test_select_table_prefers_fresh_candidate_on_indicator_near_tie() -> None:
@@ -1541,6 +1634,8 @@ async def test_nabo_search_and_query_normalization() -> None:
         kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
 
     assert search["source_system"] == "NABO", search
+    assert "results" not in search, search
+    assert search["deprecated_aliases"]["results"].startswith("Use tables"), search
     assert search["tables"][0]["dtacycle_cd_suggestion"] == "YY", search
     assert explore["items"][0]["item_id"] == "10001", explore
     assert query["dtacycle_cd"] == "YY", query
@@ -2198,8 +2293,54 @@ async def test_search_stats_preserves_source_systems() -> None:
     assert sources == {"KOSIS", "NABO"}, result
     assert result["must_know"]["caller_must_preserve_source_system"] is True, result
     assert result["must_know"]["definition_comparison_required"] is True, result
+    assert "source_payloads" not in result, result
+    assert result["source_summaries"]["kosis"]["result_count"] == 1, result
+    assert result["source_summaries"]["nabo"]["result_count"] == 1, result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "cross_source_definition_check_required" in markers, markers
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = fake_search_nabo  # type: ignore[assignment]
+        verbose_result = await kosis_mcp_server.search_stats("GDP", include_source_payloads=True)
+    finally:
+        kosis_mcp_server.search_kosis = original_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = original_search_nabo  # type: ignore[assignment]
+    assert "source_payloads" in verbose_result, verbose_result
+
+
+def test_plan_response_compact_hides_legacy_control_fields() -> None:
+    compact = kosis_mcp_server._sanitize_plan_response({
+        "status": "planned",
+        "route": {"debug": True},
+        "deprecated_fields": {"old": "new"},
+        "recommended_tool_manifest": {"expose": ["missing_tool"]},
+        "llm_guardrails": ["do this"],
+        "llm_rules": ["do that"],
+        "raw_metric_candidates": [{"name": "a"}, {"name": "b"}],
+        "nabo_indicator_normalization": {
+            "candidate_phrases": list(range(10)),
+            "table_matches": list(range(10)),
+            "term_matches": list(range(10)),
+        },
+    })
+    assert "route" not in compact, compact
+    assert "deprecated_fields" not in compact, compact
+    assert "recommended_tool_manifest" not in compact, compact
+    assert "raw_metric_candidates" not in compact, compact
+    assert compact["raw_metric_candidate_count"] == 2, compact
+    assert len(compact["nabo_indicator_normalization"]["candidate_phrases"]) == 5, compact
+    assert compact["response_profile"]["compact"] is True, compact
+
+
+async def test_verify_stat_claims_does_not_claim_free_text_verification() -> None:
+    result = await kosis_mcp_server.verify_stat_claims({
+        "answer": "서울 인구는 1억 명입니다."
+    })
+    assert result["verified"] is False, result
+    assert result["verification_scope"] == "structured_payload_only", result
+    assert result["does_not_verify_free_text_claims"] is True, result
+    assert result["claims_detected_but_not_verified"], result
 
 
 async def test_http_auth_middleware_requires_token_when_configured() -> None:
@@ -2230,6 +2371,7 @@ async def main() -> None:
         ("fanout_partial_coverage", lambda: test_fanout_partial_coverage()),
         ("indicator_evidence_required", lambda: test_indicator_evidence_required_when_indicator_supplied()),
         ("axis_only_exploration", lambda: test_indicator_evidence_not_required_for_axis_only_exploration()),
+        ("embedded_dimension_evidence", lambda: test_metadata_dimension_embedded_in_indicator_is_not_rejected()),
         ("select_table_query_fallback", lambda: test_select_table_falls_back_to_query_indicator()),
         ("resolve_concepts_contract", lambda: test_resolve_concepts_contract_on_unresolved()),
         ("explore_table_stale_contract", lambda: test_explore_table_contract_on_stale_period()),
@@ -2254,6 +2396,8 @@ async def main() -> None:
         ("quick_schema_no_unsupported", lambda: test_quick_tool_schemas_do_not_require_unsupported()),
         ("missing_key_structured", lambda: test_missing_api_key_returns_structured_payload()),
         ("variable_compatibility", lambda: test_check_variable_compatibility_reports_common_period_and_units()),
+        ("variable_compatibility_tier_a_miss_candidates", lambda: test_check_variable_compatibility_surfaces_tier_a_miss_candidates()),
+        ("variable_compatibility_cadence_mismatch", lambda: test_check_variable_compatibility_marks_cadence_mismatch()),
         ("select_table_freshness_near_tiebreak", lambda: test_select_table_prefers_fresh_candidate_on_indicator_near_tie()),
         ("indicator_normalization_parenthetical_acronym", lambda: test_indicator_normalization_prefers_parenthetical_acronym()),
         ("indicator_normalization_route_terms", lambda: test_indicator_normalization_uses_route_search_terms()),
@@ -2305,6 +2449,8 @@ async def main() -> None:
         ("nabo_truncation_latest", lambda: test_nabo_query_truncation_does_not_claim_dataset_latest()),
         ("nabo_partial_filter_match", lambda: test_nabo_query_marks_partial_filter_match()),
         ("search_stats_source_systems", lambda: test_search_stats_preserves_source_systems()),
+        ("plan_response_compact", lambda: test_plan_response_compact_hides_legacy_control_fields()),
+        ("verify_stat_claims_free_text_scope", lambda: test_verify_stat_claims_does_not_claim_free_text_verification()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
     ]
     passed = 0

@@ -63,10 +63,8 @@ CASES: list[dict[str, Any]] = [
         "contract_role": "planning_only",
         "final_answer_expected": False,
         "handoff_final_answer_expected": False,
-        "manifest_exposes": ["plan_query", "query_table"],
-        "manifest_hides": ["answer_query", "quick_stat"],
         "canonical_workflow": "evidence_workflow",
-        "deprecated_fields": ["suggested_workflow", "consistency_warnings", "router_slots_overridden"],
+        "compact_omits_control_fields": True,
     },
     {
         "name": "regions_vs_region_separation",
@@ -397,6 +395,13 @@ async def main() -> None:
             canonical = result.get("canonical_fields") or {}
             if canonical.get("workflow") != case["canonical_workflow"]:
                 problems.append({"canonical_workflow": canonical.get("workflow"), "expected": case["canonical_workflow"]})
+        if case.get("compact_omits_control_fields"):
+            for field in ("deprecated_fields", "recommended_tool_manifest", "route", "llm_guardrails", "llm_rules"):
+                if field in result:
+                    problems.append({"compact_field_should_be_omitted": field})
+            profile = result.get("response_profile") or {}
+            if profile.get("compact") is not True:
+                problems.append({"response_profile": profile})
         deprecated = result.get("deprecated_fields") or {}
         missing_deprecated = [field for field in case.get("deprecated_fields", []) if field not in deprecated]
         if missing_deprecated:

@@ -127,6 +127,17 @@ def _dimension_coverage(
     return matched, missing, evidence
 
 
+def _dimension_terms(dimension: str) -> tuple[str, ...]:
+    return DIMENSION_AXIS_KEYWORDS.get(dimension, (dimension,))
+
+
+def _text_has_dimension_term(text: Any, dimension: str) -> bool:
+    haystack = _compact_text(str(text or "")).lower()
+    if not haystack:
+        return False
+    return any(_compact_text(token).lower() in haystack for token in _dimension_terms(dimension))
+
+
 def _indicator_evidence(
     table_name: Optional[str],
     axes: dict[str, dict[str, Any]],
@@ -245,6 +256,34 @@ class TableMetadataProfile:
     ) -> tuple[list[str], list[str], dict[str, list[dict[str, Any]]]]:
         return _dimension_coverage(self.axes, self.period_rows, required_dimensions)
 
+    def embedded_dimension_evidence(self, dimension: str, indicator: Optional[str]) -> list[dict[str, Any]]:
+        """Detect dimensions fixed inside table/item names instead of exposed as axes."""
+        evidence: list[dict[str, Any]] = []
+        if indicator and _text_has_dimension_term(indicator, dimension):
+            evidence.append({
+                "source": "indicator_text",
+                "value": indicator,
+                "coverage_type": "fixed_in_indicator",
+            })
+        if _text_has_dimension_term(self.table_name, dimension):
+            evidence.append({
+                "source": "table_name",
+                "value": self.table_name,
+                "coverage_type": "fixed_in_table",
+            })
+        for axis in self.axes.values():
+            for meta in (axis.get("items") or {}).values():
+                label = meta.get("label")
+                if _text_has_dimension_term(label, dimension):
+                    evidence.append({
+                        "source": "item_label",
+                        "value": label,
+                        "coverage_type": "fixed_in_item",
+                    })
+                    if len(evidence) >= 5:
+                        return evidence
+        return evidence
+
     def indicator_evidence(self, indicator: Optional[str]) -> tuple[int, list[str]]:
         return _indicator_evidence(self.table_name, self.axes, indicator)
 
@@ -352,6 +391,14 @@ class MetadataCompatibilityScorer:
     def evaluate(self, profile: TableMetadataProfile) -> MetadataCompatibilityResult:
         matched, missing, axis_evidence = profile.dimension_coverage(self.required_dimensions)
         indicator_score, indicator_hits = profile.indicator_evidence(self.indicator)
+        for dim in list(missing):
+            embedded = profile.embedded_dimension_evidence(dim, self.indicator)
+            if not embedded or indicator_score <= 0:
+                continue
+            missing.remove(dim)
+            if dim not in matched:
+                matched.append(dim)
+            axis_evidence[dim] = embedded
         score = indicator_score + len(matched) * 5 - len(missing) * 6
         if self.indicator and indicator_score <= 0:
             status = "not_matched_indicator"

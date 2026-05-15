@@ -152,6 +152,7 @@ QUERY_TABLE_CONCURRENCY = _env_int("KOSIS_MCP_QUERY_TABLE_CONCURRENCY", 8)
 QUERY_TABLE_CALL_TIMEOUT = _env_float("KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT", 15.0)
 DATA_FRESHNESS_WARNING_YEARS = _env_float("KOSIS_MCP_DATA_FRESHNESS_WARNING_YEARS", 2.0, minimum=0.0)
 VERBOSE_OUTPUT_CONTRACT = _env_bool("KOSIS_MCP_VERBOSE_OUTPUT_CONTRACT", False)
+ANSWER_QUERY_TIMEOUT_SECONDS = _env_float("KOSIS_MCP_ANSWER_QUERY_TIMEOUT_SECONDS", 20.0, minimum=1.0)
 NABO_API_BASE = "https://www.nabostats.go.kr/openapi"
 NABO_MAX_PAGE_SIZE = 1000
 NABO_DEFAULT_MAX_ROWS = 5000
@@ -379,6 +380,8 @@ def _mcp_tool_output_contract(
         "projection_data": "Label values as projection/forecast when answering.",
         "missing_values": "Some returned rows have no numeric value; inspect missing_value_examples before quoting values.",
         "all_values_missing": "Rows were matched but every returned value is empty; report unavailable data instead of a numeric answer.",
+        "tier_a_not_matched": "The shortcut/Tier-A catalog did not contain this variable; inspect search_candidates before deciding the statistic is unavailable.",
+        "cadence_mismatch": "Variables use different publication cadences; aggregate or resample outside the MCP before modeling them together.",
         "unit_caller_resolution_required": "Resolve the computed unit from unit_transformation before quoting.",
         "unit_mismatch": "Do not add or share values with different units until the caller explicitly converts them.",
         "unit_conversion_required": "Convert units outside the MCP or re-query comparable rows before using this result.",
@@ -457,6 +460,7 @@ def _mcp_tool_output_contract(
         "unsupported_source_system",
         "period_type_inconsistent",
         "no_common_period",
+        "tier_a_not_matched",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -3879,8 +3883,6 @@ async def _quick_stat_core(
             "더 구체적인 키워드로 다시 시도하세요."
         ),
     }
-
-
 @mcp.tool()
 async def quick_trend(
     query: str, region: str = "전국", years: int = 10,
@@ -5276,7 +5278,7 @@ async def chain_full_analysis(
     return [TextContent(type="text", text=str(summary))]
 
 @mcp.tool()
-async def plan_query(query: str, api_key: Optional[str] = None, nabo_api_key: Optional[str] = None) -> dict:
+async def plan_query(query: str, api_key: Optional[str] = None, nabo_api_key: Optional[str] = None, verbose: bool = False) -> dict:
     """[🧭] Gemma용 절차형 KOSIS 분석 계획을 만든다.
 
     질문을 차원과 작업 단계로 분해합니다.
@@ -5291,7 +5293,8 @@ async def plan_query(query: str, api_key: Optional[str] = None, nabo_api_key: Op
     """
     planner = QueryWorkflowPlanner()
     plan = planner.build(query)
-    return await _enrich_plan_with_metadata(plan, query, api_key=api_key, nabo_api_key=nabo_api_key)
+    enriched = await _enrich_plan_with_metadata(plan, query, api_key=api_key, nabo_api_key=nabo_api_key)
+    return _sanitize_plan_response(enriched, verbose=verbose)
 
 
 @mcp.tool()
@@ -5318,8 +5321,24 @@ async def answer_query(
         raise
     engine = NaturalLanguageAnswerEngine(key)
     try:
-        result = await engine.answer(query, region)
+        result = await asyncio.wait_for(engine.answer(query, region), timeout=ANSWER_QUERY_TIMEOUT_SECONDS)
         result = _attach_gemma_deprecation_warning(result)
+        return result if verbose else _compact_answer_query_response(result, query=query, region=region)
+    except asyncio.TimeoutError:
+        result = _attach_gemma_deprecation_warning({
+            "?곹깭": "failed",
+            "status": "failed",
+            "肄붾뱶": STATUS_RUNTIME_ERROR,
+            "code": STATUS_RUNTIME_ERROR,
+            "?ㅻ쪟": f"answer_query exceeded {ANSWER_QUERY_TIMEOUT_SECONDS:.1f}s timeout.",
+            "error": f"answer_query exceeded {ANSWER_QUERY_TIMEOUT_SECONDS:.1f}s timeout.",
+            "query": query,
+            "recommended_fast_path": {
+                "simple_lookup": "quick_stat",
+                "time_series": "query_table after plan/select/resolve",
+                "availability_check": "check_stat_availability",
+            },
+        })
         return result if verbose else _compact_answer_query_response(result, query=query, region=region)
     except RuntimeError as e:
         result = _attach_gemma_deprecation_warning({
@@ -5340,6 +5359,104 @@ async def verify_stat_claims(answer_payload: dict[str, Any]) -> dict:
     실제 원자료를 재호출하지 않고, 챗봇 응답 payload가 최소한의 통계 응답
     요건(값, 단위, 기준시점, 통계표, 출처, 산식)을 갖췄는지 확인한다.
     """
+    verification_scope = "structured_payload_only"
+    if not isinstance(answer_payload, dict):
+        return {
+            "verified": False,
+            "code": STATUS_RUNTIME_ERROR,
+            "verification_scope": verification_scope,
+            "issues": ["Input must be a structured dict payload, not free text."],
+        }
+
+    rows = answer_payload.get("rows")
+    if rows is None:
+        rows = answer_payload.get("data")
+    if rows is None:
+        rows = answer_payload.get("table")
+    if rows is None:
+        rows = []
+
+    text_parts = [
+        str(answer_payload.get(key) or "")
+        for key in ("answer", "text", "summary", "message")
+    ]
+    text_blob = " ".join(part for part in text_parts if part.strip())
+    free_text_numbers = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|명|개|원|억원|조원|천명|만명)?", text_blob)
+    if not rows and free_text_numbers:
+        return {
+            "verified": False,
+            "code": STATUS_UNVERIFIED_FORMULA,
+            "verification_scope": verification_scope,
+            "does_not_verify_free_text_claims": True,
+            "claims_detected_but_not_verified": free_text_numbers[:10],
+            "issues": [
+                "Numeric-looking free-text claims were detected, but this tool only checks structured payload rows.",
+                "Use query_table/quick_stat to retrieve source rows before claiming a value is verified.",
+            ],
+            "recommendation": {
+                "for_simple_stat": "quick_stat",
+                "for_raw_rows": "query_table after selecting/resolving the table",
+            },
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="claim_payload_check",
+                final_answer_expected=False,
+                markers=["validation_errors"],
+                explanation="Free-text numeric claims are not verified by verify_stat_claims.",
+                extra_signals={
+                    "verification_scope": verification_scope,
+                    "free_text_claim_count": len(free_text_numbers),
+                },
+            ),
+        }
+
+    issues: list[str] = []
+    warnings: list[str] = []
+    claims: list[dict[str, Any]] = []
+    if not rows:
+        issues.append("No structured rows were found; nothing can be verified.")
+    elif not isinstance(rows, list):
+        issues.append("rows/data/table must be a list of row dictionaries.")
+    else:
+        for idx, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                issues.append(f"Row {idx} is not a dict.")
+                continue
+            value = row.get("value", row.get("값"))
+            unit = row.get("unit", row.get("단위"))
+            period = row.get("period", row.get("시점"))
+            source = row.get("source") or row.get("source_system") or row.get("출처")
+            missing = [
+                name for name, val in (
+                    ("value", value),
+                    ("unit", unit),
+                    ("period", period),
+                    ("source", source),
+                )
+                if val in (None, "")
+            ]
+            if missing:
+                issues.append(f"Row {idx} missing fields: {', '.join(missing)}")
+                continue
+            claims.append({
+                "row_index": idx,
+                "indicator": row.get("indicator") or row.get("지표"),
+                "value": value,
+                "unit": unit,
+                "period": period,
+                "source": source,
+            })
+
+    verified = not issues and bool(claims)
+    return {
+        "verified": verified,
+        "code": STATUS_EXECUTED if verified else STATUS_UNVERIFIED_FORMULA,
+        "verification_scope": verification_scope,
+        "claims": claims,
+        "issues": issues,
+        "warnings": warnings,
+        "does_not_verify_free_text_claims": True,
+    }
+
     if not isinstance(answer_payload, dict):
         return {
             "verified": False,
@@ -5608,7 +5725,7 @@ async def indicator_dependency_map(indicator: str) -> dict:
                 "caller_must_verify": [
                     "KOSIS metadata contains the numerator and denominator concepts",
                     "query_table raw rows share compatible period, unit, and population scope",
-                    "caller has selected the correct formula operation before compute_indicator",
+                    "caller has selected the correct arithmetic operation before using compute_indicator or external code",
                 ],
             }
             subgroup = next((label for term, label in subgroup_terms if term in indicator), None)
@@ -5863,6 +5980,54 @@ def _table_selection_reasons(selected: dict[str, Any], selected_candidates: list
     if item_count:
         reasons.append(f"item_count={item_count}")
     return reasons
+
+
+def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "status": candidate.get("status"),
+        "score": candidate.get("score"),
+        "org_id": candidate.get("org_id"),
+        "tbl_id": candidate.get("tbl_id"),
+        "table_name": candidate.get("table_name"),
+        "source": candidate.get("source"),
+        "search_term": candidate.get("search_term"),
+        "matched_dimensions": candidate.get("matched_dimensions"),
+        "missing_dimensions": candidate.get("missing_dimensions"),
+        "indicator_evidence": candidate.get("indicator_evidence"),
+        "ranking_features": candidate.get("ranking_features"),
+        "periods": candidate.get("periods"),
+    }
+    if candidate.get("selection_reasons"):
+        compact["selection_reasons"] = candidate.get("selection_reasons")
+    compatibility = candidate.get("compatibility")
+    if isinstance(compatibility, dict):
+        compact["compatibility"] = {
+            "verification_level": compatibility.get("verification_level"),
+            "not_matched_reason": compatibility.get("not_matched_reason"),
+            "indicator_score": compatibility.get("indicator_score"),
+        }
+    axis_evidence = candidate.get("axis_evidence") or {}
+    embedded = {
+        dim: evidence
+        for dim, evidence in axis_evidence.items()
+        if any(str((item or {}).get("coverage_type") or "").startswith("fixed_in_") for item in evidence or [])
+    }
+    if embedded:
+        compact["embedded_dimension_evidence"] = embedded
+    return {key: value for key, value in compact.items() if value not in (None, [], {})}
+
+
+def _selection_rejection_summary(candidates: list[dict[str, Any]], limit: int) -> dict[str, Any]:
+    rejected = [candidate for candidate in candidates if candidate.get("status") != "selected"]
+    by_status: dict[str, int] = {}
+    for candidate in rejected:
+        status = str(candidate.get("status") or "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+    return {
+        "count": len(rejected),
+        "by_status": by_status,
+        "examples": [_compact_table_candidate(candidate) for candidate in rejected[:limit]],
+    }
 
 
 def _search_result_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6133,6 +6298,42 @@ def _plan_contract_add_markers(plan: dict[str, Any], markers: list[str]) -> None
             present.append(marker)
     signals["markers_present"] = present
     signals["has_caveats"] = bool(present)
+
+
+def _sanitize_plan_response(plan: dict[str, Any], *, verbose: bool = False) -> dict[str, Any]:
+    if verbose:
+        return plan
+    compact = dict(plan)
+    for key in (
+        "deprecated_fields",
+        "recommended_tool_manifest",
+        "llm_guardrails",
+        "llm_rules",
+        "route",
+    ):
+        compact.pop(key, None)
+    if isinstance(compact.get("raw_metric_candidates"), list):
+        compact["raw_metric_candidate_count"] = len(compact["raw_metric_candidates"])
+        compact.pop("raw_metric_candidates", None)
+    if isinstance(compact.get("nabo_indicator_normalization"), dict):
+        nabo_norm = dict(compact["nabo_indicator_normalization"])
+        for key in ("candidate_phrases", "table_matches", "term_matches"):
+            if isinstance(nabo_norm.get(key), list):
+                nabo_norm[f"{key}_count"] = len(nabo_norm[key])
+                nabo_norm[key] = nabo_norm[key][:5]
+        compact["nabo_indicator_normalization"] = nabo_norm
+    compact["response_profile"] = {
+        "compact": True,
+        "omitted_fields": [
+            "route",
+            "deprecated_fields",
+            "recommended_tool_manifest",
+            "llm_guardrails",
+            "llm_rules",
+        ],
+        "verbose_hint": "Call plan_query(..., verbose=true) for router internals and full diagnostics.",
+    }
+    return compact
 
 
 def _change_implication_evidence(query: str, route_payload: dict[str, Any]) -> Optional[str]:
@@ -6815,7 +7016,7 @@ async def search_nabo_tables(
         "pagination": pagination,
         "search_diagnostics": search_diagnostics,
         "tables": tables,
-        "results": tables,
+        "deprecated_aliases": {"results": "Use tables; duplicate results payload is no longer returned by default."},
         "must_know": {
             "source_system": "NABO",
             "provider": "국회예산정책처 재정경제통계시스템",
@@ -7396,7 +7597,6 @@ async def query_nabo_table(
                 "truncated_by_max_rows": payload.get("truncated", False),
                 "pagination": pagination,
                 "missing_value_count": missing_value_count,
-                "missing_value_examples": missing_value_examples,
                 "dtacycle_resolution": cycle_resolution,
                 "period_request": period_request,
                 "period_filtered_row_count": len(period_rows),
@@ -7516,6 +7716,7 @@ async def search_stats(
     limit: int = 10,
     kosis_api_key: Optional[str] = None,
     nabo_api_key: Optional[str] = None,
+    include_source_payloads: bool = False,
 ) -> dict:
     """[🔎] KOSIS/NABO 통합 통계표 후보 검색 facade."""
     source_norm = str(source or "all").lower()
@@ -7544,7 +7745,6 @@ async def search_stats(
                 "table_id": row.get("통계표ID") or row.get("TBL_ID"),
                 "org_id": row.get("기관ID") or row.get("ORG_ID"),
                 "table_name": row.get("통계표명") or row.get("TBL_NM"),
-                "raw": row,
             })
     if source_norm in {"all", "nabo"}:
         nabo_payload = await search_nabo_tables(query, limit=limit, api_key=nabo_api_key)
@@ -7572,13 +7772,35 @@ async def search_stats(
     )
     if cross_source_definition_check_required:
         markers.append("cross_source_definition_check_required")
-    return {
+    source_summaries = {
+        name: {
+            "status": payload.get("status") or payload.get("?곹깭"),
+            "result_count": payload.get("result_count") or len(payload.get("寃곌낵") or payload.get("tables") or []),
+            "total_count": payload.get("total_count"),
+            "markers_present": ((payload.get("mcp_output_contract") or {}).get("current_signals") or {}).get("markers_present"),
+        }
+        for name, payload in source_payloads.items()
+        if isinstance(payload, dict)
+    }
+    compact_source_summaries: dict[str, dict[str, Any]] = {}
+    for name, payload in source_payloads.items():
+        if not isinstance(payload, dict):
+            continue
+        source_result_count = len(_search_result_rows(payload)) if name == "kosis" else len(payload.get("tables") or [])
+        compact_source_summaries[name] = {
+            "status": payload.get("status") or payload.get("상태"),
+            "result_count": payload.get("result_count") or source_result_count,
+            "total_count": payload.get("total_count"),
+            "markers_present": ((payload.get("mcp_output_contract") or {}).get("current_signals") or {}).get("markers_present"),
+        }
+    source_summaries = compact_source_summaries
+    result = {
         "status": "executed" if results else "empty",
         "query": query,
         "source": source_norm,
         "result_count": len(results),
         "results": results,
-        "source_payloads": source_payloads,
+        "source_summaries": source_summaries,
         "must_know": {
             "mixed_sources": source_norm == "all",
             "caller_must_preserve_source_system": True,
@@ -7601,18 +7823,9 @@ async def search_stats(
             },
         ),
     }
-
-
-
-
-
-
-
-
-
-
-
-
+    if include_source_payloads:
+        result["source_payloads"] = source_payloads
+    return result
 
 
 @mcp.tool()
@@ -7884,6 +8097,7 @@ async def select_table_for_query(
     infer_dimensions: bool = False,
     reject_if_missing_dimensions: bool = True,
     limit: int = 8,
+    verbose: bool = False,
     api_key: Optional[str] = None,
 ) -> dict:
     """[🧭] 자연어 질문에 맞는 KOSIS 통계표 후보를 메타데이터 기반으로 고른다.
@@ -8034,6 +8248,9 @@ async def select_table_for_query(
         if "indicator_evidence_empty" in selection_markers else
         "A metadata-compatible table candidate was selected."
     )
+    alternatives = candidates[:limit] if verbose else [_compact_table_candidate(candidate) for candidate in candidates[:limit]]
+    rejected_candidates = [candidate for candidate in candidates if candidate.get("status") != "selected"]
+    rejected_payload = rejected_candidates[:limit] if verbose else _selection_rejection_summary(candidates, min(limit, 5))
     return {
         "상태": "selected" if selected else "needs_table_selection",
         "status": "selected" if selected else "needs_table_selection",
@@ -8048,9 +8265,11 @@ async def select_table_for_query(
         "infer_dimensions": infer_dimensions,
         "inferred_dimensions": _normalize_required_dimensions(inferred_dimensions),
         "reject_if_missing_dimensions": reject_if_missing_dimensions,
-        "selected": selected[0] if selected else None,
-        "alternatives": candidates[:limit],
-        "rejected": [c for c in candidates if c.get("status") != "selected"][:limit],
+        "verbose": verbose,
+        "selected": (selected[0] if verbose else _compact_table_candidate(selected[0])) if selected else None,
+        "alternatives": alternatives,
+        "rejected": rejected_payload,
+        "diagnostics_note": "Pass verbose=true to include full axis_evidence, axis_summary, and metadata_profile for every candidate.",
         "ranking_criteria": [
             {"order": 1, "field": "indicator_score_band", "applied": True},
             {"order": 2, "field": "latest_period_year", "applied": True},
@@ -8061,17 +8280,18 @@ async def select_table_for_query(
         ],
         "warnings": warnings,
         "mcp_output_contract": _mcp_tool_output_contract(
-            role="table_selection",
-            final_answer_expected=False,
-            markers=selection_markers,
-            explanation=explanation,
-            extra_signals={
-                "selected_count": len(selected),
-                "candidate_count": len(candidates),
-                "indicator_required": effective_indicator is not None,
-                "indicator_source": indicator_source,
-            },
-        ),
+                role="table_selection",
+                final_answer_expected=False,
+                markers=selection_markers,
+                explanation=explanation,
+                extra_signals={
+                    "selected_count": len(selected),
+                    "candidate_count": len(candidates),
+                    "rejected_count": len(rejected_candidates),
+                    "indicator_required": effective_indicator is not None,
+                    "indicator_source": indicator_source,
+                },
+            ),
         "주의": [
             "select_table_for_query는 표 후보와 축 충족 여부만 판단합니다.",
             "required_dimensions가 비어 있으면 축 충족 검증이 약해집니다. 가능하면 LLM이 필요한 차원을 명시하세요.",
@@ -8243,6 +8463,7 @@ async def check_variable_compatibility(
     starts: list[int] = []
     ends: list[int] = []
     units: set[str] = set()
+    cadences: set[str] = set()
     requested_regions = [str(item).strip() for item in regions or [] if str(item or "").strip()]
 
     for variable in requested:
@@ -8254,8 +8475,28 @@ async def check_variable_compatibility(
         }
         if not param:
             report["status"] = "not_matched"
-            report["recommendation"] = "Use plan_query/search_kosis/select_table_for_query to resolve this variable first."
-            markers.append("not_matched")
+            report["match_scope"] = "tier_a_not_matched"
+            report["recommendation"] = "Tier A direct mapping did not match. Inspect search_candidates; if relevant candidates exist, resolve the table with select_table_for_query before building a dataset."
+            try:
+                search_result = await search_kosis(variable, limit=5, use_routing=True, api_key=api_key)
+                candidates = _search_result_rows(search_result)
+                report["search_status"] = "candidates_found" if candidates else "search_empty"
+                report["search_candidate_count"] = len(candidates)
+                report["search_candidates"] = [
+                    {
+                        "org_id": _row_first(row, ["湲곌?ID", "疫꿸퀗?ID", "ORG_ID"]),
+                        "tbl_id": _row_first(row, ["?듦퀎?쏧D", "?????쬎", "TBL_ID"]),
+                        "table_name": _row_first(row, ["?듦퀎?쒕챸", "?????뺤구", "TBL_NM"]),
+                    }
+                    for row in candidates[:5]
+                ]
+                markers.append("tier_a_not_matched")
+                if not candidates:
+                    markers.append("not_matched")
+            except Exception as exc:
+                report["search_status"] = "search_failed"
+                report["search_error"] = repr(exc)
+                markers.append("not_matched")
             variable_reports.append(report)
             continue
 
@@ -8303,6 +8544,8 @@ async def check_variable_compatibility(
             latest.get("PRD_DE") or latest.get("prdDe")
         ) if latest else None
         cadence = (latest.get("PRD_SE") or latest.get("prdSe")) if latest else None
+        if cadence:
+            cadences.add(str(cadence))
         start_year = _period_year_key(start_period)
         latest_year = _period_year_key(latest_period)
         report["period_metadata"] = {
@@ -8332,8 +8575,11 @@ async def check_variable_compatibility(
             markers.append("no_common_period")
     if len(units) > 1:
         markers.append("mixed_units")
+    if len(cadences) > 1:
+        markers.append("cadence_mismatch")
 
-    status = "compatible" if common_range and not any(marker in {"not_matched", "validation_errors", "no_common_period"} for marker in markers) else "needs_attention"
+    blocking_markers = {"not_matched", "tier_a_not_matched", "validation_errors", "no_common_period"}
+    status = "compatible" if common_range and not any(marker in blocking_markers for marker in markers) else "needs_attention"
     return {
         "status": status,
         "variables_requested": requested,
@@ -8343,6 +8589,11 @@ async def check_variable_compatibility(
         "unit_profile": {
             "distinct_units": sorted(units),
             "mixed_units": len(units) > 1,
+        },
+        "cadence_profile": {
+            "distinct_cadences": sorted(cadences),
+            "mixed_cadences": len(cadences) > 1,
+            "guidance": "For annual modeling, aggregate/resample higher-frequency variables outside the MCP after choosing an explicit rule (mean, end-of-period, sum, etc.)." if len(cadences) > 1 else None,
         },
         "dataset_guidance": {
             "recommended_next_step": "Use query_table or a panel dataset builder to extract rows only over common_period_range before analysis.",
@@ -8356,13 +8607,11 @@ async def check_variable_compatibility(
             extra_signals={
                 "common_period_range": common_range,
                 "mixed_units": len(units) > 1,
+                "mixed_cadences": len(cadences) > 1,
                 "variable_count": len(requested),
             },
         ),
     }
-
-
-
 
 
 
@@ -8859,7 +9108,6 @@ async def query_table(
                 "projection_horizon_years": nature.get("projection_horizon_years"),
                 "period_metadata_available": latest_period is not None,
                 "missing_value_count": missing_value_count,
-                "missing_value_examples": missing_value_examples,
                 "aggregation_report": aggregation_report,
             },
         ),
