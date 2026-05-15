@@ -443,6 +443,8 @@ def _mcp_tool_output_contract(
         "catalog_fallback_search": "NABO API table-name search was empty; candidates came from local catalog substring/metadata scoring.",
         "item_catalog_search": "NABO table candidates were found through item-name metadata, not table title alone.",
         "broad_query": "The query is broad or under-specified; treat returned rows as candidates and narrow by table metadata before answering.",
+        "partial_candidates_demoted": "Full query matches are available; treat partial-term candidates as secondary references, not primary matches.",
+        "unfocused_full_match_demoted": "Some full-term matches were demoted because the query terms are a small part of a long table title; inspect low_confidence_results if needed.",
         "metric_extraction_low_confidence": "Metric candidates came from weak search evidence; verify with metadata before querying values.",
         "router_intended_dim_mismatch": "Planner router slots and intended dimensions disagree or one side is missing; prefer metadata-verified metrics.",
         "truncated_definition": "Dictionary definition appears incomplete; avoid treating it as authoritative without another source.",
@@ -6141,15 +6143,31 @@ def _search_candidate_text(row: dict[str, Any]) -> str:
     )
 
 
+def _search_candidate_title(row: dict[str, Any]) -> str:
+    return str(row.get("table_name") or row.get("?듦퀎?쒕챸") or row.get("TBL_NM") or row.get("STATBL_NM") or "")
+
+
+def _query_title_focus_ratio(query: Any, title: Any) -> float:
+    tokens = _query_tokens_for_matching(query)
+    title_text = str(title or "")
+    compact_title = re.sub(r"[\W_]+", "", title_text, flags=re.UNICODE).lower()
+    if not tokens or not compact_title:
+        return 0.0
+    matched_len = sum(len(token) for token in tokens if _query_token_matches_text(token, title_text))
+    return round(matched_len / max(1, len(compact_title)), 4)
+
+
 def _sort_search_candidates(query: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         if not isinstance(row.get("match_quality"), dict):
             row["match_quality"] = _query_match_quality(query, _search_candidate_text(row))
+        row["match_quality"]["title_focus_ratio"] = _query_title_focus_ratio(query, _search_candidate_title(row))
     return sorted(
         rows,
         key=lambda row: (
             -float((row.get("match_quality") or {}).get("weighted_coverage_ratio") or 0.0),
             -float((row.get("match_quality") or {}).get("coverage_ratio") or 0.0),
+            -float((row.get("match_quality") or {}).get("title_focus_ratio") or 0.0),
             -_match_quality_rank(row.get("match_quality")),
             str(row.get("source_system") or ""),
             str(row.get("table_name") or row.get("통계표명") or ""),
@@ -6190,6 +6208,44 @@ def _demote_low_confidence_search_results(results: list[dict[str, Any]], summary
     ):
         return [], results, "low_confidence_only"
     return results, [], None
+
+
+def _demote_partial_results_when_full_match_exists(results: list[dict[str, Any]], summary: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not results or int(summary.get("full_query_match_count") or 0) <= 0:
+        return results, []
+    primary: list[dict[str, Any]] = []
+    secondary: list[dict[str, Any]] = []
+    for row in results:
+        quality = row.get("match_quality") if isinstance(row, dict) else None
+        coverage = float((quality or {}).get("coverage_ratio") or 0.0) if isinstance(quality, dict) else 0.0
+        if coverage >= 1.0:
+            primary.append(row)
+        else:
+            secondary.append(row)
+    return (primary or results), secondary
+
+
+def _demote_unfocused_full_matches(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if len(results) <= 1:
+        return results, []
+    focused: list[dict[str, Any]] = []
+    unfocused: list[dict[str, Any]] = []
+    focus_values = [
+        float((row.get("match_quality") or {}).get("title_focus_ratio") or 0.0)
+        for row in results
+        if isinstance(row, dict)
+    ]
+    best_focus = max(focus_values, default=0.0)
+    if best_focus < 0.12:
+        return results, []
+    cutoff = max(0.08, best_focus * 0.45)
+    for row in results:
+        focus = float((row.get("match_quality") or {}).get("title_focus_ratio") or 0.0)
+        if focus < cutoff:
+            unfocused.append(row)
+        else:
+            focused.append(row)
+    return (focused or results), unfocused
 
 
 def _candidate_quality_label(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
@@ -7397,7 +7453,10 @@ async def search_nabo_tables(
             )
     tables = _sort_search_candidates(query, tables)
     quality_summary = _search_quality_summary(query, tables)
-    candidate_quality = _candidate_quality_label(tables, quality_summary)
+    primary_tables, secondary_tables = _demote_partial_results_when_full_match_exists(tables, quality_summary)
+    primary_tables, unfocused_tables = _demote_unfocused_full_matches(primary_tables)
+    secondary_tables.extend(unfocused_tables)
+    candidate_quality = _candidate_quality_label(primary_tables, quality_summary)
     broad_query = _is_broad_query_candidate_set(query, tables)
     if broad_query:
         candidate_quality = "broad_query_candidates"
@@ -7405,9 +7464,15 @@ async def search_nabo_tables(
         markers.append("no_full_query_match")
     if quality_summary["missing_terms_across_results"]:
         markers.append("partial_query_match")
+    partial_secondary_count = len(secondary_tables) - len(unfocused_tables)
+    if partial_secondary_count > 0:
+        markers.append("partial_candidates_demoted")
+    if unfocused_tables:
+        markers.append("unfocused_full_match_demoted")
     if broad_query:
         markers.append("broad_query")
-    response_tables = _omit_raw_from_payload_rows(tables, include_raw)
+    response_tables = _omit_raw_from_payload_rows(primary_tables, include_raw)
+    low_confidence_tables = _omit_raw_from_payload_rows(secondary_tables, include_raw)
     search_diagnostics = {
         "api_table_name_result_count": len(api_tables),
         "catalog_fallback_used": bool(catalog_fallback),
@@ -7416,9 +7481,12 @@ async def search_nabo_tables(
         "catalog_fallback_error": catalog_fallback.get("error"),
         "item_catalog_error": catalog_fallback.get("item_catalog_error"),
         "search_quality_summary": quality_summary,
+        "primary_candidate_count": len(primary_tables),
+        "partial_candidates_demoted_count": len(secondary_tables),
+        "unfocused_full_match_demoted_count": len(unfocused_tables),
     }
     pagination = {
-        "result_count": len(tables),
+        "result_count": len(primary_tables),
         "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
         "truncated": payload.get("truncated", False),
         "strategy": "increase_limit_requery",
@@ -7429,17 +7497,18 @@ async def search_nabo_tables(
         } if (catalog_fallback.get("total_count", payload.get("total_count", len(tables))) or 0) > len(tables) else None,
     }
     return {
-        "status": "executed" if tables and candidate_quality == "full_match_available" else "needs_table_selection",
+        "status": "executed" if primary_tables and candidate_quality == "full_match_available" else "needs_table_selection",
         "source_system": "NABO",
         "provider": "국회예산정책처 재정경제통계시스템",
         "query": query,
-        "result_count": len(tables),
+        "result_count": len(primary_tables),
         "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
         "truncated": payload.get("truncated", False),
         "pagination": pagination,
         "search_diagnostics": search_diagnostics,
         "candidate_quality": candidate_quality,
         "tables": response_tables,
+        "low_confidence_results": low_confidence_tables,
         "deprecated_aliases": {"results": "Use tables; duplicate results payload is no longer returned by default."},
         "payload_options": {
             "include_raw": include_raw,
@@ -7462,11 +7531,12 @@ async def search_nabo_tables(
             explanation="NABO table search returns table candidates only, not statistical values.",
             extra_signals={
                 "source_system": "NABO",
-                "result_count": len(tables),
+                "result_count": len(primary_tables),
                 "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
                 "search_diagnostics": search_diagnostics,
                 "pagination": pagination,
                 "candidate_quality": candidate_quality,
+                "low_confidence_result_count": len(secondary_tables),
                 "payload_options": {
                     "include_raw": include_raw,
                     "raw_omitted": not include_raw,
@@ -8207,6 +8277,11 @@ async def search_stats(
     combined_results = _sort_search_candidates(query, results)[: max(1, int(limit or 10)) * (2 if source_norm == "all" else 1)]
     search_quality_summary = _search_quality_summary(query, combined_results)
     results, low_confidence_results, candidate_quality = _demote_low_confidence_search_results(combined_results, search_quality_summary)
+    unfocused_results: list[dict[str, Any]] = []
+    if not low_confidence_results:
+        results, low_confidence_results = _demote_partial_results_when_full_match_exists(results, search_quality_summary)
+        results, unfocused_results = _demote_unfocused_full_matches(results)
+        low_confidence_results.extend(unfocused_results)
     candidate_quality = candidate_quality or _candidate_quality_label(results, search_quality_summary)
     broad_query = _is_broad_query_candidate_set(query, results or low_confidence_results)
     if broad_query and candidate_quality == "full_match_available":
@@ -8217,7 +8292,13 @@ async def search_stats(
     elif search_quality_summary["full_query_match_count"] == 0:
         markers.append("no_full_query_match")
     if low_confidence_results:
-        markers.append("low_confidence_candidates_only")
+        if candidate_quality == "low_confidence_only":
+            markers.append("low_confidence_candidates_only")
+        else:
+            if len(low_confidence_results) > len(unfocused_results):
+                markers.append("partial_candidates_demoted")
+            if unfocused_results:
+                markers.append("unfocused_full_match_demoted")
     if broad_query:
         markers.append("broad_query")
     if search_quality_summary["missing_terms_across_results"]:

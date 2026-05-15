@@ -1813,6 +1813,35 @@ async def test_nabo_search_uses_token_coverage_fallback() -> None:
     assert "catalog_fallback_search" in markers, markers
 
 
+async def test_nabo_search_demotes_partial_candidates_when_full_match_exists() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+
+    async def fake_fetch(service: str, key: str, params: Any = None, *, max_rows: int = 5000) -> dict[str, Any]:
+        if service == "Sttsapitbl":
+            return {
+                "status": "executed",
+                "total_count": 2,
+                "rows": [
+                    {"STATBL_ID": "N1", "STATBL_NM": "Electric fee and generation", "DTACYCLE_NM": "Year"},
+                    {"STATBL_ID": "N2", "STATBL_NM": "Electric generation", "DTACYCLE_NM": "Year"},
+                ],
+            }
+        return {"status": "executed", "total_count": 0, "rows": []}
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_nabo_tables("electric fee", api_key="dummy")
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+
+    assert result["status"] == "executed", result
+    assert result["tables"][0]["table_id"] == "N1", result
+    assert len(result["tables"]) == 1, result
+    assert result["low_confidence_results"][0]["table_id"] == "N2", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "partial_candidates_demoted" in markers, markers
+
+
 def test_nabo_table_search_metric_promotion_requires_metadata_support() -> None:
     assert kosis_mcp_server._nabo_table_candidates_support_query(
         "national debt",
@@ -2510,6 +2539,102 @@ async def test_search_stats_surfaces_partial_query_match() -> None:
     assert "low_confidence_candidates_only" in markers, result
 
 
+async def test_search_stats_demotes_partial_candidates_when_full_match_exists() -> None:
+    original_search_kosis = kosis_mcp_server.search_kosis
+    original_search_nabo = kosis_mcp_server.search_nabo_tables
+
+    async def fake_search_kosis(query: str, limit: int = 10, **_: Any) -> dict[str, Any]:
+        return {
+            "result_count": 0,
+            "寃곌낵": [],
+            "mcp_output_contract": {"current_signals": {"markers_present": []}},
+        }
+
+    async def fake_search_nabo(query: str, limit: int = 10, **_: Any) -> dict[str, Any]:
+        return {
+            "status": "executed",
+            "result_count": 2,
+            "tables": [
+                {
+                    "source_system": "NABO",
+                    "table_id": "N1",
+                    "table_name": "Electric fee",
+                    "match_quality": kosis_mcp_server._query_match_quality(query, "Electric fee"),
+                },
+                {
+                    "source_system": "NABO",
+                    "table_id": "N2",
+                    "table_name": "Electric generation",
+                    "match_quality": kosis_mcp_server._query_match_quality(query, "Electric generation"),
+                },
+            ],
+            "mcp_output_contract": {"current_signals": {"markers_present": []}},
+        }
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = fake_search_nabo  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_stats("electric fee")
+    finally:
+        kosis_mcp_server.search_kosis = original_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = original_search_nabo  # type: ignore[assignment]
+
+    assert result["status"] == "executed", result
+    assert result["candidate_quality"] == "full_match_available", result
+    assert len(result["results"]) == 1, result
+    assert result["results"][0]["table_id"] == "N1", result
+    assert result["low_confidence_results"][0]["table_id"] == "N2", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "partial_candidates_demoted" in markers, result
+
+
+async def test_search_stats_demotes_unfocused_full_matches() -> None:
+    original_search_kosis = kosis_mcp_server.search_kosis
+    original_search_nabo = kosis_mcp_server.search_nabo_tables
+
+    async def fake_search_kosis(query: str, limit: int = 10, **_: Any) -> dict[str, Any]:
+        return {
+            "result_count": 0,
+            "寃곌낵": [],
+            "mcp_output_contract": {"current_signals": {"markers_present": []}},
+        }
+
+    async def fake_search_nabo(query: str, limit: int = 10, **_: Any) -> dict[str, Any]:
+        rows = [
+            ("N1", "Electric fee"),
+            ("N2", "Survey question about accepting home activity data collection to reduce electric fee"),
+        ]
+        return {
+            "status": "executed",
+            "result_count": 2,
+            "tables": [
+                {
+                    "source_system": "NABO",
+                    "table_id": table_id,
+                    "table_name": table_name,
+                    "match_quality": kosis_mcp_server._query_match_quality(query, table_name),
+                }
+                for table_id, table_name in rows
+            ],
+            "mcp_output_contract": {"current_signals": {"markers_present": []}},
+        }
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = fake_search_nabo  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_stats("electric fee")
+    finally:
+        kosis_mcp_server.search_kosis = original_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = original_search_nabo  # type: ignore[assignment]
+
+    assert result["status"] == "executed", result
+    assert len(result["results"]) == 1, result
+    assert result["results"][0]["table_id"] == "N1", result
+    assert result["low_confidence_results"][0]["table_id"] == "N2", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "unfocused_full_match_demoted" in markers, result
+
+
 def test_ascii_query_terms_do_not_match_inside_words() -> None:
     quality = kosis_mcp_server._query_match_quality("중소기업 R&D", "OECD public sector debt")
     assert "rd" in quality["missing_query_terms"], quality
@@ -2736,6 +2861,7 @@ async def main() -> None:
         ("nabo_catalog_fallback_search", lambda: test_nabo_search_uses_catalog_fallback_for_contained_table_name()),
         ("nabo_item_catalog_fallback_search", lambda: test_nabo_search_uses_item_catalog_fallback()),
         ("nabo_token_coverage_fallback", lambda: test_nabo_search_uses_token_coverage_fallback()),
+        ("nabo_partial_candidate_demote", lambda: test_nabo_search_demotes_partial_candidates_when_full_match_exists()),
         ("nabo_table_search_metric_support", lambda: test_nabo_table_search_metric_promotion_requires_metadata_support()),
         ("nabo_unknown_filter", lambda: test_nabo_query_rejects_unknown_filter_key()),
         ("nabo_missing_values", lambda: test_nabo_query_marks_missing_values()),
@@ -2755,6 +2881,8 @@ async def main() -> None:
         ("decode_error_internal_status", lambda: test_decode_error_knows_internal_status_codes()),
         ("search_kosis_match_quality", lambda: test_search_kosis_attaches_match_quality()),
         ("search_stats_partial_match", lambda: test_search_stats_surfaces_partial_query_match()),
+        ("search_stats_partial_candidate_demote", lambda: test_search_stats_demotes_partial_candidates_when_full_match_exists()),
+        ("search_stats_unfocused_candidate_demote", lambda: test_search_stats_demotes_unfocused_full_matches()),
         ("ascii_query_terms_word_boundary", lambda: test_ascii_query_terms_do_not_match_inside_words()),
         ("quick_stat_fuzzy_candidate", lambda: test_quick_stat_typo_returns_fuzzy_candidates_without_execution()),
         ("quick_stat_semantic_rewrite", lambda: test_quick_stat_unmapped_colloquial_requires_semantic_rewrite()),
