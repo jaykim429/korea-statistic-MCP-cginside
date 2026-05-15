@@ -791,6 +791,10 @@ NABOSTATS(국회예산정책처 재정경제통계시스템) OpenAPI도 같은 M
 - `search_nabo_terms(term, limit?)` — NABO 통계 용어사전을 검색합니다.
 - `search_stats(query, source="all")` — KOSIS와 NABO 표 후보를 함께 찾는 통합 검색 입구입니다. 통합 검색은 후보를 합쳐 보여줄 뿐, 두 제공기관의 통계가 같은 정의라고 단정하지 않습니다.
 
+검색 도구는 후보의 신뢰도를 함께 반환합니다. `match_quality`에는 질의어가 후보 표명·메타데이터에 얼마나 들어맞는지(`coverage_ratio`, `weighted_coverage_ratio`)와, 표 제목 안에서 질의어가 차지하는 비중(`title_focus_ratio`)이 들어갑니다. 완전 매칭 후보가 있으면 일부 단어만 맞은 후보는 `low_confidence_results`로 내려가고 `partial_candidates_demoted` marker가 붙습니다. 질의어는 모두 들어있지만 긴 설문 문항처럼 제목 초점이 낮은 후보도 `unfocused_full_match_demoted` marker와 함께 `low_confidence_results`로 분리됩니다.
+
+예를 들어 `search_stats("전기 요금", source="all")`은 `에너지용도별 전기요금 및 발전량`, 동절기·하절기 월평균 전기요금 같은 집중도 높은 후보를 우선 보여주고, "전기 요금 절약을 위해 데이터를 수집..."처럼 긴 문항형 후보는 보조 후보로 분리합니다. 이 처리는 특정 단어 사전이 아니라 질의어 커버리지와 제목 초점 비율로 작동합니다.
+
 예시:
 
 ```text
