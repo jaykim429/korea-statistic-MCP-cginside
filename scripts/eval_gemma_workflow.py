@@ -60,7 +60,7 @@ CASES: list[dict[str, Any]] = [
         "name": "simple_birth",
         "query": "출생아 수 알려줘",
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
-        "concepts": ["출생"],
+        "concepts": ["출생아수"],
         "consistency_warnings_len": 0,
     },
     {
@@ -78,7 +78,7 @@ CASES: list[dict[str, Any]] = [
         "expected_intent": "trend",
         "expected_workflow": ["select_table_for_query", "resolve_concepts", "query_table"],
         "required_dimensions": ["time"],
-        "concepts": ["출생", "2015", "2023"],
+        "concepts": ["출생아수", "2015", "2023"],
         "dimension_checks": {"time.type": "year_range", "time.start": "2015", "time.end": "2023"},
         "period_range": ["2015", "2023"],
     },

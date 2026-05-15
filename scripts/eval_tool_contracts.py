@@ -713,10 +713,54 @@ async def test_select_table_prefers_fresh_candidate_on_indicator_near_tie() -> N
 
     assert result["selected"]["tbl_id"] == "NEW", result
     assert result["selected"]["ranking_features"]["indicator_score"] == 3, result
-    assert result["alternatives"][1]["ranking_features"]["indicator_score"] == 5, result
+    assert result["alternatives"][0]["ranking_features"]["indicator_score"] == 5, result
     assert result["selected"]["ranking_features"]["latest_period_year"] == 2023, result
-    assert result["ranking_criteria"][1]["field"] == "latest_period_year", result
+    assert any(item["field"] == "latest_period_year" for item in result["ranking_criteria"]), result
     assert any("freshest" in reason for reason in result["selected"]["selection_reasons"]), result
+
+
+async def test_select_table_penalizes_projection_international_table_without_intent() -> None:
+    original_search = kosis_mcp_server.search_kosis
+    original_fetch_meta = kosis_mcp_server._fetch_meta
+
+    async def fake_search(term: str, limit: int = 10, use_routing: bool = True, api_key: Any = None) -> dict[str, Any]:
+        return {
+            "결과": [
+                {"통계표명": "Total fertility rate - Northeast Asia", "통계표ID": "INTL", "기관ID": "101"},
+                {"통계표명": "Total fertility rate", "통계표ID": "DOMESTIC", "기관ID": "101"},
+            ],
+            "Tier_A_직접_매핑": None,
+        }
+
+    async def fake_fetch_meta(client: Any, key: Any, org_id: str, tbl_id: str, kind: str) -> list[dict[str, Any]]:
+        if kind == "TBL":
+            name = "Total fertility rate - Northeast Asia" if tbl_id == "INTL" else "Total fertility rate"
+            return [{"TBL_NM": name}]
+        if kind == "ITM":
+            return [{"OBJ_ID": "ITEM", "OBJ_NM": "item", "ITM_ID": "T1", "ITM_NM": "Total fertility rate"}]
+        if kind == "PRD":
+            latest = "2100" if tbl_id == "INTL" else "2024"
+            return [{"PRD_SE": "Y", "STRT_PRD_DE": "2000", "END_PRD_DE": latest}]
+        return []
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = fake_fetch_meta  # type: ignore[assignment]
+        result = await kosis_mcp_server.select_table_for_query(
+            "Korea total fertility rate",
+            indicator="Total fertility rate",
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server.search_kosis = original_search  # type: ignore[assignment]
+        kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
+
+    assert result["selected"]["tbl_id"] == "DOMESTIC", result
+    assert all(row.get("tbl_id") != "DOMESTIC" for row in result["alternatives"]), result
+    intl = next(row for row in result["alternatives"] if row["tbl_id"] == "INTL")
+    penalty_types = {item["type"] for item in intl["ranking_penalties"]}
+    assert "projection_without_future_intent" in penalty_types, intl
+    assert "international_table_for_domestic_query" in penalty_types, intl
 
 
 async def test_indicator_normalization_prefers_parenthetical_acronym() -> None:
@@ -1214,7 +1258,8 @@ async def test_analysis_tools_return_materials_not_interpretation() -> None:
     assert linear["forecast_path"], forecast
     assert forecast["model_options"], forecast
 
-    assert "해석" not in corr["Pearson"], corr
+    assert "Pearson" not in corr, corr
+    assert corr["deprecated_aliases"]["Pearson"] == "Use correlations.pearson", corr
     assert "kendall" in corr["correlations"], corr
     assert corr["must_know"]["correlation_is_not_causation"] is True, corr
 
@@ -2343,6 +2388,79 @@ async def test_verify_stat_claims_does_not_claim_free_text_verification() -> Non
     assert result["claims_detected_but_not_verified"], result
 
 
+async def test_decode_error_knows_internal_status_codes() -> None:
+    result = await kosis_mcp_server.decode_error("STAT_NOT_FOUND")
+    assert result["코드"] == "STAT_NOT_FOUND", result
+    assert result["공식코드_여부"] is False, result
+    assert result["source"] == "kosis_mcp_internal_status", result
+
+
+async def test_search_kosis_attaches_match_quality() -> None:
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_call(client: Any, endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{
+            "TBL_ID": "T1",
+            "ORG_ID": "101",
+            "TBL_NM": "R&D expenditure",
+            "STRT_PRD_DE": "2020",
+            "END_PRD_DE": "2024",
+        }]
+
+    try:
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_kosis("small business R&D", use_routing=False, api_key="dummy")
+    finally:
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    quality = result["결과"][0]["match_quality"]
+    assert quality["match_quality"] in {"low", "medium"}, result
+    assert "small" in quality["missing_query_terms"], result
+
+
+async def test_chart_distribution_returns_raw_svg_field() -> None:
+    original_lookup = kosis_mcp_server._curation_lookup
+    original_quick_stat = kosis_mcp_server.quick_stat
+
+    param = SimpleNamespace(
+        description="test indicator",
+        unit="units",
+        tbl_nm="test table",
+        region_scheme={
+            "전국": "00",
+            "A": "1",
+            "B": "2",
+            "C": "3",
+            "D": "4",
+            "E": "5",
+        },
+    )
+
+    async def fake_quick_stat(query: str, region: str = "전국", period: str = "latest", api_key: Any = None, **_: Any) -> dict[str, Any]:
+        return {"값": str({"A": 1, "B": 2, "C": 3, "D": 4, "E": 5}.get(region, 0))}
+
+    try:
+        kosis_mcp_server._curation_lookup = lambda query: param  # type: ignore[assignment]
+        kosis_mcp_server.quick_stat = fake_quick_stat  # type: ignore[assignment]
+        result = await kosis_mcp_server.chart_distribution("test", api_key="dummy")
+    finally:
+        kosis_mcp_server._curation_lookup = original_lookup  # type: ignore[assignment]
+        kosis_mcp_server.quick_stat = original_quick_stat  # type: ignore[assignment]
+
+    assert isinstance(result, dict), result
+    assert result["mime_type"] == "image/svg+xml", result
+    assert result["svg"].startswith("<svg"), result
+    assert "```" not in result["svg"], result
+
+
+async def test_shortcut_contract_prunes_null_fields() -> None:
+    payload = {"status": "failed", "code": "PERIOD_NOT_FOUND", "권고": None, "기간_해석": None}
+    result = kosis_mcp_server._attach_shortcut_contract(payload, tool="quick_stat")
+    assert "권고" not in result, result
+    assert "기간_해석" not in result, result
+    assert "period_not_found" in result["mcp_output_contract"]["current_signals"]["markers_present"], result
+
+
 async def test_http_auth_middleware_requires_token_when_configured() -> None:
     from kosis_http_server import OptionalBearerAuthMiddleware
 
@@ -2399,6 +2517,7 @@ async def main() -> None:
         ("variable_compatibility_tier_a_miss_candidates", lambda: test_check_variable_compatibility_surfaces_tier_a_miss_candidates()),
         ("variable_compatibility_cadence_mismatch", lambda: test_check_variable_compatibility_marks_cadence_mismatch()),
         ("select_table_freshness_near_tiebreak", lambda: test_select_table_prefers_fresh_candidate_on_indicator_near_tie()),
+        ("select_table_projection_international_penalty", lambda: test_select_table_penalizes_projection_international_table_without_intent()),
         ("indicator_normalization_parenthetical_acronym", lambda: test_indicator_normalization_prefers_parenthetical_acronym()),
         ("indicator_normalization_route_terms", lambda: test_indicator_normalization_uses_route_search_terms()),
         ("indicator_normalization_table_context", lambda: test_indicator_normalization_prefers_relevant_table_name()),
@@ -2451,6 +2570,10 @@ async def main() -> None:
         ("search_stats_source_systems", lambda: test_search_stats_preserves_source_systems()),
         ("plan_response_compact", lambda: test_plan_response_compact_hides_legacy_control_fields()),
         ("verify_stat_claims_free_text_scope", lambda: test_verify_stat_claims_does_not_claim_free_text_verification()),
+        ("decode_error_internal_status", lambda: test_decode_error_knows_internal_status_codes()),
+        ("search_kosis_match_quality", lambda: test_search_kosis_attaches_match_quality()),
+        ("chart_distribution_raw_svg", lambda: test_chart_distribution_returns_raw_svg_field()),
+        ("shortcut_prunes_null_fields", lambda: test_shortcut_contract_prunes_null_fields()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
     ]
     passed = 0

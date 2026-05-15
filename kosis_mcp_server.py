@@ -253,7 +253,7 @@ def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]
 def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Optional[list[str]] = None) -> Any:
     if not isinstance(payload, dict):
         return payload
-    result = dict(payload)
+    result = _prune_nullish_fields(dict(payload))
     existing_contract = result.get("mcp_output_contract") if isinstance(result.get("mcp_output_contract"), dict) else {}
     existing_signals = existing_contract.get("current_signals") if isinstance(existing_contract, dict) else {}
     markers = list(existing_signals.get("markers_present") or []) if isinstance(existing_signals, dict) else []
@@ -368,7 +368,7 @@ def _mcp_tool_output_contract(
         "complete_fanout_miss": "Report that verified calls returned no rows; do not backfill from model knowledge.",
         "max_fanout_exceeded": "Reduce filters or split the query into smaller calls.",
         "fanout_call_failed": "Inspect fanout.call_details errors/timeouts before using any partial rows.",
-        "period_not_found": "Use available_period_range or suggested_period_range before retrying.",
+        "period_not_found": "Use available_period_range/suggested_period_range when present; otherwise call explore_table before retrying.",
         "period_type_mismatch": "Convert the requested period to the table cadence shown in period_format_examples.",
         "dtacycle_mismatch": "Use the table's dtacycle_cd_suggestions or dtacycle_cd='auto' before querying NABO rows.",
         "invalid_period_format": "Normalize natural-language time to KOSIS period codes before retrying query_table.",
@@ -382,6 +382,7 @@ def _mcp_tool_output_contract(
         "all_values_missing": "Rows were matched but every returned value is empty; report unavailable data instead of a numeric answer.",
         "tier_a_not_matched": "The shortcut/Tier-A catalog did not contain this variable; inspect search_candidates before deciding the statistic is unavailable.",
         "cadence_mismatch": "Variables use different publication cadences; aggregate or resample outside the MCP before modeling them together.",
+        "ranking_penalties_applied": "Inspect ranking_penalties/query_match_quality before trusting the selected table.",
         "unit_caller_resolution_required": "Resolve the computed unit from unit_transformation before quoting.",
         "unit_mismatch": "Do not add or share values with different units until the caller explicitly converts them.",
         "unit_conversion_required": "Convert units outside the MCP or re-query comparable rows before using this result.",
@@ -4302,6 +4303,7 @@ async def correlate_stats(
     region: str = "전국", years: int = 15,
     api_key: Optional[str] = None,
     include_interpretation: bool = False,
+    include_legacy_aliases: bool = False,
 ) -> dict:
     """[📊] 두 통계의 상관계수와 재현 가능한 정합 데이터를 반환."""
     a = await quick_trend(query_a, region, years, api_key)
@@ -4369,16 +4371,12 @@ async def correlate_stats(
             "spearman": {"coefficient": round(float(sr), 8), "p_value": round(float(sp), 8)},
             "kendall": {"coefficient": round(float(kr), 8), "p_value": round(float(kp), 8)},
         },
-        "Pearson": {
-            "상관계수": round(float(pr), 4), "p_value": round(float(pp), 4),
-        },
-        "Spearman": {
-            "상관계수": round(float(sr), 4), "p_value": round(float(sp), 4),
-        },
-        "Kendall": {
-            "상관계수": round(float(kr), 4), "p_value": round(float(kp), 4),
-        },
         "정합데이터": list(zip(common, aa, bb)),
+        "deprecated_aliases": {
+            "Pearson": "Use correlations.pearson",
+            "Spearman": "Use correlations.spearman",
+            "Kendall": "Use correlations.kendall",
+        } if not include_legacy_aliases else {},
         "common_pitfalls": [
             {
                 "pitfall": "Correlation is not causation.",
@@ -4387,10 +4385,21 @@ async def correlate_stats(
             }
         ],
     }
+    if include_legacy_aliases:
+        result["Pearson"] = {"상관계수": round(float(pr), 4), "p_value": round(float(pp), 4)}
+        result["Spearman"] = {"상관계수": round(float(sr), 4), "p_value": round(float(sp), 4)}
+        result["Kendall"] = {"상관계수": round(float(kr), 4), "p_value": round(float(kp), 4)}
     if include_interpretation:
-        result["Pearson"]["해석"] = interpret(pr)
-        result["Spearman"]["해석"] = interpret(sr)
-        result["Kendall"]["해석"] = interpret(kr)
+        if not include_legacy_aliases:
+            result["interpretation_examples"] = {
+                "pearson": interpret(pr),
+                "spearman": interpret(sr),
+                "kendall": interpret(kr),
+            }
+        else:
+            result["Pearson"]["해석"] = interpret(pr)
+            result["Spearman"]["해석"] = interpret(sr)
+            result["Kendall"]["해석"] = interpret(kr)
     return result
 
 
@@ -4961,7 +4970,7 @@ async def chart_distribution(
     period: str = "latest",
     highlight_regions: Optional[list[str]] = None,
     api_key: Optional[str] = None,
-) -> list:
+) -> Any:
     """[🎨] 시도별 값 분포 (히스토그램 + 박스플롯).
 
     한 시점에서 17개 시도 값이 어떻게 퍼져 있는지. 중앙값/사분위/평균 표시.
@@ -5005,17 +5014,27 @@ async def chart_distribution(
     mean = sum(values) / len(values)
     sorted_v = sorted(values)
     median = sorted_v[len(sorted_v) // 2]
-    return [
-        _svg_to_image(svg),
-        TextContent(
-            type="text",
-            text=(
-                f"{param.description} 분포 — 시도 {len(values)}개, "
-                f"평균 {mean:.2f}, 중앙값 {median:.2f}, "
-                f"범위 [{min(values):.2f}, {max(values):.2f}]"
-            ),
-        ),
-    ]
+    summary = (
+        f"{param.description} 분포 — 시도 {len(values)}개, "
+        f"평균 {mean:.2f}, 중앙값 {median:.2f}, "
+        f"범위 [{min(values):.2f}, {max(values):.2f}]"
+    )
+    return {
+        "status": "executed",
+        "chart_type": "distribution",
+        "mime_type": "image/svg+xml",
+        "svg": svg,
+        "text_summary": summary,
+        "rendering_note": "SVG is returned as a raw field, not a markdown code fence.",
+        "data_summary": {
+            "region_count": len(values),
+            "mean": mean,
+            "median": median,
+            "min": min(values),
+            "max": max(values),
+            "unit": param.unit,
+        },
+    }
 
 
 @mcp.tool()
@@ -5854,6 +5873,21 @@ async def _search_kosis_keywords(
         if tier_a_hint is not None else
         "Search returned candidate tables; verify each candidate via select_table_for_query before use."
     )
+    result_rows: list[dict[str, Any]] = []
+    for row in unique[:limit]:
+        record = {
+            "통계표명": row.get("TBL_NM"),
+            "통계표ID": row.get("TBL_ID"),
+            "기관ID": row.get("ORG_ID"),
+            "수록기간": f"{row.get('STRT_PRD_DE')} ~ {row.get('END_PRD_DE')}",
+            "검색어": row.get("_검색어"),
+            "URL": row.get("LINK_URL") or row.get("TBL_VIEW_URL"),
+        }
+        record["match_quality"] = _query_match_quality(
+            query,
+            str(record.get("통계표명") or ""),
+        )
+        result_rows.append(record)
     return {
         "입력": query,
         "라우팅_사용": used_routing,
@@ -5862,17 +5896,8 @@ async def _search_kosis_keywords(
         "original_query_preserved": bool(keywords and keywords[0] == query),
         "결과수": len(unique),
         "Tier_A_직접_매핑": tier_a_hint,
-        "결과": [
-            {
-                "통계표명": r.get("TBL_NM"),
-                "통계표ID": r.get("TBL_ID"),
-                "기관ID": r.get("ORG_ID"),
-                "수록기간": f"{r.get('STRT_PRD_DE')} ~ {r.get('END_PRD_DE')}",
-                "검색어": r.get("_검색어"),
-                "URL": r.get("LINK_URL") or r.get("TBL_VIEW_URL"),
-            }
-            for r in unique[:limit]
-        ],
+        "결과": result_rows,
+        "results": result_rows,
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_search",
             final_answer_expected=False,
@@ -5885,6 +5910,97 @@ async def _search_kosis_keywords(
                 "original_query_preserved": bool(keywords and keywords[0] == query),
             },
         ),
+    }
+
+
+_QUERY_STOP_TERMS = {
+    "알려줘", "알려", "보여줘", "찾아줘", "최근", "추이", "기준", "통계", "자료",
+    "the", "and", "for", "with", "show", "find", "data", "stat", "stats",
+}
+
+
+def _query_tokens_for_matching(query: Any) -> list[str]:
+    text = str(query or "").replace("R&D", "RD").replace("r&d", "rd")
+    tokens = re.findall(r"[0-9A-Za-z가-힣]+", text)
+    cleaned: list[str] = []
+    for token in tokens:
+        norm = _compact_text(token)
+        if len(norm) < 2 or norm in _QUERY_STOP_TERMS:
+            continue
+        cleaned.append(norm)
+    return list(dict.fromkeys(cleaned))
+
+
+def _query_match_quality(query: Any, candidate_text: Any) -> dict[str, Any]:
+    tokens = _query_tokens_for_matching(query)
+    haystack = _compact_text(str(candidate_text or "").replace("R&D", "RD").replace("r&d", "rd"))
+    matched = [token for token in tokens if token in haystack]
+    missing = [token for token in tokens if token not in haystack]
+    ratio = round(len(matched) / len(tokens), 4) if tokens else 1.0
+    return {
+        "query_terms": tokens,
+        "matched_terms": matched,
+        "missing_query_terms": missing,
+        "coverage_ratio": ratio,
+        "match_quality": "high" if ratio >= 0.8 else "medium" if ratio >= 0.5 else "low",
+    }
+
+
+_DOMESTIC_QUERY_TERMS = ("전국", "한국", "대한민국", "국내", "korea", "southkorea")
+_FUTURE_REQUEST_TERMS = ("추계", "전망", "예측", "장래", "미래", "projection", "forecast")
+_INTERNATIONAL_CONTEXT_TERMS = (
+    "국가별", "국제", "세계", "oecd", "imf", "world", "country", "countries",
+    "asia", "아시아", "유럽", "미국", "일본", "중국", "동북", "중앙아시아",
+)
+
+
+def _candidate_text_for_ranking(candidate: dict[str, Any]) -> str:
+    parts = [
+        candidate.get("table_name"),
+        " ".join(candidate.get("indicator_evidence") or []),
+    ]
+    return " ".join(str(part or "") for part in parts)
+
+
+def _selection_context_adjustments(candidate: dict[str, Any], query: Any, indicator: Any = None) -> dict[str, Any]:
+    query_text = _compact_text(f"{query or ''} {indicator or ''}")
+    candidate_text = _compact_text(_candidate_text_for_ranking(candidate))
+    latest_year = _candidate_latest_period_year(candidate)
+    current_year = datetime.now().year
+    future_requested = any(_compact_text(term) in query_text for term in _FUTURE_REQUEST_TERMS)
+    domestic_requested = any(_compact_text(term) in query_text for term in _DOMESTIC_QUERY_TERMS)
+    international_requested = any(_compact_text(term) in query_text for term in _INTERNATIONAL_CONTEXT_TERMS)
+    projection_like = latest_year > current_year + 5 or any(_compact_text(term) in candidate_text for term in _FUTURE_REQUEST_TERMS)
+    international_like = any(_compact_text(term) in candidate_text for term in _INTERNATIONAL_CONTEXT_TERMS)
+    quality = _query_match_quality(query, _candidate_text_for_ranking(candidate))
+    penalties: list[dict[str, Any]] = []
+    if projection_like and not future_requested:
+        penalties.append({
+            "type": "projection_without_future_intent",
+            "penalty": 3,
+            "evidence": {"latest_period_year": latest_year},
+        })
+    if domestic_requested and international_like and not international_requested:
+        penalties.append({
+            "type": "international_table_for_domestic_query",
+            "penalty": 3,
+            "evidence": {"table_name": candidate.get("table_name")},
+        })
+    if quality["query_terms"] and quality["coverage_ratio"] < 0.5:
+        penalties.append({
+            "type": "low_query_term_coverage",
+            "penalty": 1,
+            "evidence": {
+                "matched_terms": quality["matched_terms"],
+                "missing_query_terms": quality["missing_query_terms"],
+            },
+        })
+    return {
+        "query_match_quality": quality,
+        "ranking_penalty": sum(int(item["penalty"]) for item in penalties),
+        "ranking_penalties": penalties,
+        "projection_like": projection_like,
+        "international_like": international_like,
     }
 
 
@@ -5922,24 +6038,32 @@ def _candidate_indicator_score(candidate: dict[str, Any]) -> int:
         return 0
 
 
-def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]]) -> None:
+def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]], *, query: Any = None, indicator: Any = None) -> None:
     for candidate in candidates:
         indicator_score = _candidate_indicator_score(candidate)
+        context = _selection_context_adjustments(candidate, query, indicator)
         features = {
             "indicator_score": indicator_score,
             "indicator_score_band": indicator_score // 3,
             "latest_period_year": _candidate_latest_period_year(candidate),
             "cadence_diversity": _candidate_cadence_diversity(candidate),
             "item_count": _candidate_item_count(candidate),
+            "query_term_coverage": context["query_match_quality"]["coverage_ratio"],
+            "ranking_penalty": context["ranking_penalty"],
         }
         candidate["ranking_features"] = features
+        candidate["query_match_quality"] = context["query_match_quality"]
+        if context["ranking_penalties"]:
+            candidate["ranking_penalties"] = context["ranking_penalties"]
 
 
 def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
     features = candidate.get("ranking_features") or {}
     return (
         candidate.get("status") != "selected",
+        int(features.get("ranking_penalty") or 0),
         -int(features.get("indicator_score_band") or 0),
+        -int(float(features.get("query_term_coverage") or 0.0) * 1000),
         -int(features.get("latest_period_year") or 0),
         -int(features.get("indicator_score") or 0),
         -int(features.get("cadence_diversity") or 0),
@@ -5979,6 +6103,14 @@ def _table_selection_reasons(selected: dict[str, Any], selected_candidates: list
         reasons.append(f"cadence_diversity={cadence_count}")
     if item_count:
         reasons.append(f"item_count={item_count}")
+    if selected.get("query_match_quality"):
+        quality = selected["query_match_quality"]
+        reasons.append(
+            f"query_term_coverage={quality.get('coverage_ratio')} "
+            f"(matched={quality.get('matched_terms')}, missing={quality.get('missing_query_terms')})"
+        )
+    if selected.get("ranking_penalties"):
+        reasons.append(f"ranking_penalties={selected.get('ranking_penalties')}")
     return reasons
 
 
@@ -5994,6 +6126,8 @@ def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "matched_dimensions": candidate.get("matched_dimensions"),
         "missing_dimensions": candidate.get("missing_dimensions"),
         "indicator_evidence": candidate.get("indicator_evidence"),
+        "query_match_quality": candidate.get("query_match_quality"),
+        "ranking_penalties": candidate.get("ranking_penalties"),
         "ranking_features": candidate.get("ranking_features"),
         "periods": candidate.get("periods"),
     }
@@ -6986,6 +7120,12 @@ async def search_nabo_tables(
         markers.append("catalog_fallback_search")
         if any(str(table.get("search_match_source") or "").find("item_catalog") >= 0 for table in tables):
             markers.append("item_catalog_search")
+    for table in tables:
+        if isinstance(table, dict):
+            table["match_quality"] = _query_match_quality(
+                query,
+                " ".join(str(table.get(key) or "") for key in ("table_name", "category", "table_comment", "search_term")),
+            )
     search_diagnostics = {
         "api_table_name_result_count": len(api_tables),
         "catalog_fallback_used": bool(catalog_fallback),
@@ -7828,6 +7968,18 @@ async def search_stats(
     return result
 
 
+def _prune_nullish_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _prune_nullish_fields(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [_prune_nullish_fields(item) for item in value]
+    return value
+
+
 @mcp.tool()
 async def resolve_concepts(
     org_id: str,
@@ -8214,7 +8366,7 @@ async def select_table_for_query(
                 period_rows=period_rows,
             )
             candidates.append(scorer.evaluate(profile).to_response())
-    _annotate_table_candidate_ranking(candidates)
+    _annotate_table_candidate_ranking(candidates, query=query, indicator=effective_indicator)
     candidates.sort(key=_table_candidate_sort_key)
     selected = [c for c in candidates if c.get("status") == "selected"]
     if selected:
@@ -8241,6 +8393,8 @@ async def select_table_for_query(
         warnings.append(
             "indicator와 query가 모두 비어 있어 indicator 증거 검증이 수행되지 않았습니다."
         )
+    if any(candidate.get("ranking_penalties") for candidate in candidates):
+        selection_markers.append("ranking_penalties_applied")
     explanation = (
         "No candidate satisfied both metadata dimensions and indicator evidence."
         if not selected else
@@ -8248,7 +8402,12 @@ async def select_table_for_query(
         if "indicator_evidence_empty" in selection_markers else
         "A metadata-compatible table candidate was selected."
     )
-    alternatives = candidates[:limit] if verbose else [_compact_table_candidate(candidate) for candidate in candidates[:limit]]
+    selected_candidate = selected[0] if selected else None
+    alternative_candidates = [
+        candidate for candidate in candidates
+        if selected_candidate is None or candidate is not selected_candidate
+    ]
+    alternatives = alternative_candidates[:limit] if verbose else [_compact_table_candidate(candidate) for candidate in alternative_candidates[:limit]]
     rejected_candidates = [candidate for candidate in candidates if candidate.get("status") != "selected"]
     rejected_payload = rejected_candidates[:limit] if verbose else _selection_rejection_summary(candidates, min(limit, 5))
     return {
@@ -8266,17 +8425,20 @@ async def select_table_for_query(
         "inferred_dimensions": _normalize_required_dimensions(inferred_dimensions),
         "reject_if_missing_dimensions": reject_if_missing_dimensions,
         "verbose": verbose,
-        "selected": (selected[0] if verbose else _compact_table_candidate(selected[0])) if selected else None,
+        "selected": (selected_candidate if verbose else _compact_table_candidate(selected_candidate)) if selected_candidate else None,
         "alternatives": alternatives,
         "rejected": rejected_payload,
         "diagnostics_note": "Pass verbose=true to include full axis_evidence, axis_summary, and metadata_profile for every candidate.",
         "ranking_criteria": [
-            {"order": 1, "field": "indicator_score_band", "applied": True},
-            {"order": 2, "field": "latest_period_year", "applied": True},
-            {"order": 3, "field": "indicator_score", "applied": True},
-            {"order": 4, "field": "cadence_diversity", "applied": True},
-            {"order": 5, "field": "item_count", "applied": True},
-            {"order": 6, "field": "score", "applied": True},
+            {"order": 1, "field": "status_selected", "applied": True},
+            {"order": 2, "field": "ranking_penalty", "applied": True},
+            {"order": 3, "field": "indicator_score_band", "applied": True},
+            {"order": 4, "field": "query_term_coverage", "applied": True},
+            {"order": 5, "field": "latest_period_year", "applied": True},
+            {"order": 6, "field": "indicator_score", "applied": True},
+            {"order": 7, "field": "cadence_diversity", "applied": True},
+            {"order": 8, "field": "item_count", "applied": True},
+            {"order": 9, "field": "score", "applied": True},
         ],
         "warnings": warnings,
         "mcp_output_contract": _mcp_tool_output_contract(
@@ -9594,7 +9756,28 @@ async def decode_error(error_code: str) -> dict:
         # Try exact, then upper, then lowercase. KOSIS official codes
         # are numeric so case-insensitive lookup is safe for non-numeric variants.
     candidates = [code, code.upper(), code.lower()]
+    internal_error_map = {
+        STATUS_EXECUTED: "Internal status: request executed successfully.",
+        STATUS_NEEDS_TABLE_SELECTION: "Internal status: table selection is required before querying values.",
+        STATUS_STAT_NOT_FOUND: "Internal error: the requested statistic/table was not found or metadata returned no table.",
+        STATUS_PERIOD_NOT_FOUND: "Internal error: the requested period is outside the available data or returned no rows.",
+        STATUS_PERIOD_RANGE_REQUESTED: "Internal status: a range was supplied to a single-period shortcut.",
+        STATUS_UNVERIFIED_FORMULA: "Internal status: claim/formula could not be verified from structured rows.",
+        STATUS_INVALID_FILTER_CODE: "Internal error: one or more filter codes are invalid for the selected table.",
+        STATUS_INVALID_PERIOD_RANGE: "Internal error: period range could not be parsed or is unsupported.",
+        STATUS_DENOMINATOR_REQUIRED: "Internal status: denominator data is required before computing the indicator.",
+        STATUS_RUNTIME_ERROR: "Internal runtime error.",
+        STATUS_MISSING_API_KEY: "Internal error: required API key is missing.",
+        STATUS_FANOUT_LIMIT_EXCEEDED: "Internal error: requested fan-out exceeds configured safety limit.",
+    }
     for cand in candidates:
+        if cand in internal_error_map:
+            return {
+                "코드": cand,
+                "의미": internal_error_map[cand],
+                "공식코드_여부": False,
+                "source": "kosis_mcp_internal_status",
+            }
         if cand in ERROR_MAP:
             return {
                 "코드": cand,
