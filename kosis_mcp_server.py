@@ -24,6 +24,7 @@ import os
 import re
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Optional
 
 import httpx
@@ -235,6 +236,8 @@ def _attach_gemma_deprecation_warning(payload: dict[str, Any]) -> dict[str, Any]
         markers.append("dropped_dimensions")
     if result.get("status") == "failed":
         markers.append("runtime_error")
+    if result.get("did_you_mean"):
+        markers.append("fuzzy_candidate_available")
     result["mcp_output_contract"] = _mcp_tool_output_contract(
         role="convenience_tool",
         final_answer_expected=True,
@@ -266,6 +269,8 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
         markers.append("period_not_found")
     if result.get("오류") or status in {"failed", "unsupported"}:
         markers.append("unsupported")
+    if result.get("did_you_mean"):
+        markers.append("fuzzy_candidate_available")
     result["mcp_output_contract"] = _mcp_tool_output_contract(
         role="shortcut_tool",
         final_answer_expected=True,
@@ -876,6 +881,56 @@ from kosis_charts_extra import (
 def _lookup_quick(query: str) -> Optional[QuickStatParam]:
     """큐레이션 모듈에 위임 (Tier A 정밀 매핑 + 동의어 + 부분 일치)."""
     return _curation_lookup(query)
+
+
+def _suggest_tier_a_query_candidates(query: Any, limit: int = 3) -> list[dict[str, Any]]:
+    """Return fuzzy Tier-A candidates without silently executing them."""
+    needle = _compact_text(str(query or ""))
+    if len(needle) < 3:
+        return []
+
+    def similarity(candidate: str) -> float:
+        if not candidate:
+            return 0.0
+        best = SequenceMatcher(None, needle, candidate).ratio()
+        if needle in candidate or candidate in needle:
+            best = max(best, 0.9)
+        # Long labels such as "small-business establishments" should still
+        # surface typo candidates for their leading concept token.
+        window_sizes = {len(needle)}
+        if len(needle) > 3:
+            window_sizes.update({len(needle) - 1, len(needle) + 1})
+        for size in sorted(size for size in window_sizes if 2 <= size <= len(candidate)):
+            for start in range(0, len(candidate) - size + 1):
+                best = max(best, SequenceMatcher(None, needle, candidate[start:start + size]).ratio())
+        return best
+
+    scored: list[dict[str, Any]] = []
+    for key, param in TIER_A_STATS.items():
+        texts = [key, getattr(param, "description", None), getattr(param, "tbl_nm", None)]
+        best_score = 0.0
+        best_text = None
+        for text in texts:
+            candidate = _compact_text(str(text or ""))
+            if not candidate:
+                continue
+            score = similarity(candidate)
+            if score > best_score:
+                best_score = score
+                best_text = text
+        threshold = 0.72 if len(needle) >= 4 else 0.82
+        if best_score >= threshold:
+            scored.append({
+                "query": key,
+                "description": getattr(param, "description", None),
+                "table_name": getattr(param, "tbl_nm", None),
+                "score": round(best_score, 4),
+                "matched_text": best_text,
+                "source": "tier_a_fuzzy_candidate",
+                "caller_must_confirm": True,
+            })
+    scored.sort(key=lambda row: (-float(row.get("score") or 0.0), str(row.get("query") or "")))
+    return scored[: max(1, int(limit or 3))]
 
 
 def _resolve_classification_term(
@@ -3841,6 +3896,7 @@ async def _quick_stat_core(
 
     # === Tier B 라우팅: 추천 검색어로 폴백 ===
     hints = _routing_hints(query)
+    did_you_mean = _suggest_tier_a_query_candidates(query)
     search_keywords = hints[:3] if hints else [query]
 
     async with httpx.AsyncClient() as client:
@@ -3879,6 +3935,7 @@ async def _quick_stat_core(
             }
             for r in unique[:8]
         ],
+        "did_you_mean": did_you_mean,
         "안내": (
             "후보 중 적합한 통계표를 골라서 KOSIS 사이트에서 확인하거나, "
             "더 구체적인 키워드로 다시 시도하세요."
@@ -5800,6 +5857,7 @@ async def _search_kosis_keywords(
     limit: int,
     api_key: Optional[str] = None,
     used_routing: bool = False,
+    include_legacy_aliases: bool = False,
 ) -> dict:
     try:
         key = _resolve_key(api_key)
@@ -5888,16 +5946,24 @@ async def _search_kosis_keywords(
             str(record.get("통계표명") or ""),
         )
         result_rows.append(record)
-    return {
+    result_rows = _sort_search_candidates(query, result_rows)
+    quality_summary = _search_quality_summary(query, result_rows)
+    if result_rows and quality_summary["full_query_match_count"] == 0:
+        search_markers.append("no_full_query_match")
+    if quality_summary["missing_terms_across_results"]:
+        search_markers.append("partial_query_match")
+    response = {
         "입력": query,
         "라우팅_사용": used_routing,
         "사용된_검색어": keywords,
         "search_terms_used": keywords,
         "original_query_preserved": bool(keywords and keywords[0] == query),
         "결과수": len(unique),
+        "result_count": len(unique),
         "Tier_A_직접_매핑": tier_a_hint,
         "결과": result_rows,
-        "results": result_rows,
+        "deprecated_aliases": {"results": "Use 결과; duplicate results payload is omitted by default."},
+        "search_quality_summary": quality_summary,
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_search",
             final_answer_expected=False,
@@ -5908,9 +5974,13 @@ async def _search_kosis_keywords(
                 "routing_used": used_routing,
                 "tier_a_match": tier_a_hint is not None,
                 "original_query_preserved": bool(keywords and keywords[0] == query),
+                "search_quality_summary": quality_summary,
             },
         ),
     }
+    if include_legacy_aliases:
+        response["results"] = result_rows
+    return response
 
 
 _QUERY_STOP_TERMS = {
@@ -5943,6 +6013,61 @@ def _query_match_quality(query: Any, candidate_text: Any) -> dict[str, Any]:
         "missing_query_terms": missing,
         "coverage_ratio": ratio,
         "match_quality": "high" if ratio >= 0.8 else "medium" if ratio >= 0.5 else "low",
+    }
+
+
+def _match_quality_rank(quality: Optional[dict[str, Any]]) -> int:
+    label = (quality or {}).get("match_quality")
+    return {"high": 3, "medium": 2, "low": 1}.get(str(label), 0)
+
+
+def _search_candidate_text(row: dict[str, Any]) -> str:
+    return " ".join(
+        str(row.get(key) or "")
+        for key in (
+            "table_name", "table_id", "category", "table_comment",
+            "matched_items", "search_term",
+            "통계표명", "통계표ID", "TBL_NM", "TBL_ID",
+        )
+    )
+
+
+def _sort_search_candidates(query: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for row in rows:
+        if not isinstance(row.get("match_quality"), dict):
+            row["match_quality"] = _query_match_quality(query, _search_candidate_text(row))
+    return sorted(
+        rows,
+        key=lambda row: (
+            -float((row.get("match_quality") or {}).get("coverage_ratio") or 0.0),
+            -_match_quality_rank(row.get("match_quality")),
+            str(row.get("source_system") or ""),
+            str(row.get("table_name") or row.get("통계표명") or ""),
+            str(row.get("table_id") or row.get("통계표ID") or ""),
+        ),
+    )
+
+
+def _search_quality_summary(query: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    qualities = [
+        row.get("match_quality")
+        for row in rows
+        if isinstance(row.get("match_quality"), dict)
+    ]
+    missing_terms = sorted({
+        term
+        for quality in qualities
+        for term in (quality.get("missing_query_terms") or [])
+    })
+    full_count = sum(1 for quality in qualities if float(quality.get("coverage_ratio") or 0.0) >= 1.0)
+    return {
+        "query_terms": _query_tokens_for_matching(query),
+        "full_query_match_count": full_count,
+        "partial_query_match_count": sum(1 for quality in qualities if 0.0 < float(quality.get("coverage_ratio") or 0.0) < 1.0),
+        "low_query_match_count": sum(1 for quality in qualities if quality.get("match_quality") == "low"),
+        "best_coverage_ratio": max((float(quality.get("coverage_ratio") or 0.0) for quality in qualities), default=0.0),
+        "missing_terms_across_results": missing_terms,
+        "candidate_count": len(rows),
     }
 
 
@@ -7039,6 +7164,7 @@ async def search_kosis(
     query: str, limit: int = 10,
     use_routing: bool = True,
     api_key: Optional[str] = None,
+    include_legacy_aliases: bool = False,
 ) -> dict:
     """[🔍] KOSIS 통합검색. Tier B 라우팅 사전으로 검색어를 자동 보강.
 
@@ -7068,6 +7194,7 @@ async def search_kosis(
         limit,
         api_key,
         used_routing=used_routing,
+        include_legacy_aliases=include_legacy_aliases,
     )
 
 
@@ -7126,6 +7253,12 @@ async def search_nabo_tables(
                 query,
                 " ".join(str(table.get(key) or "") for key in ("table_name", "category", "table_comment", "search_term")),
             )
+    tables = _sort_search_candidates(query, tables)
+    quality_summary = _search_quality_summary(query, tables)
+    if tables and quality_summary["full_query_match_count"] == 0:
+        markers.append("no_full_query_match")
+    if quality_summary["missing_terms_across_results"]:
+        markers.append("partial_query_match")
     search_diagnostics = {
         "api_table_name_result_count": len(api_tables),
         "catalog_fallback_used": bool(catalog_fallback),
@@ -7133,6 +7266,7 @@ async def search_nabo_tables(
         "catalog_size": catalog_fallback.get("catalog_size"),
         "catalog_fallback_error": catalog_fallback.get("error"),
         "item_catalog_error": catalog_fallback.get("item_catalog_error"),
+        "search_quality_summary": quality_summary,
     }
     pagination = {
         "result_count": len(tables),
@@ -7885,15 +8019,22 @@ async def search_stats(
                 "table_id": row.get("통계표ID") or row.get("TBL_ID"),
                 "org_id": row.get("기관ID") or row.get("ORG_ID"),
                 "table_name": row.get("통계표명") or row.get("TBL_NM"),
+                "match_quality": row.get("match_quality"),
             })
     if source_norm in {"all", "nabo"}:
         nabo_payload = await search_nabo_tables(query, limit=limit, api_key=nabo_api_key)
         source_payloads["nabo"] = nabo_payload
         results.extend((nabo_payload.get("tables") or [])[:limit])
 
+    results = _sort_search_candidates(query, results)[: max(1, int(limit or 10)) * (2 if source_norm == "all" else 1)]
+    search_quality_summary = _search_quality_summary(query, results)
     markers = []
     if not results:
         markers.append("search_empty")
+    elif search_quality_summary["full_query_match_count"] == 0:
+        markers.append("no_full_query_match")
+    if search_quality_summary["missing_terms_across_results"]:
+        markers.append("partial_query_match")
     missing_sources = [
         name for name, payload in source_payloads.items()
         if isinstance(payload, dict) and payload.get("code") == STATUS_MISSING_API_KEY
@@ -7932,6 +8073,7 @@ async def search_stats(
             "result_count": payload.get("result_count") or source_result_count,
             "total_count": payload.get("total_count"),
             "markers_present": ((payload.get("mcp_output_contract") or {}).get("current_signals") or {}).get("markers_present"),
+            "search_quality_summary": payload.get("search_quality_summary") or (payload.get("search_diagnostics") or {}).get("search_quality_summary"),
         }
     source_summaries = compact_source_summaries
     result = {
@@ -7941,6 +8083,7 @@ async def search_stats(
         "result_count": len(results),
         "results": results,
         "source_summaries": source_summaries,
+        "search_quality_summary": search_quality_summary,
         "must_know": {
             "mixed_sources": source_norm == "all",
             "caller_must_preserve_source_system": True,
@@ -7948,6 +8091,9 @@ async def search_stats(
             "source_systems_present": source_systems_present,
             "definition_comparison_required": cross_source_definition_check_required,
             "do_not_treat_cross_source_results_as_equivalent": cross_source_definition_check_required,
+            "search_results_are_candidates": True,
+            "full_query_match_count": search_quality_summary["full_query_match_count"],
+            "missing_terms_across_results": search_quality_summary["missing_terms_across_results"],
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_search",
@@ -7960,6 +8106,7 @@ async def search_stats(
                 "missing_sources": missing_sources,
                 "source_systems_present": source_systems_present,
                 "definition_comparison_required": cross_source_definition_check_required,
+                "search_quality_summary": search_quality_summary,
             },
         ),
     }

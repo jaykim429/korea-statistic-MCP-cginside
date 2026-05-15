@@ -2416,6 +2416,66 @@ async def test_search_kosis_attaches_match_quality() -> None:
     quality = result["결과"][0]["match_quality"]
     assert quality["match_quality"] in {"low", "medium"}, result
     assert "small" in quality["missing_query_terms"], result
+    assert "results" not in result, result
+    assert result["search_quality_summary"]["full_query_match_count"] == 0, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "no_full_query_match" in markers, result
+
+
+async def test_search_stats_surfaces_partial_query_match() -> None:
+    original_search_kosis = kosis_mcp_server.search_kosis
+    original_search_nabo = kosis_mcp_server.search_nabo_tables
+
+    async def fake_search_kosis(query: str, limit: int = 10, **_: Any) -> dict[str, Any]:
+        return {
+            "result_count": 1,
+            "결과": [{
+                "통계표ID": "K1",
+                "기관ID": "101",
+                "통계표명": "R&D expenditure",
+                "match_quality": kosis_mcp_server._query_match_quality(query, "R&D expenditure"),
+            }],
+            "mcp_output_contract": {"current_signals": {"markers_present": []}},
+        }
+
+    async def fake_search_nabo(query: str, limit: int = 10, **_: Any) -> dict[str, Any]:
+        return {
+            "status": "empty",
+            "result_count": 0,
+            "tables": [],
+            "mcp_output_contract": {"current_signals": {"markers_present": ["search_empty"]}},
+        }
+
+    try:
+        kosis_mcp_server.search_kosis = fake_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = fake_search_nabo  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_stats("small business R&D")
+    finally:
+        kosis_mcp_server.search_kosis = original_search_kosis  # type: ignore[assignment]
+        kosis_mcp_server.search_nabo_tables = original_search_nabo  # type: ignore[assignment]
+
+    assert result["search_quality_summary"]["full_query_match_count"] == 0, result
+    assert "small" in result["must_know"]["missing_terms_across_results"], result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "no_full_query_match" in markers, result
+
+
+async def test_quick_stat_typo_returns_fuzzy_candidates_without_execution() -> None:
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_call(client: Any, endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
+    try:
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_stat("중소기엄", api_key="dummy")
+    finally:
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    assert result.get("did_you_mean"), result
+    assert result["did_you_mean"][0]["caller_must_confirm"] is True, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "fuzzy_candidate_available" in markers, result
 
 
 async def test_chart_distribution_returns_raw_svg_field() -> None:
@@ -2572,6 +2632,8 @@ async def main() -> None:
         ("verify_stat_claims_free_text_scope", lambda: test_verify_stat_claims_does_not_claim_free_text_verification()),
         ("decode_error_internal_status", lambda: test_decode_error_knows_internal_status_codes()),
         ("search_kosis_match_quality", lambda: test_search_kosis_attaches_match_quality()),
+        ("search_stats_partial_match", lambda: test_search_stats_surfaces_partial_query_match()),
+        ("quick_stat_fuzzy_candidate", lambda: test_quick_stat_typo_returns_fuzzy_candidates_without_execution()),
         ("chart_distribution_raw_svg", lambda: test_chart_distribution_returns_raw_svg_field()),
         ("shortcut_prunes_null_fields", lambda: test_shortcut_contract_prunes_null_fields()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
