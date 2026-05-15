@@ -54,7 +54,6 @@ CASES: list[dict[str, Any]] = [
     },
     {
         "name": "metro_nonmetro_industry_gap",
-        "evidence_bundle": False,
         "query": "수도권과 비수도권의 소상공인 사업체 수 차이를 비교하고, 업종별로 격차가 가장 큰 분야를 찾아줘.",
         "metrics": ["사업체 수"],
         "dimensions": ["region_group", "industry", "scale"],

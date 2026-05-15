@@ -271,9 +271,20 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
         markers.append("unsupported")
     if result.get("did_you_mean"):
         markers.append("fuzzy_candidate_available")
+    if isinstance(result.get("semantic_rewrite"), dict) and result["semantic_rewrite"].get("required"):
+        markers.append("semantic_rewrite_required")
+    has_error_payload = any(result.get(key) for key in ("error", "오류", "?ㅻ쪟"))
+    has_candidate_only_payload = any(result.get(key) for key in ("검색_후보", "search_candidates", "candidates"))
+    final_answer_expected = not (
+        status in {"failed", "unsupported", "empty", "needs_query_rewrite", "needs_table_selection"}
+        or has_error_payload
+        or bool(result.get("did_you_mean"))
+        or bool(result.get("semantic_rewrite"))
+        or has_candidate_only_payload
+    )
     result["mcp_output_contract"] = _mcp_tool_output_contract(
         role="shortcut_tool",
-        final_answer_expected=True,
+        final_answer_expected=final_answer_expected,
         markers=markers,
         explanation=f"{tool} is a narrow shortcut tool; check dropped_dimensions before treating the result as complete.",
         extra_signals={
@@ -286,13 +297,22 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
 
 def _compact_answer_query_response(payload: dict[str, Any], *, query: str, region: str) -> dict[str, Any]:
     """Return a slim answer_query shape for chatbot clients that do their own reasoning."""
+    def _first_payload_row_field(field: str) -> Any:
+        for row_key in ("data", "rows", "results", "표", "시계열", "결과"):
+            rows = payload.get(row_key)
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                value = rows[0].get(field)
+                if value not in (None, "", [], {}):
+                    return value
+        return None
+
     metadata_keys = {
         "query": query,
-        "region": payload.get("region") or payload.get("지역") or region,
+        "region": payload.get("region") or payload.get("지역") or _first_payload_row_field("지역") or region,
         "answer_type": payload.get("answer_type") or payload.get("답변유형"),
         "stat_name": payload.get("stat_name") or payload.get("통계명"),
-        "unit": payload.get("unit") or payload.get("단위"),
-        "period": payload.get("period") or payload.get("시점") or payload.get("used_period"),
+        "unit": payload.get("unit") or payload.get("단위") or _first_payload_row_field("단위"),
+        "period": payload.get("period") or payload.get("시점") or payload.get("used_period") or _first_payload_row_field("시점"),
         "source": payload.get("source") or payload.get("출처"),
         "table_id": payload.get("table_id") or payload.get("tbl_id") or payload.get("통계표ID"),
         "period_age_years": payload.get("period_age_years"),
@@ -318,7 +338,7 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
             notes.append(value)
 
     data = None
-    for key in ("data", "rows", "results", "result", "표", "시계열", "결과", "예측", "이상치"):
+    for key in ("data", "rows", "results", "result", "표", "시계열", "검색_후보", "검색결과", "search_candidates", "candidates", "결과", "예측", "이상치"):
         value = payload.get(key)
         if value not in (None, "", [], {}):
             data = value
@@ -330,17 +350,25 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
     diagnostics = {
         "tool_mode": payload.get("tool_mode", "convenience"),
         "markers_present": markers or [],
-        "fulfillment_status": payload.get("fulfillment_status") or payload.get("status") or payload.get("상태"),
+        "fulfillment_status": payload.get("fulfillment_status") or payload.get("이행_상태") or payload.get("status") or payload.get("상태"),
         "dropped_dimensions": payload.get("dropped_dimensions") or payload.get("누락_차원") or [],
     }
     diagnostics = {k: v for k, v in diagnostics.items() if v not in (None, "", [], {})}
 
     compact = {
-        "status": payload.get("status") or payload.get("상태") or "unknown",
+        "status": payload.get("상태") or payload.get("execution_status") or payload.get("status") or "unknown",
         "code": payload.get("code") or payload.get("코드"),
+        "answer_type": metadata.get("answer_type"),
         "answer": payload.get("answer") or payload.get("답변"),
         "error": payload.get("error") or payload.get("오류"),
+        "value": payload.get("value") or payload.get("값") or _first_payload_row_field("값"),
+        "unit": metadata.get("unit"),
+        "region": metadata.get("region"),
+        "used_period": payload.get("used_period") or metadata.get("period"),
+        "period_age_years": metadata.get("period_age_years"),
         "data": data,
+        "comparison": payload.get("comparison") or payload.get("비교"),
+        "calculation": payload.get("calculation") or payload.get("계산"),
         "metadata": metadata,
         "notes": notes,
         "diagnostics": diagnostics,
@@ -414,6 +442,7 @@ def _mcp_tool_output_contract(
         "nabo_metadata_partial": "NABO metadata lookup was partial; treat candidates as unverified.",
         "catalog_fallback_search": "NABO API table-name search was empty; candidates came from local catalog substring/metadata scoring.",
         "item_catalog_search": "NABO table candidates were found through item-name metadata, not table title alone.",
+        "broad_query": "The query is broad or under-specified; treat returned rows as candidates and narrow by table metadata before answering.",
         "metric_extraction_low_confidence": "Metric candidates came from weak search evidence; verify with metadata before querying values.",
         "router_intended_dim_mismatch": "Planner router slots and intended dimensions disagree or one side is missing; prefer metadata-verified metrics.",
         "truncated_definition": "Dictionary definition appears incomplete; avoid treating it as authoritative without another source.",
@@ -4015,7 +4044,8 @@ async def quick_trend(
         return _unsupported_source_response("quick_trend", query, resolved_source)
     ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_trend_core(query, region, years, api_key)
-    return _attach_ignored_params(result, ignored_params, "quick_trend")
+    result = _attach_ignored_params(result, ignored_params, "quick_trend")
+    return _attach_shortcut_contract(result, tool="quick_trend", ignored_params=ignored_params)
 
 
 async def _quick_trend_core(
@@ -4108,7 +4138,8 @@ async def quick_region_compare(
     """
     ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_region_compare_core(query, period, sort, api_key)
-    return _attach_ignored_params(result, ignored_params, "quick_region_compare")
+    result = _attach_ignored_params(result, ignored_params, "quick_region_compare")
+    return _attach_shortcut_contract(result, tool="quick_region_compare", ignored_params=ignored_params)
 
 
 async def _quick_region_compare_core(
@@ -4989,15 +5020,22 @@ async def chart_correlation(
         return [TextContent(type="text", text="데이터 부족")]
 
     points = [(p[1], p[2]) for p in aligned]
+    pearson = (corr.get("correlations") or {}).get("pearson") or {}
+    if not pearson and isinstance(corr.get("Pearson"), dict):
+        pearson = {
+            "coefficient": corr["Pearson"].get("상관계수"),
+            "p_value": corr["Pearson"].get("p_value"),
+        }
+    r_value = pearson.get("coefficient")
     svg = _chart_scatter_svg(
         points,
         title=f"{corr['통계_A']} vs {corr['통계_B']}",
         xlabel=corr["통계_A"], ylabel=corr["통계_B"],
-        source="KOSIS", r_value=corr["Pearson"]["상관계수"],
+        source="KOSIS", r_value=r_value,
     )
     summary = (
-        f"Pearson r={corr['Pearson']['상관계수']}, "
-        f"p={corr['Pearson']['p_value']}"
+        f"Pearson r={r_value}, "
+        f"p={pearson.get('p_value')}"
     )
     return [_svg_to_image(svg), TextContent(type="text", text=summary)]
 
@@ -6162,6 +6200,16 @@ def _candidate_quality_label(results: list[dict[str, Any]], summary: dict[str, A
     if int(summary.get("partial_query_match_count") or 0) > 0:
         return "partial_matches_only"
     return "low_confidence_only"
+
+
+def _is_broad_query_candidate_set(query: Any, results: list[dict[str, Any]]) -> bool:
+    tokens = _query_tokens_for_matching(query)
+    if len(tokens) != 1 or len(results) <= 1:
+        return False
+    token = tokens[0]
+    if re.fullmatch(r"[a-z0-9]{3,}", token):
+        return False
+    return len(token) <= 2
 
 
 _DOMESTIC_QUERY_TERMS = ("전국", "한국", "대한민국", "국내", "korea", "southkorea")
@@ -7350,10 +7398,15 @@ async def search_nabo_tables(
     tables = _sort_search_candidates(query, tables)
     quality_summary = _search_quality_summary(query, tables)
     candidate_quality = _candidate_quality_label(tables, quality_summary)
+    broad_query = _is_broad_query_candidate_set(query, tables)
+    if broad_query:
+        candidate_quality = "broad_query_candidates"
     if tables and quality_summary["full_query_match_count"] == 0:
         markers.append("no_full_query_match")
     if quality_summary["missing_terms_across_results"]:
         markers.append("partial_query_match")
+    if broad_query:
+        markers.append("broad_query")
     response_tables = _omit_raw_from_payload_rows(tables, include_raw)
     search_diagnostics = {
         "api_table_name_result_count": len(api_tables),
@@ -7400,6 +7453,7 @@ async def search_nabo_tables(
             "do_not_mix_with_kosis_without_source_label": True,
             "search_results_are_candidates": True,
             "candidate_quality": candidate_quality,
+            "broad_query": broad_query,
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_search",
@@ -8154,6 +8208,9 @@ async def search_stats(
     search_quality_summary = _search_quality_summary(query, combined_results)
     results, low_confidence_results, candidate_quality = _demote_low_confidence_search_results(combined_results, search_quality_summary)
     candidate_quality = candidate_quality or _candidate_quality_label(results, search_quality_summary)
+    broad_query = _is_broad_query_candidate_set(query, results or low_confidence_results)
+    if broad_query and candidate_quality == "full_match_available":
+        candidate_quality = "broad_query_candidates"
     markers = []
     if not combined_results:
         markers.append("search_empty")
@@ -8161,6 +8218,8 @@ async def search_stats(
         markers.append("no_full_query_match")
     if low_confidence_results:
         markers.append("low_confidence_candidates_only")
+    if broad_query:
+        markers.append("broad_query")
     if search_quality_summary["missing_terms_across_results"]:
         markers.append("partial_query_match")
     missing_sources = [
@@ -8223,6 +8282,7 @@ async def search_stats(
             "do_not_treat_cross_source_results_as_equivalent": cross_source_definition_check_required,
             "search_results_are_candidates": True,
             "low_confidence_results_are_not_matches": bool(low_confidence_results),
+            "broad_query": broad_query,
             "full_query_match_count": search_quality_summary["full_query_match_count"],
             "missing_terms_across_results": search_quality_summary["missing_terms_across_results"],
         },
@@ -8239,6 +8299,7 @@ async def search_stats(
                 "definition_comparison_required": cross_source_definition_check_required,
                 "search_quality_summary": search_quality_summary,
                 "candidate_quality": candidate_quality,
+                "broad_query": broad_query,
             },
         ),
     }

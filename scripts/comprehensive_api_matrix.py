@@ -113,41 +113,51 @@ def value_at(result: dict[str, Any], *paths: str) -> Any:
 
 
 def list_summary(result: list[Any]) -> dict[str, Any]:
-    image_count = sum(isinstance(item, ImageContent) for item in result)
     text_items = [item for item in result if isinstance(item, TextContent)]
+    svg_text_count = sum(1 for item in text_items if "<svg" in getattr(item, "text", ""))
+    image_count = sum(isinstance(item, ImageContent) for item in result) + svg_text_count
     return {
         "kind": "list",
         "items": len(result),
         "image_count": image_count,
-        "text_count": len(text_items),
+        "text_count": len(text_items) - svg_text_count,
         "text": [getattr(item, "text", "")[:240] for item in text_items[:2]],
     }
 
 
 def dict_summary(result: dict[str, Any]) -> dict[str, Any]:
-    table = result.get("표") or []
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    table_payload = result.get("표") or result.get("data") or []
+    table = table_payload if isinstance(table_payload, list) else []
     first_row = table[0] if isinstance(table, list) and table else None
+    forecast_path = value_at(result, "computed_examples.linear.forecast_path") or result.get("예측") or []
+    search_payload = result.get("검색결과") or result.get("검색_후보") or result.get("data") or []
+    if not isinstance(search_payload, list):
+        search_payload = []
+    has_svg = bool(result.get("svg"))
     return {
         "kind": "dict",
-        "error": result.get("오류"),
+        "error": result.get("오류") or result.get("error"),
         "empty_result": result.get("결과") == "데이터 없음",
-        "status": result.get("상태"),
-        "code": result.get("코드"),
-        "answer_type": result.get("답변유형"),
+        "status": result.get("상태") or result.get("status"),
+        "code": result.get("코드") or result.get("code"),
+        "answer_type": result.get("답변유형") or result.get("answer_type") or metadata.get("answer_type"),
         "answer": result.get("answer"),
-        "value": result.get("값"),
-        "unit": result.get("단위"),
-        "period": result.get("시점"),
-        "region": result.get("지역") or (first_row or {}).get("지역"),
-        "stat_name": result.get("통계명"),
+        "value": result.get("값") or result.get("value"),
+        "unit": result.get("단위") or result.get("unit") or metadata.get("unit"),
+        "period": result.get("시점") or result.get("used_period") or metadata.get("period"),
+        "region": result.get("지역") or result.get("region") or metadata.get("region") or (first_row or {}).get("지역"),
+        "stat_name": result.get("통계명") or metadata.get("stat_name"),
         "region_count": result.get("지역수"),
-        "data_count": result.get("데이터수"),
-        "common_count": result.get("공통_시점수"),
-        "forecast_count": len(result.get("예측") or []),
-        "result_count": result.get("결과수"),
-        "search_count": len(result.get("검색결과") or result.get("검색_후보") or []),
+        "data_count": result.get("데이터수") or len(table),
+        "common_count": result.get("공통_시점수") or value_at(result, "data.공통_시점수"),
+        "forecast_count": len(forecast_path),
+        "result_count": result.get("결과수") or len(search_payload),
+        "search_count": len(search_payload),
         "direct_key": (result.get("route") or {}).get("direct_stat_key"),
         "first_row": first_row,
+        "image_count": 1 if has_svg else None,
+        "text_count": 1 if result.get("text_summary") else None,
     }
 
 

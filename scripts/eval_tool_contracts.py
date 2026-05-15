@@ -2551,8 +2551,52 @@ async def test_quick_stat_unmapped_colloquial_requires_semantic_rewrite() -> Non
     assert result["candidate_quality"] == "no_lexical_or_curated_match", result
     assert result["semantic_rewrite"]["performed_by"] == "caller_llm", result
     assert "중소기업" not in json.dumps(result, ensure_ascii=False), result
+    assert result["mcp_output_contract"]["final_answer_expected"] is False, result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "semantic_rewrite_required" in markers, result
+
+
+async def test_quick_shortcut_failures_are_not_final_answers() -> None:
+    trend = await kosis_mcp_server.quick_trend("not-a-tier-a-variable", api_key="dummy")
+    region = await kosis_mcp_server.quick_region_compare("not-a-tier-a-variable", api_key="dummy")
+
+    assert trend["mcp_output_contract"]["final_answer_expected"] is False, trend
+    assert region["mcp_output_contract"]["final_answer_expected"] is False, region
+    assert "unsupported" in trend["mcp_output_contract"]["current_signals"]["markers_present"], trend
+    assert "unsupported" in region["mcp_output_contract"]["current_signals"]["markers_present"], region
+
+
+async def test_nabo_broad_query_requires_table_selection() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+    kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+
+    assert kosis_mcp_server._is_broad_query_candidate_set("지원", [{"id": 1}, {"id": 2}]) is True
+    assert kosis_mcp_server._is_broad_query_candidate_set("GDP", [{"id": 1}, {"id": 2}]) is False
+    assert kosis_mcp_server._is_broad_query_candidate_set("국가채무", [{"id": 1}, {"id": 2}]) is False
+
+    async def fake_fetch(service: str, key: str, params: Any = None, *, max_rows: int = 5000) -> dict[str, Any]:
+        if service != "Sttsapitbl":
+            return {"status": "executed", "total_count": 0, "rows": []}
+        return {
+            "status": "executed",
+            "total_count": 2,
+            "rows": [
+                {"STATBL_ID": "N1", "STATBL_NM": "지원 현황", "DTACYCLE_NM": "Year"},
+                {"STATBL_ID": "N2", "STATBL_NM": "지원 규모", "DTACYCLE_NM": "Year"},
+            ],
+        }
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_nabo_tables("지원", api_key="dummy")
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+        kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+
+    assert result["status"] == "needs_table_selection", result
+    assert result["candidate_quality"] == "broad_query_candidates", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "broad_query" in markers, result
 
 
 async def test_chart_distribution_returns_raw_svg_field() -> None:
@@ -2714,6 +2758,8 @@ async def main() -> None:
         ("ascii_query_terms_word_boundary", lambda: test_ascii_query_terms_do_not_match_inside_words()),
         ("quick_stat_fuzzy_candidate", lambda: test_quick_stat_typo_returns_fuzzy_candidates_without_execution()),
         ("quick_stat_semantic_rewrite", lambda: test_quick_stat_unmapped_colloquial_requires_semantic_rewrite()),
+        ("quick_shortcut_failure_not_final", lambda: test_quick_shortcut_failures_are_not_final_answers()),
+        ("nabo_broad_query_requires_selection", lambda: test_nabo_broad_query_requires_table_selection()),
         ("chart_distribution_raw_svg", lambda: test_chart_distribution_returns_raw_svg_field()),
         ("shortcut_prunes_null_fields", lambda: test_shortcut_contract_prunes_null_fields()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),

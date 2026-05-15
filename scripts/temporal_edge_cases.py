@@ -93,7 +93,7 @@ CASES: list[dict[str, Any]] = [
 
 
 def first_table_row(result: dict[str, Any]) -> dict[str, Any]:
-    table = result.get("표") or []
+    table = result.get("표") or result.get("data") or []
     if table and isinstance(table[0], dict):
         return table[0]
     return {}
@@ -104,21 +104,22 @@ def summarize(result: Any) -> dict[str, Any]:
         return {"kind": type(result).__name__, "repr": repr(result)[:240]}
 
     first = first_table_row(result)
-    comparison = result.get("비교") or {}
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    comparison = result.get("비교") or result.get("comparison") or {}
     return {
         "kind": "dict",
-        "error": result.get("오류"),
+        "error": result.get("오류") or result.get("error"),
         "empty_result": result.get("결과") == "데이터 없음",
-        "status": result.get("상태"),
-        "code": result.get("코드"),
-        "answer_type": result.get("답변유형"),
+        "status": result.get("상태") or result.get("status"),
+        "code": result.get("코드") or result.get("code"),
+        "answer_type": result.get("답변유형") or result.get("answer_type") or metadata.get("answer_type"),
         "answer": result.get("answer"),
-        "value": result.get("값"),
-        "unit": result.get("단위"),
-        "period": result.get("시점") or first.get("시점"),
-        "region": result.get("지역") or first.get("지역"),
+        "value": result.get("값") or result.get("value"),
+        "unit": result.get("단위") or result.get("unit") or metadata.get("unit"),
+        "period": result.get("시점") or result.get("used_period") or metadata.get("period") or first.get("시점"),
+        "region": result.get("지역") or result.get("region") or metadata.get("region") or first.get("지역"),
         "region_count": result.get("지역수"),
-        "table_rows": len(result.get("표") or []),
+        "table_rows": len(result.get("표") or result.get("data") or []),
         "direct_key": (result.get("route") or {}).get("direct_stat_key"),
         "compare_start": (comparison.get("시작") or {}).get("시점"),
         "compare_end": (comparison.get("종료") or {}).get("시점"),

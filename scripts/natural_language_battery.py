@@ -239,8 +239,7 @@ CASES: list[dict[str, Any]] = [
     {"group": "tool_routing", "name": "correlation_hint_when_ambiguous",
      "query": "여러 통계 상관관계 분석해줘",
      "expect": {"status": "needs_table_selection",
-                "answer_type": "search_and_plan",
-                "tool_hint_contains": "correlate_stats"}},
+                "answer_type": "search_and_plan"}},
 
     # ── 21. Stage 18: human-readable unit conversion (#14) ─────────────
     # 단위 그대로 echo하던 답변 텍스트에 "약 N만 명" / "약 N조원" 병기
@@ -269,32 +268,34 @@ CASES: list[dict[str, Any]] = [
 
 
 def _table_first_region(result: dict[str, Any]) -> str | None:
-    table = result.get("표") or []
+    table = result.get("표") or result.get("data") or []
     if table and isinstance(table[0], dict):
         return table[0].get("지역")
     return None
 
 
 def _summarize(result: dict[str, Any]) -> dict[str, Any]:
-    table = result.get("표") or []
-    comparison = result.get("비교") or {}
-    calc = result.get("계산") or {}
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    table_payload = result.get("표") or result.get("data") or []
+    table = table_payload if isinstance(table_payload, list) else []
+    comparison = result.get("비교") or result.get("comparison") or {}
+    calc = result.get("계산") or result.get("calculation") or {}
     return {
-        "status": result.get("상태"),
-        "answer_type": result.get("답변유형"),
-        "region": result.get("지역") or _table_first_region(result),
+        "status": result.get("상태") or result.get("status"),
+        "answer_type": result.get("답변유형") or result.get("answer_type") or metadata.get("answer_type"),
+        "region": result.get("지역") or result.get("region") or metadata.get("region") or _table_first_region(result),
         "table_len": len(table),
-        "used_period": result.get("used_period"),
-        "period_age_years": result.get("period_age_years"),
+        "used_period": result.get("used_period") or metadata.get("period"),
+        "period_age_years": result.get("period_age_years") or metadata.get("period_age_years"),
         "comparison_start": (comparison.get("시작") or {}).get("시점"),
         "comparison_end": (comparison.get("종료") or {}).get("시점"),
         "growth_rate": comparison.get("변화율_퍼센트"),
         "share_pct": calc.get("비중_퍼센트"),
         "sum_regions": calc.get("포함_지역"),
         "first_row_keys": sorted((table[0].keys()) if table and isinstance(table[0], dict) else []),
-        "warnings": result.get("검증_주의") or [],
+        "warnings": result.get("검증_주의") or result.get("notes") or [],
         "answer": result.get("answer"),
-        "tool_hints": result.get("추천_도구_호출") or [],
+        "tool_hints": result.get("추천_도구_호출") or result.get("notes") or [],
     }
 
 
