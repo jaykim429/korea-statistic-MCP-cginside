@@ -114,6 +114,25 @@ def _summed_rows_label(rows: Sequence[dict[str, Any]], fallback: Optional[str]) 
     return labels[0] if labels else fallback
 
 
+def _summed_rows_label_profile(rows: Sequence[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+    labels = []
+    seen = set()
+    for row in rows:
+        label = _item_label(row) or _row_label(row)
+        if not label:
+            continue
+        text = str(label)
+        if text in seen:
+            continue
+        seen.add(text)
+        labels.append(text)
+    return {
+        "summed_labels_sample": labels[:limit],
+        "summed_label_count": len(labels),
+        "summed_labels_truncated": len(labels) > limit,
+    }
+
+
 def _row_unit(row: dict[str, Any]) -> Optional[str]:
     unit = row.get("unit")
     if unit:
@@ -861,6 +880,7 @@ class SumAdditiveRows(IndicatorOperation):
             sample = bucket["sample"]
             sample_dims = _row_dimensions(sample)
             projected_dims = {axis: sample_dims.get(axis) for axis in axes if axis in sample_dims}
+            label_profile = _summed_rows_label_profile(bucket["rows"])
             outcome.results.append(IndicatorResult(
                 value=_round(bucket["total"], decimals),
                 period=period,
@@ -870,10 +890,7 @@ class SumAdditiveRows(IndicatorOperation):
                 inputs={
                     "row_count": bucket["count"],
                     "group_codes": list(codes),
-                    "summed_labels": [
-                        label for row in bucket["rows"]
-                        if (label := (_item_label(row) or _row_label(row)))
-                    ],
+                    **label_profile,
                 },
                 note="Caller asserted additivity; do not use this for rates/indices/averages.",
             ))

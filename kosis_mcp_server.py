@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -188,6 +189,11 @@ NABO_DTACYCLE_GUIDANCE = {
 NABO_ITEM_META_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 NABO_TABLE_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
 NABO_ITEM_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
+NABO_CATALOG_CACHE_TTL_SECONDS = 60 * 60 * 24
+NABO_TABLE_CATALOG_FETCHED_AT: dict[str, float] = {}
+NABO_ITEM_CATALOG_FETCHED_AT: dict[str, float] = {}
+NABO_TABLE_CATALOG_LOCK = asyncio.Lock()
+NABO_ITEM_CATALOG_LOCK = asyncio.Lock()
 
 ANSWER_QUERY_CONVENIENCE_NOTE = {
     "tool": "answer_query",
@@ -390,6 +396,7 @@ def _mcp_tool_output_contract(
         "truncated_definition": "Dictionary definition appears incomplete; avoid treating it as authoritative without another source.",
         "low_definition_specificity": "Dictionary definition is too short or generic for high-stakes distinction; verify scope/standard.",
         "period_type_inconsistent": "Period metadata cadence and period-code shape disagree; inspect period rows before choosing period format.",
+        "possible_period_type_inconsistent": "Period metadata range codes look coarser than the declared cadence; verify actual data periods before querying.",
     }
     marker_guidance = {
         marker: marker_guidance_catalog[marker]
@@ -692,6 +699,7 @@ def _period_metadata_inconsistencies(period_rows: Any) -> list[dict[str, Any]]:
                     "period_code": row.get(field),
                     "declared_cadence": cadence,
                     "period_code_shape": shape,
+                    "severity": "strong" if field in {"PRD_DE", "prdDe"} else "possible",
                 })
     return issues
 
@@ -1569,22 +1577,34 @@ def _nabo_table_candidates_support_query(query: Any, tables: list[dict[str, Any]
 
 async def _nabo_table_catalog(key: str) -> list[dict[str, Any]]:
     cache_key = "all"
-    if cache_key in NABO_TABLE_CATALOG_CACHE:
+    fetched_at = NABO_TABLE_CATALOG_FETCHED_AT.get(cache_key, 0)
+    if cache_key in NABO_TABLE_CATALOG_CACHE and time.time() - fetched_at < NABO_CATALOG_CACHE_TTL_SECONDS:
         return NABO_TABLE_CATALOG_CACHE[cache_key]
-    payload = await _nabo_fetch_rows("Sttsapitbl", key, {"pSize": NABO_MAX_PAGE_SIZE}, max_rows=50000)
-    tables = [_nabo_table_record(row) for row in payload.get("rows", [])]
-    NABO_TABLE_CATALOG_CACHE[cache_key] = tables
-    return tables
+    async with NABO_TABLE_CATALOG_LOCK:
+        fetched_at = NABO_TABLE_CATALOG_FETCHED_AT.get(cache_key, 0)
+        if cache_key in NABO_TABLE_CATALOG_CACHE and time.time() - fetched_at < NABO_CATALOG_CACHE_TTL_SECONDS:
+            return NABO_TABLE_CATALOG_CACHE[cache_key]
+        payload = await _nabo_fetch_rows("Sttsapitbl", key, {"pSize": NABO_MAX_PAGE_SIZE}, max_rows=50000)
+        tables = [_nabo_table_record(row) for row in payload.get("rows", [])]
+        NABO_TABLE_CATALOG_CACHE[cache_key] = tables
+        NABO_TABLE_CATALOG_FETCHED_AT[cache_key] = time.time()
+        return tables
 
 
 async def _nabo_item_catalog(key: str) -> list[dict[str, Any]]:
     cache_key = "all"
-    if cache_key in NABO_ITEM_CATALOG_CACHE:
+    fetched_at = NABO_ITEM_CATALOG_FETCHED_AT.get(cache_key, 0)
+    if cache_key in NABO_ITEM_CATALOG_CACHE and time.time() - fetched_at < NABO_CATALOG_CACHE_TTL_SECONDS:
         return NABO_ITEM_CATALOG_CACHE[cache_key]
-    payload = await _nabo_fetch_rows("Sttsapitblitm", key, {"pSize": NABO_MAX_PAGE_SIZE}, max_rows=50000)
-    items = [_nabo_item_record(row) for row in payload.get("rows", [])]
-    NABO_ITEM_CATALOG_CACHE[cache_key] = items
-    return items
+    async with NABO_ITEM_CATALOG_LOCK:
+        fetched_at = NABO_ITEM_CATALOG_FETCHED_AT.get(cache_key, 0)
+        if cache_key in NABO_ITEM_CATALOG_CACHE and time.time() - fetched_at < NABO_CATALOG_CACHE_TTL_SECONDS:
+            return NABO_ITEM_CATALOG_CACHE[cache_key]
+        payload = await _nabo_fetch_rows("Sttsapitblitm", key, {"pSize": NABO_MAX_PAGE_SIZE}, max_rows=50000)
+        items = [_nabo_item_record(row) for row in payload.get("rows", [])]
+        NABO_ITEM_CATALOG_CACHE[cache_key] = items
+        NABO_ITEM_CATALOG_FETCHED_AT[cache_key] = time.time()
+        return items
 
 
 def _nabo_item_match_score(query: Any, item: dict[str, Any]) -> int:
@@ -6163,30 +6183,41 @@ def _nabo_metric_from_search_query(query: str) -> Optional[str]:
 
 async def _collect_nabo_plan_matches(query: str, plan: dict[str, Any], nabo_api_key: Optional[str]) -> dict[str, Any]:
     candidates = _nabo_plan_candidate_phrases(query, plan)
-    metrics: list[dict[str, Any]] = []
-    seen_metrics: set[str] = set()
+    metric_by_key: dict[str, dict[str, Any]] = {}
     term_matches: list[dict[str, Any]] = []
     table_matches: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+
+    source_priority = {
+        "nabo_term_dictionary": 100,
+        "nabo_item_catalog": 85,
+        "nabo_table_search": 55,
+        "nabo_query_candidate": 10,
+    }
 
     def add_metric(name: Any, *, source: str, evidence: dict[str, Any]) -> None:
         metric_name = _nabo_metric_from_search_query(str(name or ""))
         if not metric_name:
             return
         key = _metric_name_key(metric_name)
-        if not key or key in seen_metrics:
+        if not key:
             return
-        seen_metrics.add(key)
-        metrics.append({
+        priority = source_priority.get(source, 0)
+        candidate = {
             "name": metric_name,
-            "role": "primary" if not metrics else "comparison",
+            "role": "candidate",
             "source": source,
             "availability": "unknown",
             "extraction_method": "nabo_metadata_or_query_candidate",
             "caller_must_verify_with_nabo_meta": True,
             "source_system": "NABO",
             "nabo_evidence": evidence,
-        })
+            "source_priority": priority,
+            "confidence": "high" if priority >= 100 else "medium" if priority >= 80 else "low",
+        }
+        existing = metric_by_key.get(key)
+        if not existing or priority > int(existing.get("source_priority") or 0):
+            metric_by_key[key] = candidate
 
     for candidate in candidates:
         try:
@@ -6224,6 +6255,21 @@ async def _collect_nabo_plan_matches(query: str, plan: dict[str, Any], nabo_api_
                         for table in tables[:3]
                         if isinstance(table, dict)
                     ])
+                    for table in tables[:3]:
+                        if not isinstance(table, dict):
+                            continue
+                        for item in table.get("matched_items") or []:
+                            if isinstance(item, dict) and item.get("item_name"):
+                                add_metric(
+                                    item.get("item_name") or item.get("item_full_name"),
+                                    source="nabo_item_catalog",
+                                    evidence={
+                                        "query": candidate,
+                                        "table_id": table.get("table_id"),
+                                        "item_id": item.get("item_id"),
+                                        "match_score": item.get("match_score"),
+                                    },
+                                )
                     if _nabo_table_candidates_support_query(candidate, tables):
                         add_metric(candidate, source="nabo_table_search", evidence={"query": candidate, "result_count": len(tables)})
             elif tables_payload.get("code") == STATUS_MISSING_API_KEY:
@@ -6232,9 +6278,16 @@ async def _collect_nabo_plan_matches(query: str, plan: dict[str, Any], nabo_api_
         except Exception as exc:
             errors.append({"tool": "search_nabo_tables", "query": candidate, "error": str(exc)})
 
-    if not metrics:
+    if not metric_by_key:
         for candidate in candidates:
             add_metric(candidate, source="nabo_query_candidate", evidence={"query": candidate, "metadata_status": "unverified"})
+
+    metrics = sorted(
+        metric_by_key.values(),
+        key=lambda metric: (-int(metric.get("source_priority") or 0), str(metric.get("name") or "")),
+    )
+    for idx, metric in enumerate(metrics):
+        metric["role"] = "primary" if idx == 0 else "comparison"
 
     return {
         "source": "nabo_meta_match" if term_matches or table_matches else "nabo_query_candidate",
@@ -6400,9 +6453,9 @@ async def _apply_nabo_source_routing(plan: dict[str, Any], query: str, nabo_api_
     workflow = _nabo_suggested_workflow(plan, query)
     plan["suggested_workflow"] = workflow
     plan["suggested_clarification_questions"] = [
-        "Which NABO fiscal/economic indicator should be used? Examples: fiscal balance, national debt, expenditure budget, debt-to-GDP ratio.",
-        "Which period do you want? Examples: latest, 2020-2024, recent 5 years.",
-        "Which basis should be preserved? Examples: settlement, budget, supplementary budget, GDP ratio.",
+        "어떤 NABO 재정·경제 지표를 볼까요? 예: 재정수지, 국가채무, 세출예산, GDP 대비 비율",
+        "기간은 어떻게 잡을까요? 예: 최신, 2020-2024, 최근 5년",
+        "어떤 기준을 유지할까요? 예: 결산, 본예산, 추경, GDP 대비 비율",
     ]
     plan["next_call"] = workflow[0] if workflow else None
     plan["evidence_workflow"] = _nabo_evidence_workflow(plan)
@@ -6688,6 +6741,8 @@ async def search_nabo_tables(
         "result_count": len(tables),
         "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
         "truncated": payload.get("truncated", False),
+        "strategy": "increase_limit_requery",
+        "true_page_supported": False,
         "next_call_hint": {
             "tool": "search_nabo_tables",
             "args": {"query": query, "limit": min(NABO_MAX_PAGE_SIZE, max(safe_limit * 2, safe_limit + 1))},
@@ -7212,6 +7267,8 @@ async def query_nabo_table(
         "total_count": payload.get("total_count"),
         "max_rows": payload.get("max_rows"),
         "truncated": payload.get("truncated", False),
+        "strategy": "increase_max_rows_requery",
+        "true_page_supported": False,
         "next_call_hint": {
             "tool": "query_nabo_table",
             "args": {
@@ -9004,7 +9061,10 @@ async def explore_table(
     if period_age is not None and period_age >= 1.0:
         explore_markers.append("stale_metadata")
     if period_metadata_inconsistencies:
-        explore_markers.append("period_type_inconsistent")
+        if any(item.get("severity") == "strong" for item in period_metadata_inconsistencies):
+            explore_markers.append("period_type_inconsistent")
+        else:
+            explore_markers.append("possible_period_type_inconsistent")
     if industry_term and not result.get("resolved_industry", {}).get("ITM_ID"):
         explore_markers.append("industry_unresolved")
     explore_explanation = (

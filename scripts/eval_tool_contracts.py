@@ -203,7 +203,7 @@ async def test_explore_table_marks_period_metadata_inconsistent() -> None:
         kosis_mcp_server._fetch_meta = original_fetch_meta  # type: ignore[assignment]
 
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
-    assert "period_type_inconsistent" in markers, markers
+    assert "possible_period_type_inconsistent" in markers, markers
     assert result["period_metadata_inconsistencies"], result
 
 
@@ -394,7 +394,10 @@ async def test_compute_indicator_sum_labels_multiple_items() -> None:
     result = await kosis_mcp_server.compute_indicator(operation="sum_additive_rows", input_rows=rows)
     assert result["status"] == "ok", result
     assert result["results"][0]["label"] == "sum: Revenue + Expense", result
-    assert result["results"][0]["inputs"]["summed_labels"] == ["Revenue", "Expense"], result
+    inputs = result["results"][0]["inputs"]
+    assert inputs["summed_labels_sample"] == ["Revenue", "Expense"], result
+    assert inputs["summed_label_count"] == 2, result
+    assert inputs["summed_labels_truncated"] is False, result
 
 
 async def test_compute_indicator_share_rejects_mixed_input_total_units() -> None:
@@ -1623,7 +1626,7 @@ async def test_plan_query_routes_explicit_nabo_source() -> None:
     assert {"관리재정수지", "국가채무"} <= metric_names, result
     assert "GDP디플레이터" not in metric_names, result
     assert result["next_call"]["tool"] == "search_nabo_tables", result
-    assert "fiscal balance" in result["suggested_clarification_questions"][0], result
+    assert "재정수지" in result["suggested_clarification_questions"][0], result
     workflow_tools = {step.get("tool") for step in result["evidence_workflow"] if step.get("tool")}
     assert {"search_nabo_tables", "explore_nabo_table", "query_nabo_table"} <= workflow_tools, result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
