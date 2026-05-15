@@ -1367,6 +1367,51 @@ async def test_nabo_search_and_query_normalization() -> None:
     assert query["rows"][0]["dimensions"]["ITEM"]["code"] == "10001", query
 
 
+async def test_nabo_search_uses_catalog_fallback_for_contained_table_name() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+    kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+
+    async def fake_fetch(service: str, key: str, params: Any = None, *, max_rows: int = 5000) -> dict[str, Any]:
+        if service != "Sttsapitbl":
+            return {"status": "executed", "total_count": 0, "rows": []}
+        params = params or {}
+        if params.get("STATBL_NM"):
+            return {"status": "executed", "total_count": 0, "rows": []}
+        return {
+            "status": "executed",
+            "total_count": 2,
+            "rows": [
+                {"STATBL_ID": "N1", "STATBL_NM": "Fiscal Balance", "DTACYCLE_NM": "Year"},
+                {"STATBL_ID": "N2", "STATBL_NM": "Policy Fund", "DTACYCLE_NM": "Year"},
+            ],
+        }
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_nabo_tables("Total Fiscal Balance", api_key="dummy")
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+        kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+
+    assert result["status"] == "executed", result
+    assert result["tables"][0]["table_id"] == "N1", result
+    assert result["search_diagnostics"]["api_table_name_result_count"] == 0, result
+    assert result["search_diagnostics"]["catalog_fallback_used"] is True, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "catalog_fallback_search" in markers, markers
+
+
+def test_nabo_table_search_metric_promotion_requires_metadata_support() -> None:
+    assert kosis_mcp_server._nabo_table_candidates_support_query(
+        "national debt",
+        [{"table_name": "Debt", "category": None, "table_comment": None}],
+    ) is True
+    assert kosis_mcp_server._nabo_table_candidates_support_query(
+        "data",
+        [{"table_name": "Policy Fund", "category": None, "table_comment": None}],
+    ) is False
+
+
 async def test_nabo_query_rejects_unknown_filter_key() -> None:
     result = await kosis_mcp_server.query_nabo_table(
         "T1",
@@ -1551,16 +1596,69 @@ async def test_nabo_query_accepts_period_range_forms() -> None:
             filters={"ITEM": ["10001"]},
             api_key="dummy",
         )
+        string_period_range = await kosis_mcp_server.query_nabo_table(
+            "T1",
+            dtacycle_cd="YY",
+            period_range="2022:2023",  # type: ignore[arg-type]
+            filters={"ITEM": ["10001"]},
+            api_key="dummy",
+        )
     finally:
         kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
 
     assert [row["period"] for row in colon["rows"]] == ["2022", "2023"], colon
     assert [row["period"] for row in hyphen["rows"]] == ["2022", "2023", "2024"], hyphen
     assert [row["period"] for row in array_range["rows"]] == ["2023", "2024"], array_range
+    assert [row["period"] for row in string_period_range["rows"]] == ["2022", "2023"], string_period_range
     assert colon["period_request"]["mode"] == "range", colon
     assert "period_input_normalized" in colon["mcp_output_contract"]["current_signals"]["markers_present"], colon
     data_calls = [p for p in captured_params if p["service"] == "Sttsapitbldata"]
     assert all("WRTTIME_IDTFR_ID" not in p for p in data_calls), data_calls
+
+
+async def test_nabo_query_rejects_nullish_period_string_without_raw_exception() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+    captured_services: list[str] = []
+
+    async def fake_fetch(service: str, _: str, params: dict[str, Any], **__: Any) -> dict[str, Any]:
+        captured_services.append(service)
+        if service == "Sttsapitbl":
+            return {
+                "status": "executed",
+                "total_count": 1,
+                "rows": [{"STATBL_ID": "T1", "STATBL_NM": "test", "DTACYCLE_NM": "년"}],
+            }
+        raise AssertionError("data endpoint should not be called for null-like period strings")
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.query_nabo_table(
+            "T1",
+            dtacycle_cd="YY",
+            period="null",
+            filters={"ITEM": ["10001"]},
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+
+    assert result["status"] == "unsupported", result
+    assert result["validation_errors"][0]["code"] == "NULLISH_PERIOD_INPUT", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "period_request_normalization_error" in markers, markers
+    assert captured_services == ["Sttsapitbl"], captured_services
+
+
+async def test_nabo_query_rejects_invalid_filters_shape_without_raw_exception() -> None:
+    result = await kosis_mcp_server.query_nabo_table(
+        "T1",
+        dtacycle_cd="YY",
+        period="latest",
+        filters="null",  # type: ignore[arg-type]
+        api_key="dummy",
+    )
+    assert result["status"] == "unsupported", result
+    assert result["validation_errors"][0]["code"] == "INVALID_FILTERS_TYPE", result
 
 
 async def test_nabo_query_auto_dtacycle_uses_table_metadata() -> None:
@@ -1928,9 +2026,13 @@ async def main() -> None:
         ("query_table_aggregation_dropped_rows", lambda: test_query_table_aggregation_dropped_rows_are_marked()),
         ("query_table_fanout_limit", lambda: test_query_table_fanout_limit_rejects_before_raw_call()),
         ("nabo_search_query_normalization", lambda: test_nabo_search_and_query_normalization()),
+        ("nabo_catalog_fallback_search", lambda: test_nabo_search_uses_catalog_fallback_for_contained_table_name()),
+        ("nabo_table_search_metric_support", lambda: test_nabo_table_search_metric_promotion_requires_metadata_support()),
         ("nabo_unknown_filter", lambda: test_nabo_query_rejects_unknown_filter_key()),
         ("nabo_missing_values", lambda: test_nabo_query_marks_missing_values()),
         ("nabo_period_range_forms", lambda: test_nabo_query_accepts_period_range_forms()),
+        ("nabo_nullish_period", lambda: test_nabo_query_rejects_nullish_period_string_without_raw_exception()),
+        ("nabo_invalid_filters_shape", lambda: test_nabo_query_rejects_invalid_filters_shape_without_raw_exception()),
         ("nabo_auto_dtacycle", lambda: test_nabo_query_auto_dtacycle_uses_table_metadata()),
         ("nabo_dtacycle_mismatch", lambda: test_nabo_query_rejects_unsupported_dtacycle()),
         ("nabo_item_full_name_join", lambda: test_nabo_query_joins_item_full_name_metadata()),

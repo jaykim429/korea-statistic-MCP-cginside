@@ -186,6 +186,7 @@ NABO_DTACYCLE_GUIDANCE = {
     },
 }
 NABO_ITEM_META_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+NABO_TABLE_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
 
 ANSWER_QUERY_CONVENIENCE_NOTE = {
     "tool": "answer_query",
@@ -351,6 +352,7 @@ def _mcp_tool_output_contract(
         "period_type_mismatch": "Convert the requested period to the table cadence shown in period_format_examples.",
         "dtacycle_mismatch": "Use the table's dtacycle_cd_suggestions or dtacycle_cd='auto' before querying NABO rows.",
         "invalid_period_format": "Normalize natural-language time to KOSIS period codes before retrying query_table.",
+        "period_request_normalization_error": "Inspect period_request.errors and retry with latest, a single period, or a supported range form.",
         "duplicate_denominator_key": "Resolve duplicate denominator rows; do not choose one silently.",
         "non_numeric_aggregation_input": "Disclose dropped rows and avoid presenting aggregation as complete.",
         "aggregation_dropped_rows": "Inspect aggregation_report before using summed values.",
@@ -380,6 +382,7 @@ def _mcp_tool_output_contract(
         "nabo_routing": "NABO source preference changed the workflow away from KOSIS table selection.",
         "nabo_metadata_candidate": "NABO metadata supplied candidate metrics; verify table/items before values.",
         "nabo_metadata_partial": "NABO metadata lookup was partial; treat candidates as unverified.",
+        "catalog_fallback_search": "NABO API table-name search was empty; candidates came from local catalog substring/metadata scoring.",
     }
     marker_guidance = {
         marker: marker_guidance_catalog[marker]
@@ -409,6 +412,7 @@ def _mcp_tool_output_contract(
         "period_type_mismatch",
         "dtacycle_mismatch",
         "invalid_period_format",
+        "period_request_normalization_error",
         "duplicate_denominator_key",
         "non_numeric_aggregation_input",
         "runtime_error",
@@ -1244,13 +1248,24 @@ def _nabo_parse_period_request(
     }
     if raw_input in (None, ""):
         return result
+    if isinstance(raw_input, str) and raw_input.strip().lower() in {"null", "undefined", "none"}:
+        result["errors"].append({
+            "code": "NULLISH_PERIOD_INPUT",
+            "message": "period was a null-like string; omit period for all rows or use 'latest'/a valid period code.",
+            "received": raw_input,
+        })
+        return result
 
     if isinstance(raw_input, dict):
         start = raw_input.get("start") or raw_input.get("from") or raw_input.get("begin")
         end = raw_input.get("end") or raw_input.get("to") or raw_input.get("until")
         raw_bounds = [start, end]
     elif isinstance(raw_input, (list, tuple)):
-        values = [v for v in raw_input if v not in (None, "")]
+        values = [
+            v for v in raw_input
+            if v not in (None, "")
+            and not (isinstance(v, str) and v.strip().lower() in {"null", "undefined", "none"})
+        ]
         if len(values) == 1:
             raw_bounds = [values[0]]
         else:
@@ -1483,6 +1498,56 @@ def _nabo_table_record(row: dict[str, Any]) -> dict[str, Any]:
         "table_comment": row.get("STATBL_CMMT"),
         "service_url": row.get("SRV_URL"),
         "raw": row,
+    }
+
+
+def _nabo_catalog_match_score(query: Any, table: dict[str, Any]) -> int:
+    q = _compact_text(str(query or ""))
+    if len(q) < 2:
+        return 0
+    name = _compact_text(str(table.get("table_name") or ""))
+    category = _compact_text(str(table.get("category") or ""))
+    comment = _compact_text(str(table.get("table_comment") or ""))
+    if not name:
+        return 0
+    if name == q:
+        return 100
+    if len(name) >= 2 and name in q:
+        return 92
+    if len(q) >= 3 and q in name:
+        return 88
+    if len(q) >= 3 and (q in category or q in comment):
+        return 62
+    return 0
+
+
+def _nabo_table_candidates_support_query(query: Any, tables: list[dict[str, Any]]) -> bool:
+    return any(_nabo_catalog_match_score(query, table) >= 80 for table in tables if isinstance(table, dict))
+
+
+async def _nabo_table_catalog(key: str) -> list[dict[str, Any]]:
+    cache_key = "all"
+    if cache_key in NABO_TABLE_CATALOG_CACHE:
+        return NABO_TABLE_CATALOG_CACHE[cache_key]
+    payload = await _nabo_fetch_rows("Sttsapitbl", key, {"pSize": NABO_MAX_PAGE_SIZE}, max_rows=50000)
+    tables = [_nabo_table_record(row) for row in payload.get("rows", [])]
+    NABO_TABLE_CATALOG_CACHE[cache_key] = tables
+    return tables
+
+
+async def _nabo_catalog_fallback_search(query: str, key: str, limit: int) -> dict[str, Any]:
+    catalog = await _nabo_table_catalog(key)
+    scored = [
+        {**table, "catalog_match_score": score, "search_match_source": "nabo_table_catalog"}
+        for table in catalog
+        for score in [_nabo_catalog_match_score(query, table)]
+        if score > 0
+    ]
+    scored.sort(key=lambda table: (-int(table.get("catalog_match_score") or 0), str(table.get("table_name") or ""), str(table.get("table_id") or "")))
+    return {
+        "tables": scored[:limit],
+        "total_count": len(scored),
+        "catalog_size": len(catalog),
     }
 
 
@@ -6051,7 +6116,8 @@ async def _collect_nabo_plan_matches(query: str, plan: dict[str, Any], nabo_api_
                         for table in tables[:3]
                         if isinstance(table, dict)
                     ])
-                    add_metric(candidate, source="nabo_table_search", evidence={"query": candidate, "result_count": len(tables)})
+                    if _nabo_table_candidates_support_query(candidate, tables):
+                        add_metric(candidate, source="nabo_table_search", evidence={"query": candidate, "result_count": len(tables)})
             elif tables_payload.get("code") == STATUS_MISSING_API_KEY:
                 errors.append({"tool": "search_nabo_tables", "query": candidate, "code": STATUS_MISSING_API_KEY})
                 break
@@ -6461,16 +6527,34 @@ async def search_nabo_tables(
             ),
         }
 
-    tables = [_nabo_table_record(row) for row in payload.get("rows", [])]
+    api_tables = [_nabo_table_record(row) for row in payload.get("rows", [])]
+    tables = list(api_tables)
+    catalog_fallback: dict[str, Any] = {}
+    if not tables and query:
+        try:
+            catalog_fallback = await _nabo_catalog_fallback_search(query, key, safe_limit)
+            tables = catalog_fallback.get("tables") or []
+        except Exception as exc:
+            catalog_fallback = {"error": str(exc)}
     markers = ["search_empty"] if not tables else []
+    if catalog_fallback.get("tables"):
+        markers.append("catalog_fallback_search")
+    search_diagnostics = {
+        "api_table_name_result_count": len(api_tables),
+        "catalog_fallback_used": bool(catalog_fallback),
+        "catalog_fallback_result_count": len(catalog_fallback.get("tables") or []),
+        "catalog_size": catalog_fallback.get("catalog_size"),
+        "catalog_fallback_error": catalog_fallback.get("error"),
+    }
     return {
         "status": "executed" if tables else "needs_table_selection",
         "source_system": "NABO",
         "provider": "국회예산정책처 재정경제통계시스템",
         "query": query,
         "result_count": len(tables),
-        "total_count": payload.get("total_count", len(tables)),
+        "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
         "truncated": payload.get("truncated", False),
+        "search_diagnostics": search_diagnostics,
         "tables": tables,
         "results": tables,
         "must_know": {
@@ -6486,7 +6570,8 @@ async def search_nabo_tables(
             extra_signals={
                 "source_system": "NABO",
                 "result_count": len(tables),
-                "total_count": payload.get("total_count", len(tables)),
+                "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
+                "search_diagnostics": search_diagnostics,
             },
         ),
     }
@@ -6612,6 +6697,26 @@ async def query_nabo_table(
                 markers=["invalid_input"],
                 explanation="query_nabo_table requires a NABO STATBL_ID.",
                 extra_signals={"source_system": "NABO"},
+            ),
+        }
+    if filters is not None and not isinstance(filters, dict):
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "validation_errors": [
+                {
+                    "code": "INVALID_FILTERS_TYPE",
+                    "message": "filters must be an object/dict; use null or omit it for no filters.",
+                    "received_type": type(filters).__name__,
+                }
+            ],
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["invalid_input", "validation_errors"],
+                explanation="query_nabo_table received filters in an unsupported shape.",
+                extra_signals={"source_system": "NABO", "table_id": statbl_id},
             ),
         }
     unknown_filter_keys = [
@@ -6748,7 +6853,31 @@ async def query_nabo_table(
         else:
             cycle_resolution["metadata_error"] = str(exc)
 
-    period_request = _nabo_parse_period_request(period, period_range, cycle=cycle)
+    try:
+        period_request = _nabo_parse_period_request(period, period_range, cycle=cycle)
+    except Exception as exc:
+        period_request = {
+            "source": "period_range" if period_range not in (None, []) else "period",
+            "raw_input": period_range if period_range not in (None, []) else period,
+            "mode": "invalid",
+            "api_filter_period": None,
+            "normalized_period": None,
+            "normalized_range": None,
+            "errors": [
+                {
+                    "code": "PERIOD_REQUEST_NORMALIZATION_ERROR",
+                    "message": str(exc),
+                }
+            ],
+            "accepted_forms": {
+                "latest": "latest",
+                "single": "2024",
+                "range_array": ["2010", "2024"],
+                "range_colon": "2010:2024",
+                "range_hyphen": "2010-2024",
+                "range_object": {"start": "2010", "end": "2024"},
+            },
+        }
     if period_request.get("errors"):
         return {
             "status": "unsupported",
@@ -6764,7 +6893,7 @@ async def query_nabo_table(
             "mcp_output_contract": _mcp_tool_output_contract(
                 role="raw_extraction",
                 final_answer_expected=False,
-                markers=["invalid_input", "period_format_error", "validation_errors"],
+                markers=["invalid_input", "period_request_normalization_error", "validation_errors"],
                 explanation="query_nabo_table received a period request that could not be normalized.",
                 extra_signals={
                     "source_system": "NABO",
@@ -6803,7 +6932,46 @@ async def query_nabo_table(
         }
 
     api_rows = payload.get("rows", [])
-    period_rows = _nabo_apply_period_request(api_rows, period_request)
+    try:
+        period_rows = _nabo_apply_period_request(api_rows, period_request)
+    except Exception as exc:
+        return {
+            "status": "unsupported",
+            "source_system": "NABO",
+            "table_id": statbl_id,
+            "dtacycle_cd": cycle,
+            "dtacycle_cd_requested": requested_cycle,
+            "dtacycle_resolution": cycle_resolution,
+            "period_requested": period,
+            "period_range_requested": period_range,
+            "period_request": {
+                **period_request,
+                "errors": [
+                    *(period_request.get("errors") or []),
+                    {
+                        "code": "PERIOD_REQUEST_APPLICATION_ERROR",
+                        "message": str(exc),
+                    },
+                ],
+            },
+            "validation_errors": [
+                {
+                    "code": "PERIOD_REQUEST_APPLICATION_ERROR",
+                    "message": str(exc),
+                }
+            ],
+            "mcp_output_contract": _mcp_tool_output_contract(
+                role="raw_extraction",
+                final_answer_expected=False,
+                markers=["invalid_input", "period_request_normalization_error", "validation_errors"],
+                explanation="query_nabo_table could not apply the normalized period request.",
+                extra_signals={
+                    "source_system": "NABO",
+                    "table_id": statbl_id,
+                    "period_request": period_request,
+                },
+            ),
+        }
     filtered_rows, filter_errors = _nabo_filter_data_rows(period_rows, filters)
     filter_coverage = _nabo_filter_coverage(period_rows, filters)
     if filter_errors:
