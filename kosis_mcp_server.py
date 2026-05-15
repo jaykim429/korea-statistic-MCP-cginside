@@ -1635,6 +1635,15 @@ def _nabo_table_record(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _omit_raw_from_payload_rows(rows: list[dict[str, Any]], include_raw: bool) -> list[dict[str, Any]]:
+    if include_raw:
+        return rows
+    return [
+        {key: value for key, value in row.items() if key != "raw"}
+        for row in rows
+    ]
+
+
 def _nabo_catalog_match_score(query: Any, table: dict[str, Any]) -> int:
     q = _compact_text(str(query or ""))
     if len(q) < 2:
@@ -3944,7 +3953,11 @@ async def _quick_stat_core(
             seen.add(tid)
             unique.append(item)
 
+    unresolved_semantic = not unique and not did_you_mean
+
     return {
+        "status": "needs_query_rewrite" if unresolved_semantic else "needs_table_selection",
+        "candidate_quality": "no_lexical_or_curated_match" if unresolved_semantic else "candidate_review_required",
         "결과": "Tier A 정밀 매핑 없음. 검색 결과 반환.",
         "사용된_검색어": search_keywords,
         "검색_후보": [
@@ -3958,6 +3971,23 @@ async def _quick_stat_core(
             for r in unique[:8]
         ],
         "did_you_mean": did_you_mean,
+        "semantic_rewrite": {
+            "required": unresolved_semantic,
+            "performed_by": "caller_llm",
+            "reason": "No verified Tier A, curated routing hint, fuzzy candidate, or lexical KOSIS search result was found. The MCP does not invent an unstated synonym.",
+            "next_step": "Rephrase the user term into a statistical Korean indicator/domain term, then call search_stats/search_kosis again.",
+        } if unresolved_semantic else None,
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="shortcut_tool",
+            final_answer_expected=False,
+            markers=(["search_empty", "semantic_rewrite_required"] if unresolved_semantic else ["needs_table_selection"]),
+            explanation="quick_stat could not execute a verified shortcut; use returned candidates or caller-side semantic paraphrase before retrying.",
+            extra_signals={
+                "candidate_quality": "no_lexical_or_curated_match" if unresolved_semantic else "candidate_review_required",
+                "search_result_count": len(unique),
+                "did_you_mean_count": len(did_you_mean),
+            },
+        ),
         "안내": (
             "후보 중 적합한 통계표를 골라서 KOSIS 사이트에서 확인하거나, "
             "더 구체적인 키워드로 다시 시도하세요."
@@ -6124,6 +6154,16 @@ def _demote_low_confidence_search_results(results: list[dict[str, Any]], summary
     return results, [], None
 
 
+def _candidate_quality_label(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
+    if not results:
+        return "no_candidates"
+    if int(summary.get("full_query_match_count") or 0) > 0:
+        return "full_match_available"
+    if int(summary.get("partial_query_match_count") or 0) > 0:
+        return "partial_matches_only"
+    return "low_confidence_only"
+
+
 _DOMESTIC_QUERY_TERMS = ("전국", "한국", "대한민국", "국내", "korea", "southkorea")
 _FUTURE_REQUEST_TERMS = ("추계", "전망", "예측", "장래", "미래", "projection", "forecast")
 _INTERNATIONAL_CONTEXT_TERMS = (
@@ -7256,6 +7296,7 @@ async def search_nabo_tables(
     query: str,
     limit: int = 10,
     api_key: Optional[str] = None,
+    include_raw: bool = False,
 ) -> dict:
     """[🔍] NABOSTATS 재정경제통계시스템 통계표 검색."""
     try:
@@ -7304,14 +7345,16 @@ async def search_nabo_tables(
         if isinstance(table, dict):
             table["match_quality"] = _query_match_quality(
                 query,
-                " ".join(str(table.get(key) or "") for key in ("table_name", "category", "table_comment", "search_term")),
+                " ".join(str(table.get(key) or "") for key in ("table_name", "category", "table_comment", "search_term", "matched_items")),
             )
     tables = _sort_search_candidates(query, tables)
     quality_summary = _search_quality_summary(query, tables)
+    candidate_quality = _candidate_quality_label(tables, quality_summary)
     if tables and quality_summary["full_query_match_count"] == 0:
         markers.append("no_full_query_match")
     if quality_summary["missing_terms_across_results"]:
         markers.append("partial_query_match")
+    response_tables = _omit_raw_from_payload_rows(tables, include_raw)
     search_diagnostics = {
         "api_table_name_result_count": len(api_tables),
         "catalog_fallback_used": bool(catalog_fallback),
@@ -7333,7 +7376,7 @@ async def search_nabo_tables(
         } if (catalog_fallback.get("total_count", payload.get("total_count", len(tables))) or 0) > len(tables) else None,
     }
     return {
-        "status": "executed" if tables else "needs_table_selection",
+        "status": "executed" if tables and candidate_quality == "full_match_available" else "needs_table_selection",
         "source_system": "NABO",
         "provider": "국회예산정책처 재정경제통계시스템",
         "query": query,
@@ -7342,12 +7385,21 @@ async def search_nabo_tables(
         "truncated": payload.get("truncated", False),
         "pagination": pagination,
         "search_diagnostics": search_diagnostics,
-        "tables": tables,
+        "candidate_quality": candidate_quality,
+        "tables": response_tables,
         "deprecated_aliases": {"results": "Use tables; duplicate results payload is no longer returned by default."},
+        "payload_options": {
+            "include_raw": include_raw,
+            "raw_included": include_raw,
+            "raw_omitted": not include_raw,
+            "raw_hint": "Pass include_raw=true only when provider-specific original NABO search fields are needed for debugging.",
+        },
         "must_know": {
             "source_system": "NABO",
             "provider": "국회예산정책처 재정경제통계시스템",
             "do_not_mix_with_kosis_without_source_label": True,
+            "search_results_are_candidates": True,
+            "candidate_quality": candidate_quality,
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="table_search",
@@ -7360,6 +7412,11 @@ async def search_nabo_tables(
                 "total_count": catalog_fallback.get("total_count", payload.get("total_count", len(tables))),
                 "search_diagnostics": search_diagnostics,
                 "pagination": pagination,
+                "candidate_quality": candidate_quality,
+                "payload_options": {
+                    "include_raw": include_raw,
+                    "raw_omitted": not include_raw,
+                },
             },
         ),
     }
@@ -7472,6 +7529,7 @@ async def query_nabo_table(
     filters: Optional[dict[str, Any]] = None,
     max_rows: int = NABO_DEFAULT_MAX_ROWS,
     api_key: Optional[str] = None,
+    include_raw: bool = False,
 ) -> dict:
     """[📥] NABO 통계표 원자료를 조회하고 공통 row 포맷으로 정규화한다."""
     if not statbl_id:
@@ -7802,6 +7860,7 @@ async def query_nabo_table(
             table_exists = None
 
     rows = [_nabo_data_record(row, item_meta_map) for row in filtered_rows]
+    response_rows = _omit_raw_from_payload_rows(rows, include_raw)
     latest_period_in_returned_rows = max((row.get("period") or "" for row in rows), default=None)
     latest_period = None if payload.get("truncated") else latest_period_in_returned_rows
     markers = []
@@ -7862,6 +7921,7 @@ async def query_nabo_table(
                 "period_range": period_range,
                 "filters": filters or {},
                 "max_rows": min(50000, max(int(payload.get("max_rows") or max_rows) * 2, int(payload.get("max_rows") or max_rows) + 1)),
+                "include_raw": include_raw,
             },
         } if payload.get("truncated") else None,
     }
@@ -7896,7 +7956,13 @@ async def query_nabo_table(
         "filter_coverage": filter_coverage,
         "missing_value_count": missing_value_count,
         "missing_value_examples": missing_value_examples,
-        "rows": rows,
+        "rows": response_rows,
+        "payload_options": {
+            "include_raw": include_raw,
+            "raw_included": include_raw,
+            "raw_omitted": not include_raw,
+            "raw_hint": "Pass include_raw=true only when provider-specific original NABO fields are needed for debugging.",
+        },
         "must_know": {
             "source_system": "NABO",
             "provider": "국회예산정책처 재정경제통계시스템",
@@ -7907,6 +7973,7 @@ async def query_nabo_table(
             "period_request_mode": period_request.get("mode"),
             "item_full_name_joined_from_explore_metadata": bool(item_meta_map),
             "period_range_forms_supported": ["period_range", "2010:2024", "2010-2024", {"start": "2010", "end": "2024"}],
+            "raw_omitted_by_default": not include_raw,
         },
         "mcp_output_contract": _mcp_tool_output_contract(
             role="raw_extraction",
@@ -7931,6 +7998,10 @@ async def query_nabo_table(
                 "item_metadata_joined": bool(item_meta_map),
                 "item_metadata_error": item_meta_error,
                 "table_exists": table_exists,
+                "payload_options": {
+                    "include_raw": include_raw,
+                    "raw_omitted": not include_raw,
+                },
             },
         ),
     }
@@ -8082,6 +8153,7 @@ async def search_stats(
     combined_results = _sort_search_candidates(query, results)[: max(1, int(limit or 10)) * (2 if source_norm == "all" else 1)]
     search_quality_summary = _search_quality_summary(query, combined_results)
     results, low_confidence_results, candidate_quality = _demote_low_confidence_search_results(combined_results, search_quality_summary)
+    candidate_quality = candidate_quality or _candidate_quality_label(results, search_quality_summary)
     markers = []
     if not combined_results:
         markers.append("search_empty")
@@ -8132,10 +8204,8 @@ async def search_stats(
             "search_quality_summary": payload.get("search_quality_summary") or (payload.get("search_diagnostics") or {}).get("search_quality_summary"),
         }
     source_summaries = compact_source_summaries
-    if results and int(search_quality_summary.get("full_query_match_count") or 0) == 0:
-        candidate_quality = candidate_quality or "partial_matches_only"
     result = {
-        "status": "executed" if results and not candidate_quality else "needs_table_selection" if (results or low_confidence_results) else "empty",
+        "status": "executed" if results and candidate_quality == "full_match_available" else "needs_table_selection" if (results or low_confidence_results) else "empty",
         "query": query,
         "source": source_norm,
         "result_count": len(results),
@@ -8143,7 +8213,7 @@ async def search_stats(
         "low_confidence_results": low_confidence_results[: max(1, int(limit or 10))],
         "source_summaries": source_summaries,
         "search_quality_summary": search_quality_summary,
-        "candidate_quality": candidate_quality or ("usable_candidates" if results else "no_candidates"),
+        "candidate_quality": candidate_quality,
         "must_know": {
             "mixed_sources": source_norm == "all",
             "caller_must_preserve_source_system": True,

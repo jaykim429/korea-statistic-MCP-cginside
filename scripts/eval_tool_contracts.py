@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import io
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1681,6 +1682,8 @@ async def test_nabo_search_and_query_normalization() -> None:
     assert search["source_system"] == "NABO", search
     assert "results" not in search, search
     assert search["deprecated_aliases"]["results"].startswith("Use tables"), search
+    assert "raw" not in search["tables"][0], search
+    assert search["payload_options"]["raw_omitted"] is True, search
     assert search["tables"][0]["dtacycle_cd_suggestion"] == "YY", search
     assert explore["items"][0]["item_id"] == "10001", explore
     assert query["dtacycle_cd"] == "YY", query
@@ -1688,6 +1691,8 @@ async def test_nabo_search_and_query_normalization() -> None:
     assert query["rows"][0]["period"] == "2024", query
     assert query["rows"][0]["value"] == -8.0, query
     assert query["rows"][0]["dimensions"]["ITEM"]["code"] == "10001", query
+    assert "raw" not in query["rows"][0], query
+    assert query["payload_options"]["raw_omitted"] is True, query
 
 
 async def test_nabo_search_uses_catalog_fallback_for_contained_table_name() -> None:
@@ -1716,7 +1721,8 @@ async def test_nabo_search_uses_catalog_fallback_for_contained_table_name() -> N
         kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
         kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
 
-    assert result["status"] == "executed", result
+    assert result["status"] == "needs_table_selection", result
+    assert result["candidate_quality"] == "partial_matches_only", result
     assert result["tables"][0]["table_id"] == "N1", result
     assert result["search_diagnostics"]["api_table_name_result_count"] == 0, result
     assert result["search_diagnostics"]["catalog_fallback_used"] is True, result
@@ -2529,6 +2535,26 @@ async def test_quick_stat_typo_returns_fuzzy_candidates_without_execution() -> N
     assert "fuzzy_candidate_available" in markers, result
 
 
+async def test_quick_stat_unmapped_colloquial_requires_semantic_rewrite() -> None:
+    original_call = kosis_mcp_server._kosis_call
+
+    async def fake_call(client: Any, endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
+    try:
+        kosis_mcp_server._kosis_call = fake_call  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_stat("\uc2a4\ubab0\ube44\uc988", api_key="dummy")
+    finally:
+        kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
+
+    assert result["status"] == "needs_query_rewrite", result
+    assert result["candidate_quality"] == "no_lexical_or_curated_match", result
+    assert result["semantic_rewrite"]["performed_by"] == "caller_llm", result
+    assert "중소기업" not in json.dumps(result, ensure_ascii=False), result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "semantic_rewrite_required" in markers, result
+
+
 async def test_chart_distribution_returns_raw_svg_field() -> None:
     original_lookup = kosis_mcp_server._curation_lookup
     original_quick_stat = kosis_mcp_server.quick_stat
@@ -2687,6 +2713,7 @@ async def main() -> None:
         ("search_stats_partial_match", lambda: test_search_stats_surfaces_partial_query_match()),
         ("ascii_query_terms_word_boundary", lambda: test_ascii_query_terms_do_not_match_inside_words()),
         ("quick_stat_fuzzy_candidate", lambda: test_quick_stat_typo_returns_fuzzy_candidates_without_execution()),
+        ("quick_stat_semantic_rewrite", lambda: test_quick_stat_unmapped_colloquial_requires_semantic_rewrite()),
         ("chart_distribution_raw_svg", lambda: test_chart_distribution_returns_raw_svg_field()),
         ("shortcut_prunes_null_fields", lambda: test_shortcut_contract_prunes_null_fields()),
         ("http_auth_middleware", lambda: test_http_auth_middleware_requires_token_when_configured()),
