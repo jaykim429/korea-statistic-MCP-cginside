@@ -1768,6 +1768,45 @@ async def test_nabo_search_uses_item_catalog_fallback() -> None:
     assert "item_catalog_search" in markers, markers
 
 
+async def test_nabo_search_uses_token_coverage_fallback() -> None:
+    original_fetch = kosis_mcp_server._nabo_fetch_rows
+    kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+    kosis_mcp_server.NABO_ITEM_CATALOG_CACHE.clear()
+
+    async def fake_fetch(service: str, key: str, params: Any = None, *, max_rows: int = 5000) -> dict[str, Any]:
+        if service == "Sttsapitbl":
+            params = params or {}
+            if params.get("STATBL_NM"):
+                return {"status": "executed", "total_count": 0, "rows": []}
+            return {
+                "status": "executed",
+                "total_count": 1,
+                "rows": [{
+                    "STATBL_ID": "N1",
+                    "STATBL_NM": "중소기업 정책자금",
+                    "CATE_FULLNM": "재정통계>지원사업",
+                    "DTACYCLE_NM": "년",
+                }],
+            }
+        if service == "Sttsapitblitm":
+            return {"status": "executed", "total_count": 0, "rows": []}
+        return {"status": "executed", "total_count": 0, "rows": []}
+
+    try:
+        kosis_mcp_server._nabo_fetch_rows = fake_fetch  # type: ignore[assignment]
+        result = await kosis_mcp_server.search_nabo_tables("중소기업 지원", api_key="dummy")
+    finally:
+        kosis_mcp_server._nabo_fetch_rows = original_fetch  # type: ignore[assignment]
+        kosis_mcp_server.NABO_TABLE_CATALOG_CACHE.clear()
+        kosis_mcp_server.NABO_ITEM_CATALOG_CACHE.clear()
+
+    assert result["status"] == "executed", result
+    assert result["tables"][0]["table_id"] == "N1", result
+    assert result["tables"][0]["match_quality"]["coverage_ratio"] >= 0.5, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "catalog_fallback_search" in markers, markers
+
+
 def test_nabo_table_search_metric_promotion_requires_metadata_support() -> None:
     assert kosis_mcp_server._nabo_table_candidates_support_query(
         "national debt",
@@ -2456,8 +2495,19 @@ async def test_search_stats_surfaces_partial_query_match() -> None:
 
     assert result["search_quality_summary"]["full_query_match_count"] == 0, result
     assert "small" in result["must_know"]["missing_terms_across_results"], result
+    assert result["status"] == "needs_table_selection", result
+    assert result["candidate_quality"] == "low_confidence_only", result
+    assert result["results"] == [], result
+    assert result["low_confidence_results"], result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "no_full_query_match" in markers, result
+    assert "low_confidence_candidates_only" in markers, result
+
+
+def test_ascii_query_terms_do_not_match_inside_words() -> None:
+    quality = kosis_mcp_server._query_match_quality("중소기업 R&D", "OECD public sector debt")
+    assert "rd" in quality["missing_query_terms"], quality
+    assert quality["coverage_ratio"] == 0.0, quality
 
 
 async def test_quick_stat_typo_returns_fuzzy_candidates_without_execution() -> None:
@@ -2474,6 +2524,7 @@ async def test_quick_stat_typo_returns_fuzzy_candidates_without_execution() -> N
 
     assert result.get("did_you_mean"), result
     assert result["did_you_mean"][0]["caller_must_confirm"] is True, result
+    assert str(result["did_you_mean"][0]["query"]).startswith("중소기업_"), result
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "fuzzy_candidate_available" in markers, result
 
@@ -2614,6 +2665,7 @@ async def main() -> None:
         ("nabo_search_query_normalization", lambda: test_nabo_search_and_query_normalization()),
         ("nabo_catalog_fallback_search", lambda: test_nabo_search_uses_catalog_fallback_for_contained_table_name()),
         ("nabo_item_catalog_fallback_search", lambda: test_nabo_search_uses_item_catalog_fallback()),
+        ("nabo_token_coverage_fallback", lambda: test_nabo_search_uses_token_coverage_fallback()),
         ("nabo_table_search_metric_support", lambda: test_nabo_table_search_metric_promotion_requires_metadata_support()),
         ("nabo_unknown_filter", lambda: test_nabo_query_rejects_unknown_filter_key()),
         ("nabo_missing_values", lambda: test_nabo_query_marks_missing_values()),
@@ -2633,6 +2685,7 @@ async def main() -> None:
         ("decode_error_internal_status", lambda: test_decode_error_knows_internal_status_codes()),
         ("search_kosis_match_quality", lambda: test_search_kosis_attaches_match_quality()),
         ("search_stats_partial_match", lambda: test_search_stats_surfaces_partial_query_match()),
+        ("ascii_query_terms_word_boundary", lambda: test_ascii_query_terms_do_not_match_inside_words()),
         ("quick_stat_fuzzy_candidate", lambda: test_quick_stat_typo_returns_fuzzy_candidates_without_execution()),
         ("chart_distribution_raw_svg", lambda: test_chart_distribution_returns_raw_svg_field()),
         ("shortcut_prunes_null_fields", lambda: test_shortcut_contract_prunes_null_fields()),

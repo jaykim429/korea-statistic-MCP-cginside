@@ -920,16 +920,20 @@ def _suggest_tier_a_query_candidates(query: Any, limit: int = 3) -> list[dict[st
                 best_text = text
         threshold = 0.72 if len(needle) >= 4 else 0.82
         if best_score >= threshold:
+            specificity_penalty = max(0, len(_compact_text(str(best_text or ""))) - len(needle))
+            sort_score = best_score - min(0.25, specificity_penalty * 0.01)
             scored.append({
                 "query": key,
                 "description": getattr(param, "description", None),
                 "table_name": getattr(param, "tbl_nm", None),
                 "score": round(best_score, 4),
+                "sort_score": round(sort_score, 4),
+                "specificity_penalty": specificity_penalty,
                 "matched_text": best_text,
                 "source": "tier_a_fuzzy_candidate",
                 "caller_must_confirm": True,
             })
-    scored.sort(key=lambda row: (-float(row.get("score") or 0.0), str(row.get("query") or "")))
+    scored.sort(key=lambda row: (-float(row.get("sort_score") or 0.0), int(row.get("specificity_penalty") or 0), str(row.get("query") or "")))
     return scored[: max(1, int(limit or 3))]
 
 
@@ -1638,6 +1642,7 @@ def _nabo_catalog_match_score(query: Any, table: dict[str, Any]) -> int:
     name = _compact_text(str(table.get("table_name") or ""))
     category = _compact_text(str(table.get("category") or ""))
     comment = _compact_text(str(table.get("table_comment") or ""))
+    haystack_raw = " ".join(str(table.get(key) or "") for key in ("table_name", "category", "table_comment"))
     if not name:
         return 0
     if name == q:
@@ -1648,6 +1653,14 @@ def _nabo_catalog_match_score(query: Any, table: dict[str, Any]) -> int:
         return 88
     if len(q) >= 3 and (q in category or q in comment):
         return 62
+    tokens = _query_tokens_for_matching(query)
+    if tokens:
+        matched = [token for token in tokens if _query_token_matches_text(token, haystack_raw)]
+        coverage = len(matched) / len(tokens)
+        if coverage >= 1.0:
+            return 82
+        if coverage >= 0.5:
+            return 56
     return 0
 
 
@@ -1702,6 +1715,15 @@ def _nabo_item_match_score(query: Any, item: dict[str, Any]) -> int:
             return contains_score
         if len(q) >= 3 and q in text:
             return contains_score - 4
+    tokens = _query_tokens_for_matching(query)
+    combined_raw = " ".join(str(item.get(key) or "") for key in ("item_name", "item_full_name"))
+    if tokens:
+        matched = [token for token in tokens if _query_token_matches_text(token, combined_raw)]
+        coverage = len(matched) / len(tokens)
+        if coverage >= 1.0:
+            return 82
+        if coverage >= 0.5:
+            return 54
     return 0
 
 
@@ -6001,17 +6023,36 @@ def _query_tokens_for_matching(query: Any) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _query_token_matches_text(token: str, text: Any) -> bool:
+    norm = _compact_text(token)
+    if not norm:
+        return False
+    if re.fullmatch(r"[0-9a-z]+", norm):
+        return norm in _query_tokens_for_matching(text)
+    return norm in _compact_text(str(text or "").replace("R&D", "RD").replace("r&d", "rd"))
+
+
+def _query_token_weight(token: str) -> float:
+    # Korean query tokens tend to carry domain semantics, while short ASCII
+    # tokens are often acronyms. Weighting affects ranking only; evidence is
+    # still exposed verbatim for the caller to judge.
+    return 2.0 if re.search(r"[가-힣]", str(token or "")) else 1.0
+
+
 def _query_match_quality(query: Any, candidate_text: Any) -> dict[str, Any]:
     tokens = _query_tokens_for_matching(query)
-    haystack = _compact_text(str(candidate_text or "").replace("R&D", "RD").replace("r&d", "rd"))
-    matched = [token for token in tokens if token in haystack]
-    missing = [token for token in tokens if token not in haystack]
+    matched = [token for token in tokens if _query_token_matches_text(token, candidate_text)]
+    missing = [token for token in tokens if token not in matched]
     ratio = round(len(matched) / len(tokens), 4) if tokens else 1.0
+    total_weight = sum(_query_token_weight(token) for token in tokens)
+    matched_weight = sum(_query_token_weight(token) for token in matched)
+    weighted_ratio = round(matched_weight / total_weight, 4) if total_weight else 1.0
     return {
         "query_terms": tokens,
         "matched_terms": matched,
         "missing_query_terms": missing,
         "coverage_ratio": ratio,
+        "weighted_coverage_ratio": weighted_ratio,
         "match_quality": "high" if ratio >= 0.8 else "medium" if ratio >= 0.5 else "low",
     }
 
@@ -6039,6 +6080,7 @@ def _sort_search_candidates(query: Any, rows: list[dict[str, Any]]) -> list[dict
     return sorted(
         rows,
         key=lambda row: (
+            -float((row.get("match_quality") or {}).get("weighted_coverage_ratio") or 0.0),
             -float((row.get("match_quality") or {}).get("coverage_ratio") or 0.0),
             -_match_quality_rank(row.get("match_quality")),
             str(row.get("source_system") or ""),
@@ -6066,9 +6108,20 @@ def _search_quality_summary(query: Any, rows: list[dict[str, Any]]) -> dict[str,
         "partial_query_match_count": sum(1 for quality in qualities if 0.0 < float(quality.get("coverage_ratio") or 0.0) < 1.0),
         "low_query_match_count": sum(1 for quality in qualities if quality.get("match_quality") == "low"),
         "best_coverage_ratio": max((float(quality.get("coverage_ratio") or 0.0) for quality in qualities), default=0.0),
+        "best_weighted_coverage_ratio": max((float(quality.get("weighted_coverage_ratio") or 0.0) for quality in qualities), default=0.0),
         "missing_terms_across_results": missing_terms,
         "candidate_count": len(rows),
     }
+
+
+def _demote_low_confidence_search_results(results: list[dict[str, Any]], summary: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Optional[str]]:
+    if (
+        results
+        and int(summary.get("full_query_match_count") or 0) == 0
+        and int(summary.get("low_query_match_count") or 0) >= int(summary.get("candidate_count") or 0)
+    ):
+        return [], results, "low_confidence_only"
+    return results, [], None
 
 
 _DOMESTIC_QUERY_TERMS = ("전국", "한국", "대한민국", "국내", "korea", "southkorea")
@@ -8026,13 +8079,16 @@ async def search_stats(
         source_payloads["nabo"] = nabo_payload
         results.extend((nabo_payload.get("tables") or [])[:limit])
 
-    results = _sort_search_candidates(query, results)[: max(1, int(limit or 10)) * (2 if source_norm == "all" else 1)]
-    search_quality_summary = _search_quality_summary(query, results)
+    combined_results = _sort_search_candidates(query, results)[: max(1, int(limit or 10)) * (2 if source_norm == "all" else 1)]
+    search_quality_summary = _search_quality_summary(query, combined_results)
+    results, low_confidence_results, candidate_quality = _demote_low_confidence_search_results(combined_results, search_quality_summary)
     markers = []
-    if not results:
+    if not combined_results:
         markers.append("search_empty")
     elif search_quality_summary["full_query_match_count"] == 0:
         markers.append("no_full_query_match")
+    if low_confidence_results:
+        markers.append("low_confidence_candidates_only")
     if search_quality_summary["missing_terms_across_results"]:
         markers.append("partial_query_match")
     missing_sources = [
@@ -8076,14 +8132,18 @@ async def search_stats(
             "search_quality_summary": payload.get("search_quality_summary") or (payload.get("search_diagnostics") or {}).get("search_quality_summary"),
         }
     source_summaries = compact_source_summaries
+    if results and int(search_quality_summary.get("full_query_match_count") or 0) == 0:
+        candidate_quality = candidate_quality or "partial_matches_only"
     result = {
-        "status": "executed" if results else "empty",
+        "status": "executed" if results and not candidate_quality else "needs_table_selection" if (results or low_confidence_results) else "empty",
         "query": query,
         "source": source_norm,
         "result_count": len(results),
         "results": results,
+        "low_confidence_results": low_confidence_results[: max(1, int(limit or 10))],
         "source_summaries": source_summaries,
         "search_quality_summary": search_quality_summary,
+        "candidate_quality": candidate_quality or ("usable_candidates" if results else "no_candidates"),
         "must_know": {
             "mixed_sources": source_norm == "all",
             "caller_must_preserve_source_system": True,
@@ -8092,6 +8152,7 @@ async def search_stats(
             "definition_comparison_required": cross_source_definition_check_required,
             "do_not_treat_cross_source_results_as_equivalent": cross_source_definition_check_required,
             "search_results_are_candidates": True,
+            "low_confidence_results_are_not_matches": bool(low_confidence_results),
             "full_query_match_count": search_quality_summary["full_query_match_count"],
             "missing_terms_across_results": search_quality_summary["missing_terms_across_results"],
         },
@@ -8107,6 +8168,7 @@ async def search_stats(
                 "source_systems_present": source_systems_present,
                 "definition_comparison_required": cross_source_definition_check_required,
                 "search_quality_summary": search_quality_summary,
+                "candidate_quality": candidate_quality,
             },
         ),
     }
