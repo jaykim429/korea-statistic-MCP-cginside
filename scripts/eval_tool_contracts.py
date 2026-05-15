@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import io
 import sys
 from pathlib import Path
@@ -975,6 +976,17 @@ def test_marker_guidance_in_contract() -> None:
     assert "duplicate_denominator_key" in guidance, contract
 
 
+def test_output_contract_compact_by_default() -> None:
+    contract = kosis_mcp_server._mcp_tool_output_contract(
+        role="test",
+        final_answer_expected=False,
+        markers=["ignored_params"],
+    )
+    assert "llm_rules" not in contract, contract
+    assert "failure_markers" not in contract, contract
+    assert contract["current_signals"]["markers_present"] == ["ignored_params"], contract
+
+
 async def test_quick_stat_shortcut_contract() -> None:
     original_core = kosis_mcp_server._quick_stat_core
 
@@ -1122,6 +1134,20 @@ async def test_kosis_only_chain_tools_reject_explicit_nabo_source() -> None:
 
     chain = await kosis_mcp_server.chain_full_analysis("NABO 관리재정수지", source_system="NABO")
     assert chain and "unsupported_source_system" in chain[0].text, chain
+
+
+async def test_chain_full_analysis_returns_workflow_not_analysis() -> None:
+    result = await kosis_mcp_server.chain_full_analysis("실업률", region="전국", api_key="dummy")
+    assert len(result) == 1, result
+    payload = ast.literal_eval(result[0].text)
+    assert payload["analysis_execution"] == "not_performed", payload
+    assert payload["tool_role"] == "analysis_materials_workflow", payload
+    text = result[0].text
+    assert "r_squared" not in text, payload
+    assert "forecast_path" not in text, payload
+    assert "```svg" not in text, payload
+    markers = payload["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "analysis_not_executed" in markers, payload
 
 
 async def test_analyze_trend_accepts_source_agnostic_input_rows() -> None:
@@ -1374,6 +1400,8 @@ async def test_query_table_normalizes_suppressed_values() -> None:
         kosis_mcp_server._kosis_call = original_call  # type: ignore[assignment]
 
     row = result["rows"][0]
+    assert "raw" not in row, result
+    assert result["payload_options"]["raw_omitted"] is True, result
     assert row["value"] is None, result
     assert row["value_raw"] == "*", result
     assert row["value_numeric"] is None, result
@@ -2243,12 +2271,14 @@ async def main() -> None:
         ("answer_query_convenience_contract", lambda: test_answer_query_convenience_contract()),
         ("answer_query_compact_response", lambda: test_answer_query_compact_response_hides_control_contract()),
         ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
+        ("output_contract_compact_default", lambda: test_output_contract_compact_by_default()),
         ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),
         ("quick_stat_period_failure_contract", lambda: test_quick_stat_period_not_found_is_failure()),
         ("detect_outliers_detrended_default", lambda: test_detect_outliers_detrended_default()),
         ("detect_outliers_all_methods", lambda: test_detect_outliers_all_methods_documents_stl_optional()),
         ("analysis_tools_materials", lambda: test_analysis_tools_return_materials_not_interpretation()),
         ("analysis_tools_reject_nabo_query_fallback", lambda: test_kosis_only_chain_tools_reject_explicit_nabo_source()),
+        ("chain_full_analysis_workflow_only", lambda: test_chain_full_analysis_returns_workflow_not_analysis()),
         ("analysis_tools_input_rows", lambda: test_analyze_trend_accepts_source_agnostic_input_rows()),
         ("indicator_dependency_advisory_contract", lambda: test_indicator_dependency_map_is_advisory_contract()),
         ("query_table_invalid_filter_contract", lambda: test_query_table_invalid_filter_has_contract()),

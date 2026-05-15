@@ -140,10 +140,18 @@ def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 QUERY_TABLE_MAX_FANOUT = _env_int("KOSIS_MCP_QUERY_TABLE_MAX_FANOUT", 80)
 QUERY_TABLE_CONCURRENCY = _env_int("KOSIS_MCP_QUERY_TABLE_CONCURRENCY", 8)
 QUERY_TABLE_CALL_TIMEOUT = _env_float("KOSIS_MCP_QUERY_TABLE_CALL_TIMEOUT", 15.0)
 DATA_FRESHNESS_WARNING_YEARS = _env_float("KOSIS_MCP_DATA_FRESHNESS_WARNING_YEARS", 2.0, minimum=0.0)
+VERBOSE_OUTPUT_CONTRACT = _env_bool("KOSIS_MCP_VERBOSE_OUTPUT_CONTRACT", False)
 NABO_API_BASE = "https://www.nabostats.go.kr/openapi"
 NABO_MAX_PAGE_SIZE = 1000
 NABO_DEFAULT_MAX_ROWS = 5000
@@ -381,6 +389,7 @@ def _mcp_tool_output_contract(
         "convenience_response": "Use compact metadata/notes first; request verbose=True only for diagnostics.",
         "shortcut_response": "Check ignored_params/dropped_dimensions before treating shortcut output as complete.",
         "ignored_params": "The shortcut ignored unsupported optional parameters; returned values can still be valid for supported dimensions.",
+        "analysis_not_executed": "This tool did not run regression, forecasting, outlier detection, or chart generation; use returned workflow/data materials in a code environment if analysis is needed.",
         "deprecation": "Prefer the recommended replacement workflow/tool.",
         "formula_advisory_only": "Treat formula guidance as advisory; verify numerator/denominator from KOSIS metadata/raw rows.",
         "heuristic_extraction": "Treat extracted concepts as candidates only; verify with KOSIS metadata before use.",
@@ -462,19 +471,21 @@ def _mcp_tool_output_contract(
         current_signals.update(extra_signals)
     if marker_guidance:
         current_signals["marker_guidance"] = marker_guidance
-    return {
+    contract = {
         "role": role,
         "final_answer_expected": final_answer_expected,
         "machine_readable_status": True,
         "current_signals": current_signals,
-        "llm_rules": [
+    }
+    if VERBOSE_OUTPUT_CONTRACT:
+        contract["llm_rules"] = [
             "Do not hide unsupported, not_matched, empty_rows, validation_errors, or partial_fanout_coverage markers.",
             "Follow current_signals.marker_guidance for every marker before synthesizing a user-facing answer.",
             "If coverage_ratio is below 1.0, disclose partial coverage before using the returned rows.",
             "Do not fill missing rows from model knowledge.",
             "If unit_caller_should_label is null, resolve the unit before quoting; do not reuse unit_raw as the computed result unit.",
-        ],
-        "failure_markers": [
+        ]
+        contract["failure_markers"] = [
             "unsupported",
             "invalid_input",
             "missing_api_key",
@@ -501,8 +512,8 @@ def _mcp_tool_output_contract(
             "all_values_missing",
             "partial_fulfillment",
             "coverage_ratio",
-        ],
-    }
+        ]
+    return contract
 
 
 def _missing_api_key_response(tool: str, **context: Any) -> dict[str, Any]:
@@ -5180,53 +5191,89 @@ async def chain_full_analysis(
     api_key: Optional[str] = None,
     source_system: Optional[str] = None,
 ) -> list:
-    """[⛓] 종합 분석 재료 번들: 통계+추세+예측재료+이상치+차트.
+    """Legacy entry point that returns an analysis-materials workflow only.
 
-    LLM이 필요한 부분만 골라 해석하도록 계산 재료를 묶어 반환한다.
+    This tool no longer runs regression, forecasting, outlier detection, or
+    chart generation. The caller should retrieve verified rows and run the
+    chosen statistical analysis in a code environment.
     """
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return [TextContent(type="text", text=str(_unsupported_source_response("chain_full_analysis", query, resolved_source)))]
-    latest = await quick_stat(query, region, "latest", api_key)
-    if "오류" in latest:
-        return [TextContent(type="text", text=str(latest))]
-
-    trend = await analyze_trend(query, region, 20, api_key)
-    forecast = await forecast_stat(query, region, 15, 5, api_key)
-    outliers = await detect_outliers(query, region, 20, api_key)
-
-    series_result = await quick_trend(query, region, 20, api_key)
-    times, values = _values_from_series(series_result.get("시계열", []))
-    chart_svg = ""
-    if times:
-        chart_svg = _chart_line_svg(
-            list(zip(times, values)),
-            title=f"{trend.get('통계명')} ({region})",
-            ylabel=trend.get("단위", ""), source="KOSIS",
-        )
-
     summary = {
-        "주제": query, "지역": region,
-        "최신값": latest.get("answer"),
-        "trend_materials": {
-            "model_parameters": trend.get("model_parameters"),
-            "formula": trend.get("formula"),
-            "period": trend.get("기간"),
+        "status": "planned",
+        "tool_role": "analysis_materials_workflow",
+        "analysis_execution": "not_performed",
+        "query": query,
+        "region": region,
+        "source_system": resolved_source or "KOSIS",
+        "recommended_workflow": [
+            {
+                "step": 1,
+                "tool": "plan_query",
+                "purpose": "extract intended metrics, dimensions, source preference, and next raw-data calls",
+                "args": {"query": query},
+            },
+            {
+                "step": 2,
+                "tool": "select_table_for_query",
+                "purpose": "choose a KOSIS table whose metadata supports the requested metric and dimensions",
+                "args": {"query": query, "indicator": query, "reject_if_missing_dimensions": True},
+            },
+            {
+                "step": 3,
+                "tool": "resolve_concepts",
+                "purpose": "map region/classification labels to verified table codes",
+                "args": {"concepts": [region], "org_id": "<from_step_2>", "tbl_id": "<from_step_2>"},
+            },
+            {
+                "step": 4,
+                "tool": "query_table",
+                "purpose": "return compact raw rows for analysis; pass include_raw=true only for provider-debugging",
+                "args": {
+                    "org_id": "<from_step_2>",
+                    "tbl_id": "<from_step_2>",
+                    "filters": "<from_step_3_codes>",
+                    "include_raw": False,
+                },
+            },
+            {
+                "step": 5,
+                "tool": "check_variable_compatibility",
+                "purpose": "for multi-variable modeling, check common period, units, and requested region coverage before coding analysis",
+                "args": {"variables": ["<metric_1>", "<metric_2>"], "regions": [region]},
+            },
+        ],
+        "analysis_boundary": {
+            "mcp_does": [
+                "retrieve verified raw/statistical rows",
+                "surface period, unit, source, missing-value, and compatibility metadata",
+                "provide explicit arithmetic only when compute_indicator is called",
+            ],
+            "caller_or_code_environment_does": [
+                "regression model choice",
+                "VIF and residual diagnostics",
+                "forecasting model selection",
+                "chart design and final interpretation",
+            ],
         },
-        "forecast_materials": {
-            "model_options": forecast.get("model_options"),
-            "linear_example": ((forecast.get("computed_examples") or {}).get("linear") or {}),
-        },
-        "이상치": outliers.get("이상치", [])[:3],
-        "must_know": trend.get("must_know") or forecast.get("must_know"),
-        "출처": "통계청 KOSIS",
+        "notes": [
+            "chain_full_analysis is kept as a legacy convenience entry point but no longer runs automatic regression, forecast, outlier, or SVG chart generation.",
+            "Use query_table rows or exported data in Python/R for statistical modeling.",
+        ],
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="analysis_materials_workflow",
+            final_answer_expected=False,
+            markers=["analysis_not_executed"],
+            explanation="chain_full_analysis now returns a workflow for obtaining analysis-ready materials instead of executing statistical analysis inside the MCP.",
+            extra_signals={
+                "analysis_execution": "not_performed",
+                "legacy_tool": True,
+                "source_system": resolved_source or "KOSIS",
+            },
+        ),
     }
-
-    result = [TextContent(type="text", text=str(summary))]
-    if chart_svg:
-        result.insert(0, _svg_to_image(chart_svg))
-    return result
-
+    return [TextContent(type="text", text=str(summary))]
 
 @mcp.tool()
 async def plan_query(query: str, api_key: Optional[str] = None, nabo_api_key: Optional[str] = None) -> dict:
@@ -8339,6 +8386,7 @@ async def query_table(
     period_range: Optional[list[str]] = None,
     aggregation: str = "none",
     group_by: Optional[list[str]] = None,
+    include_raw: bool = False,
     api_key: Optional[str] = None,
 ) -> dict:
     """[🧪] 검증된 메타 코드로 KOSIS 표를 raw 조회한다.
@@ -8715,6 +8763,11 @@ async def query_table(
         contract_markers.append("missing_values")
         if missing_value_count == len(normalized_rows):
             contract_markers.append("all_values_missing")
+    if not include_raw:
+        normalized_rows = [
+            {key: value for key, value in row.items() if key != "raw"}
+            for row in normalized_rows
+        ]
     result = {
         "상태": "executed",
         "status": "executed",
@@ -8747,6 +8800,12 @@ async def query_table(
             "concurrency": QUERY_TABLE_CONCURRENCY,
             "per_call_timeout_seconds": QUERY_TABLE_CALL_TIMEOUT,
             "reason": "KOSIS multi-code parameters can fail with code 21, so the server uses verified single-code calls.",
+        },
+        "payload_options": {
+            "include_raw": include_raw,
+            "raw_included": include_raw,
+            "raw_omitted": not include_raw,
+            "raw_hint": "Pass include_raw=true only when provider-specific original KOSIS fields are needed for debugging.",
         },
         "rows": normalized_rows,
         "row_count": len(normalized_rows),
