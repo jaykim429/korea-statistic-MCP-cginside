@@ -246,6 +246,20 @@ async def test_compute_indicator_growth_rate_single_row_has_reason() -> None:
     assert result["unmatched"][0]["reason"] == "insufficient_periods", result
 
 
+async def test_compute_indicator_growth_rate_negative_base_warns() -> None:
+    rows = [
+        _make_row("2020", "-71.2", "00", "전국", unit="조원"),
+        _make_row("2021", "-30.5", "00", "전국", unit="조원"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="growth_rate", input_rows=rows)
+    assert result["status"] == "ok", result
+    assert result["results"][0]["value"] == -57.1629, result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "negative_base_growth_rate" in markers, markers
+    assert result["results"][0]["inputs"]["negative_base"] is True, result
+    assert result["computation_metadata"]["calculation_alternatives"][0]["operation"] == "yoy_diff", result
+
+
 async def test_compute_indicator_per_capita_with_denominator_zero() -> None:
     numerator = [
         _make_row("2023", "1000", "11", "서울", unit="명"),
@@ -330,6 +344,33 @@ async def test_compute_indicator_share_groups_input_total_by_period() -> None:
     markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
     assert "share_total_grouped_by_period" in markers, markers
     assert result["computation_metadata"]["share_denominator_grouping"]["grouping"] == "period", result
+
+
+async def test_compute_indicator_sum_rejects_mixed_units() -> None:
+    rows = [
+        _make_row("2024", "3653100", "00", "전국", unit="억원"),
+        _make_row("2024", "-43.5", "00", "전국", unit="조원"),
+    ]
+    rows[0]["source_system"] = "KOSIS"
+    rows[1]["source_system"] = "NABO"
+    result = await kosis_mcp_server.compute_indicator(operation="sum_additive_rows", input_rows=rows)
+    assert result["status"] == "invalid_input", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "unit_mismatch" in markers, markers
+    assert "unit_conversion_required" in markers, markers
+    assert result["computation_metadata"]["unit_profile"]["mixed_source_systems"] is True, result
+
+
+async def test_compute_indicator_share_rejects_mixed_input_total_units() -> None:
+    rows = [
+        _make_row("2024", "10", "11", "서울", unit="억원"),
+        _make_row("2024", "1", "21", "부산", unit="조원"),
+    ]
+    result = await kosis_mcp_server.compute_indicator(operation="share", input_rows=rows)
+    assert result["status"] == "invalid_input", result
+    markers = result["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "unit_mismatch" in markers, markers
+    assert "unit_conversion_required" in markers, markers
 
 
 async def test_compute_indicator_duplicate_denominator_key_is_not_silent() -> None:
@@ -959,6 +1000,28 @@ async def test_analysis_tools_return_materials_not_interpretation() -> None:
     assert "해석" not in corr["Pearson"], corr
     assert "kendall" in corr["correlations"], corr
     assert corr["must_know"]["correlation_is_not_causation"] is True, corr
+
+
+async def test_kosis_only_chain_tools_reject_explicit_nabo_source() -> None:
+    trend = await kosis_mcp_server.quick_trend("NABO 관리재정수지", source_system="NABO")
+    assert trend["status"] == "unsupported", trend
+    markers = trend["mcp_output_contract"]["current_signals"]["markers_present"]
+    assert "unsupported_source_system" in markers, markers
+
+    chain = await kosis_mcp_server.chain_full_analysis("NABO 관리재정수지", source_system="NABO")
+    assert chain and "unsupported_source_system" in chain[0].text, chain
+
+
+async def test_analyze_trend_accepts_source_agnostic_input_rows() -> None:
+    rows = [
+        {"period": "2020", "value": "1.0", "unit": "조원", "source_system": "NABO"},
+        {"period": "2021", "value": "2.0", "unit": "조원", "source_system": "NABO"},
+        {"period": "2022", "value": "3.0", "unit": "조원", "source_system": "NABO"},
+    ]
+    result = await kosis_mcp_server.analyze_trend("관리재정수지", input_rows=rows)
+    assert result["status"] == "executed", result
+    assert result["input"]["y"] == [1.0, 2.0, 3.0], result
+    assert result["input_row_profile"]["source_systems"] == ["NABO"], result
 
 
 async def test_indicator_dependency_map_is_advisory_contract() -> None:
@@ -1819,10 +1882,13 @@ async def main() -> None:
         ("search_kosis_empty_contract", lambda: test_search_kosis_contract_on_empty_results()),
         ("compute_growth_rate", lambda: test_compute_indicator_growth_rate()),
         ("compute_growth_rate_single_row_reason", lambda: test_compute_indicator_growth_rate_single_row_has_reason()),
+        ("compute_growth_rate_negative_base", lambda: test_compute_indicator_growth_rate_negative_base_warns()),
         ("compute_per_capita_denominator_zero", lambda: test_compute_indicator_per_capita_with_denominator_zero()),
         ("compute_unit_transformation", lambda: test_compute_indicator_unit_transformation_requires_caller_label()),
         ("compute_share_input_total", lambda: test_compute_indicator_share_uses_input_total()),
         ("compute_share_period_grouping", lambda: test_compute_indicator_share_groups_input_total_by_period()),
+        ("compute_sum_mixed_units", lambda: test_compute_indicator_sum_rejects_mixed_units()),
+        ("compute_share_mixed_units", lambda: test_compute_indicator_share_rejects_mixed_input_total_units()),
         ("compute_duplicate_denominator", lambda: test_compute_indicator_duplicate_denominator_key_is_not_silent()),
         ("compute_yoy_pct_intra_year", lambda: test_compute_indicator_yoy_pct_matches_intra_year()),
         ("compute_unknown_operation", lambda: test_compute_indicator_unknown_operation_is_rejected()),
@@ -1852,6 +1918,8 @@ async def main() -> None:
         ("detect_outliers_detrended_default", lambda: test_detect_outliers_detrended_default()),
         ("detect_outliers_all_methods", lambda: test_detect_outliers_all_methods_documents_stl_optional()),
         ("analysis_tools_materials", lambda: test_analysis_tools_return_materials_not_interpretation()),
+        ("analysis_tools_reject_nabo_query_fallback", lambda: test_kosis_only_chain_tools_reject_explicit_nabo_source()),
+        ("analysis_tools_input_rows", lambda: test_analyze_trend_accepts_source_agnostic_input_rows()),
         ("indicator_dependency_advisory_contract", lambda: test_indicator_dependency_map_is_advisory_contract()),
         ("query_table_invalid_filter_contract", lambda: test_query_table_invalid_filter_has_contract()),
         ("query_table_period_error_contract", lambda: test_query_table_period_error_has_contract_and_format_guidance()),

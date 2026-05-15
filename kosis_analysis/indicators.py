@@ -93,6 +93,54 @@ def _row_unit(row: dict[str, Any]) -> Optional[str]:
     return str(item.get("unit")) if item.get("unit") else None
 
 
+def _row_source_system(row: dict[str, Any]) -> Optional[str]:
+    value = row.get("source_system") or row.get("provider")
+    if value:
+        return str(value)
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        value = raw.get("source_system") or raw.get("provider")
+        if value:
+            return str(value)
+    return None
+
+
+def _profile_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    units = sorted({unit for row in rows if (unit := _row_unit(row))})
+    sources = sorted({source for row in rows if (source := _row_source_system(row))})
+    table_ids = sorted({
+        str(value)
+        for row in rows
+        for value in (
+            row.get("tbl_id"),
+            row.get("table_id"),
+            row.get("statbl_id"),
+            (row.get("raw") or {}).get("TBL_ID") if isinstance(row.get("raw"), dict) else None,
+            (row.get("raw") or {}).get("STATBL_ID") if isinstance(row.get("raw"), dict) else None,
+        )
+        if value
+    })
+    return {
+        "row_count": len(rows),
+        "units": units,
+        "distinct_unit_count": len(units),
+        "source_systems": sources,
+        "mixed_source_systems": len(sources) > 1,
+        "table_ids": table_ids,
+    }
+
+
+def _unit_mismatch_profile(rows: Sequence[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    profile = _profile_rows(rows)
+    if profile["distinct_unit_count"] <= 1:
+        return None
+    profile.update({
+        "requires_unit_conversion": True,
+        "reason": "distinct_units_in_additive_group",
+    })
+    return profile
+
+
 def _normalize_match_keys(
     rows: Sequence[dict[str, Any]],
     explicit: Optional[Sequence[str]],
@@ -259,13 +307,30 @@ class GrowthRate(_PairOverPeriodOperation):
                         outcome.markers.append("denominator_zero")
                     continue
                 value = (cur_v - prev_v) / prev_v * 100
+                inputs = {"current": cur_v, "previous": prev_v, "previous_period": prev_p}
+                note = None
+                if prev_v < 0:
+                    inputs["negative_base"] = True
+                    note = (
+                        "Percent change uses a negative base. For deficits, losses, or balances, "
+                        "the sign can be counterintuitive; compare yoy_diff/absolute change."
+                    )
+                    if "negative_base_growth_rate" not in outcome.markers:
+                        outcome.markers.append("negative_base_growth_rate")
+                    outcome.extra.setdefault("calculation_alternatives", [
+                        {
+                            "operation": "yoy_diff",
+                            "reason": "Absolute change is often easier to interpret when the base value is negative.",
+                        }
+                    ])
                 outcome.results.append(IndicatorResult(
                     value=_round(value, decimals),
                     period=cur_p,
                     label=_row_label(cur_row),
                     unit="%",
                     dimensions=_row_dimensions(cur_row),
-                    inputs={"current": cur_v, "previous": prev_v, "previous_period": prev_p},
+                    inputs=inputs,
+                    note=note,
                 ))
         outcome.status = _final_status(outcome)
         return outcome
@@ -361,16 +426,35 @@ class _YearOverYear(_PairOverPeriodOperation):
                         continue
                     value = (cur_v - prev_v) / prev_v * 100
                     unit = "%"
+                    inputs = {"current": cur_v, "previous": prev_v, "previous_period": lag_key}
+                    note = None
+                    if prev_v < 0:
+                        inputs["negative_base"] = True
+                        note = (
+                            "Year-over-year percent change uses a negative base. For deficits, losses, "
+                            "or balances, yoy_diff/absolute change may be less misleading."
+                        )
+                        if "negative_base_growth_rate" not in outcome.markers:
+                            outcome.markers.append("negative_base_growth_rate")
+                        outcome.extra.setdefault("calculation_alternatives", [
+                            {
+                                "operation": "yoy_diff",
+                                "reason": "Absolute change is often easier to interpret when the previous value is negative.",
+                            }
+                        ])
                 else:
                     value = cur_v - prev_v
                     unit = _row_unit(row)
+                    inputs = {"current": cur_v, "previous": prev_v, "previous_period": lag_key}
+                    note = None
                 outcome.results.append(IndicatorResult(
                     value=_round(value, decimals),
                     period=period,
                     label=_row_label(row),
                     unit=unit,
                     dimensions=_row_dimensions(row),
-                    inputs={"current": cur_v, "previous": prev_v, "previous_period": lag_key},
+                    inputs=inputs,
+                    note=note,
                 ))
         outcome.status = _final_status(outcome)
         return outcome
@@ -509,6 +593,26 @@ class _RatioLike(IndicatorOperation):
                     if "denominator_zero" not in outcome.markers:
                         outcome.markers.append("denominator_zero")
                     continue
+                if self.name == "share":
+                    numerator_unit = _row_unit(row)
+                    denominator_unit = _row_unit(denom_row)
+                    if numerator_unit and denominator_unit and numerator_unit != denominator_unit:
+                        outcome.unmatched.append({
+                            "period": period,
+                            "group_codes": list(key[1]),
+                            "reason": "unit_mismatch",
+                            "numerator_unit": numerator_unit,
+                            "denominator_unit": denominator_unit,
+                        })
+                        if "unit_mismatch" not in outcome.markers:
+                            outcome.markers.append("unit_mismatch")
+                        if "unit_conversion_required" not in outcome.markers:
+                            outcome.markers.append("unit_conversion_required")
+                        outcome.extra["unit_profile"] = {
+                            "numerator": _profile_rows([row]),
+                            "denominator": _profile_rows([denom_row]),
+                        }
+                        continue
                 value = num / den * effective_scale
                 unit_payload = self._unit_payload(
                     row,
@@ -543,6 +647,7 @@ class _RatioLike(IndicatorOperation):
             # Share without an explicit denominator divides by structurally comparable input totals.
             usable: list[tuple[float, dict[str, Any]]] = []
             totals_by_period: dict[str, float] = defaultdict(float)
+            rows_by_period: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for row in rows:
                 v = _to_number(row.get("value"))
                 if v is None:
@@ -553,11 +658,26 @@ class _RatioLike(IndicatorOperation):
                     continue
                 period = str(row.get("period") or "")
                 totals_by_period[period] += v
+                rows_by_period[period].append(row)
                 usable.append((v, row))
             if not usable:
                 outcome.status = "invalid_input"
                 outcome.validation_errors.append("share requires at least one numeric input row.")
                 outcome.markers.append("invalid_input")
+                return outcome
+            unit_mismatches = {
+                period: profile
+                for period, period_rows in rows_by_period.items()
+                if (profile := _unit_mismatch_profile(period_rows))
+            }
+            if unit_mismatches:
+                outcome.status = "invalid_input"
+                outcome.validation_errors.append(
+                    "share with input_rows total requires comparable units within each denominator group."
+                )
+                outcome.markers.extend(["unit_mismatch", "unit_conversion_required", "invalid_input"])
+                outcome.extra["unit_profile"] = _profile_rows(rows)
+                outcome.extra["unit_mismatches_by_period"] = unit_mismatches
                 return outcome
             zero_periods = [period for period, total in totals_by_period.items() if total == 0]
             if len(zero_periods) == len(totals_by_period):
@@ -678,13 +798,34 @@ class SumAdditiveRows(IndicatorOperation):
                 "count": 0,
                 "sample": row,
                 "unit": _row_unit(row),
+                "rows": [],
             })
+            bucket["rows"].append(row)
             v = _to_number(row.get("value"))
             if v is None:
                 outcome.unmatched.append({"period": period, "reason": "non_numeric_value"})
                 continue
             bucket["total"] += v
             bucket["count"] += 1
+        unit_mismatches: list[dict[str, Any]] = []
+        for (period, codes), bucket in groups.items():
+            mismatch = _unit_mismatch_profile(bucket["rows"])
+            if not mismatch:
+                continue
+            mismatch.update({
+                "period": period,
+                "group_codes": list(codes),
+            })
+            unit_mismatches.append(mismatch)
+        if unit_mismatches:
+            outcome.status = "invalid_input"
+            outcome.validation_errors.append(
+                "sum_additive_rows requires all rows in each additive group to use the same unit."
+            )
+            outcome.markers.extend(["unit_mismatch", "unit_conversion_required", "invalid_input"])
+            outcome.extra["unit_profile"] = _profile_rows(rows)
+            outcome.extra["unit_mismatches"] = unit_mismatches
+            return outcome
         for (period, codes), bucket in groups.items():
             if bucket["count"] == 0:
                 continue

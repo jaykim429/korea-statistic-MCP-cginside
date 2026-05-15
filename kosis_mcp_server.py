@@ -359,6 +359,10 @@ def _mcp_tool_output_contract(
         "missing_values": "Some returned rows have no numeric value; inspect missing_value_examples before quoting values.",
         "all_values_missing": "Rows were matched but every returned value is empty; report unavailable data instead of a numeric answer.",
         "unit_caller_resolution_required": "Resolve the computed unit from unit_transformation before quoting.",
+        "unit_mismatch": "Do not add or share values with different units until the caller explicitly converts them.",
+        "unit_conversion_required": "Convert units outside the MCP or re-query comparable rows before using this result.",
+        "negative_base_growth_rate": "Percent change used a negative base; prefer absolute change/yoy_diff for balances, losses, or deficits.",
+        "unsupported_source_system": "This tool cannot route the requested source; use the provider-specific raw query tool or pass input_rows to a source-agnostic tool.",
         "share_total_from_input_rows": "Disclose that the denominator was derived from input_rows, not an external total.",
         "share_total_grouped_by_period": "Interpret share results within each period group, not across all periods.",
         "convenience_response": "Use compact metadata/notes first; request verbose=True only for diagnostics.",
@@ -413,6 +417,9 @@ def _mcp_tool_output_contract(
         "partial_computation",
         "partial_fulfillment",
         "all_values_missing",
+        "unit_mismatch",
+        "unit_conversion_required",
+        "unsupported_source_system",
     } for marker in clean_markers)
     current_signals = {
         "has_failures": has_failures,
@@ -983,6 +990,94 @@ def _values_from_series(series: list[dict]) -> tuple[list[str], list[float]]:
             continue
     pairs.sort(key=lambda p: p[0])
     return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _numeric_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if not text or text in {"-", ".", "..", "...", "NA", "N/A"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _row_unit_generic(row: dict[str, Any]) -> Optional[str]:
+    if row.get("unit"):
+        return str(row.get("unit"))
+    dims = row.get("dimensions") if isinstance(row.get("dimensions"), dict) else {}
+    item = dims.get("ITEM") if isinstance(dims.get("ITEM"), dict) else {}
+    if item.get("unit"):
+        return str(item.get("unit"))
+    if row.get("UNIT_NM"):
+        return str(row.get("UNIT_NM"))
+    return None
+
+
+def _input_rows_series_materials(input_rows: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+    rows = input_rows if isinstance(input_rows, list) else []
+    pairs: list[tuple[str, float, dict[str, Any]]] = []
+    units: set[str] = set()
+    source_systems: set[str] = set()
+    table_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        period = str(row.get("period") or row.get("PRD_DE") or "")
+        raw_value = row.get("value") if "value" in row else row.get("DT")
+        value = _numeric_value(raw_value)
+        if not period or value is None:
+            continue
+        pairs.append((period, value, row))
+        if unit := _row_unit_generic(row):
+            units.add(unit)
+        for key in ("source_system", "provider"):
+            if row.get(key):
+                source_systems.add(str(row.get(key)))
+        for key in ("tbl_id", "table_id", "statbl_id"):
+            if row.get(key):
+                table_ids.add(str(row.get(key)))
+    pairs.sort(key=lambda item: item[0])
+    return {
+        "times": [period for period, _, _ in pairs],
+        "values": [value for _, value, _ in pairs],
+        "unit": sorted(units)[0] if len(units) == 1 else None,
+        "units": sorted(units),
+        "source_systems": sorted(source_systems),
+        "table_ids": sorted(table_ids),
+        "row_count": len(rows),
+        "numeric_row_count": len(pairs),
+    }
+
+
+def _resolve_tool_source_system(query: str, source_system: Optional[str] = None) -> Optional[str]:
+    explicit = str(source_system or "").strip().upper()
+    if explicit:
+        return explicit
+    return _detect_explicit_source_preference(query, {})
+
+
+def _unsupported_source_response(tool: str, query: str, source_system: Optional[str]) -> dict[str, Any]:
+    provider = source_system or _resolve_tool_source_system(query) or "unknown"
+    return {
+        "status": "unsupported",
+        "error": f"{tool} cannot fetch {provider} data from a natural-language query.",
+        "query": query,
+        "source_system": provider,
+        "recommended_flow": [
+            "Use search_nabo_tables/explore_nabo_table/query_nabo_table for NABO raw rows.",
+            "Pass those rows to compute_indicator or an input_rows-capable analysis/chart tool.",
+        ],
+        "mcp_output_contract": _mcp_tool_output_contract(
+            role="analysis_or_visualization",
+            final_answer_expected=False,
+            markers=["unsupported", "unsupported_source_system"],
+            explanation=f"{tool} will not silently fall back to KOSIS for {provider} requests.",
+            extra_signals={"tool": tool, "query": query, "source_system": provider},
+        ),
+    }
 
 
 def _analysis_input_materials(times: list[str], values: list[float]) -> dict[str, Any]:
@@ -3313,6 +3408,7 @@ async def quick_stat(
     query: str, region: str = "전국", period: str = "latest",
     api_key: Optional[str] = None,
     extra_params: Optional[dict[str, Any]] = None,
+    source_system: Optional[str] = None,
 ) -> dict:
     """[⚡] 자연어로 통계 단일값 즉시 조회.
 
@@ -3331,6 +3427,9 @@ async def quick_stat(
         예: {"industry": "제조업"}. 실제 슬라이싱에는 사용하지 않고,
         응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
     """
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return _unsupported_source_response("quick_stat", query, resolved_source)
     ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_stat_core(query, region, period, api_key)
     result = _attach_ignored_params(result, ignored_params, "quick_stat")
@@ -3574,6 +3673,7 @@ async def quick_trend(
     query: str, region: str = "전국", years: int = 10,
     api_key: Optional[str] = None,
     extra_params: Optional[dict[str, Any]] = None,
+    source_system: Optional[str] = None,
 ) -> dict:
     """[⚡] 시계열 데이터 조회 (분석/시각화 입력으로 사용).
 
@@ -3585,6 +3685,9 @@ async def quick_trend(
     extra_params는 quick_stat과 동일하게 실제 슬라이싱에 사용하지 않고
     응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
     """
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return _unsupported_source_response("quick_trend", query, resolved_source)
     ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_trend_core(query, region, years, api_key)
     return _attach_ignored_params(result, ignored_params, "quick_trend")
@@ -3849,6 +3952,8 @@ async def analyze_trend(
     api_key: Optional[str] = None,
     method: str = "linear",
     include_interpretation: bool = False,
+    input_rows: Optional[list[dict[str, Any]]] = None,
+    source_system: Optional[str] = None,
 ) -> dict:
     """[📊] 통계적 추세 재료와 재현 가능한 계산값을 반환.
 
@@ -3866,10 +3971,28 @@ async def analyze_trend(
             "method_requested": method,
             "valid_methods": valid_methods,
         }
-    series_result = await quick_trend(query, region, years, api_key)
+    if input_rows is not None:
+        row_materials = _input_rows_series_materials(input_rows)
+        times = row_materials["times"]
+        values = row_materials["values"]
+        series_result = {
+            "status": "executed",
+            "?듦퀎紐?": query,
+            "?⑥쐞": row_materials.get("unit"),
+            "source_systems": row_materials.get("source_systems"),
+            "table_ids": row_materials.get("table_ids"),
+        }
+    else:
+        resolved_source = _resolve_tool_source_system(query, source_system)
+        if resolved_source and resolved_source != "KOSIS":
+            return _unsupported_source_response("analyze_trend", query, resolved_source)
+        series_result = await quick_trend(query, region, years, api_key)
     if "오류" in series_result:
         return series_result
     times, values = _values_from_series(series_result.get("시계열", []))
+    if input_rows is not None:
+        times = row_materials["times"]
+        values = row_materials["values"]
     if len(values) < 3:
         return {"오류": "분석에 충분한 데이터 없음 (3개 미만)"}
 
@@ -3911,7 +4034,9 @@ async def analyze_trend(
             "available_methods": valid_methods,
             "interpretation_included": include_interpretation,
             "caller_can_recompute": True,
+            "input_rows_supported": True,
         },
+        "input_row_profile": row_materials if input_rows is not None else None,
         "선형회귀": {
             "기울기_연간": round(slope, 4), "R제곱": round(r2, 4),
             "p_value": round(p_value, 4), "유의": p_value < 0.05,
@@ -4427,8 +4552,38 @@ async def detect_outliers(
 async def chart_line(
     query: str, region: str = "전국", years: int = 10,
     api_key: Optional[str] = None,
+    source_system: Optional[str] = None,
+    input_rows: Optional[list[dict[str, Any]]] = None,
 ) -> list:
     """[🎨] 시계열 라인 차트 SVG (챗봇에 인라인 렌더링)."""
+    if input_rows is not None:
+        materials = _input_rows_series_materials(input_rows)
+        times = materials["times"]
+        values = materials["values"]
+        if not times:
+            return [TextContent(type="text", text=str({
+                "status": "invalid_input",
+                "error": "input_rows contained no numeric period/value pairs.",
+                "input_row_profile": materials,
+            }))]
+        svg = _chart_line_svg(
+            list(zip(times, values)),
+            title=f"{query} ({region})",
+            ylabel=materials.get("unit") or "",
+            source=" · ".join(materials.get("source_systems") or ["input_rows"]),
+            note=f"returned rows: {materials.get('numeric_row_count')}",
+        )
+        return [
+            _svg_to_image(svg),
+            TextContent(type="text", text=str({
+                "status": "executed",
+                "source": "input_rows",
+                "input_row_profile": materials,
+            })),
+        ]
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return [TextContent(type="text", text=str(_unsupported_source_response("chart_line", query, resolved_source)))]
     s = await quick_trend(query, region, years, api_key)
     if "오류" in s:
         return [TextContent(type="text", text=str(s))]
@@ -4452,12 +4607,16 @@ async def chart_line(
 async def chart_compare_regions(
     query: str, regions: list[str], period: str = "latest",
     api_key: Optional[str] = None,
+    source_system: Optional[str] = None,
 ) -> list:
     """[🎨] 지역별 막대 비교 차트.
 
     Args:
         regions: ["서울", "부산", "대구"] 같은 지역 리스트
     """
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return [TextContent(type="text", text=str(_unsupported_source_response("chart_compare_regions", query, resolved_source)))]
     items = []
     for r in regions:
         stat = await quick_stat(query, r, period, api_key)
@@ -4482,8 +4641,13 @@ async def chart_correlation(
     query_a: str, query_b: str,
     region: str = "전국", years: int = 15,
     api_key: Optional[str] = None,
+    source_system: Optional[str] = None,
+    input_rows: Optional[list[dict[str, Any]]] = None,
 ) -> list:
     """[🎨] 두 통계 산점도 + 회귀선."""
+    resolved_source = _resolve_tool_source_system(f"{query_a} {query_b}", source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return [TextContent(type="text", text=str(_unsupported_source_response("chart_correlation", f"{query_a} {query_b}", resolved_source)))]
     corr = await correlate_stats(query_a, query_b, region, years, api_key)
     if "오류" in corr:
         return [TextContent(type="text", text=str(corr))]
@@ -4513,6 +4677,7 @@ async def chart_heatmap(
     regions: Optional[list[str]] = None,
     years: int = 10,
     api_key: Optional[str] = None,
+    source_system: Optional[str] = None,
 ) -> list:
     """[🎨] 지역 × 시점 매트릭스 히트맵.
 
@@ -4523,6 +4688,9 @@ async def chart_heatmap(
         regions: 비교할 지역. None이면 17개 시도 전체.
         years: 최근 N년 (기본 10)
     """
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return [TextContent(type="text", text=str(_unsupported_source_response("chart_heatmap", query, resolved_source)))]
     param = _curation_lookup(query)
     if not param:
         return [TextContent(type="text", text=f'"{query}" Tier A 매핑 없음. chart_heatmap은 정밀 매핑된 통계만 지원.')]
@@ -4691,6 +4859,8 @@ async def chart_dual_axis(
 async def chart_dashboard(
     query: str, region: str = "전국",
     api_key: Optional[str] = None,
+    source_system: Optional[str] = None,
+    input_rows: Optional[list[dict[str, Any]]] = None,
 ) -> list:
     """[🎨] 4분할 종합 대시보드 한 장.
 
@@ -4701,6 +4871,11 @@ async def chart_dashboard(
         query: 통계 키워드
         region: 시계열의 기준 지역
     """
+    if input_rows is not None:
+        return await chart_line(query, region=region, api_key=api_key, source_system=source_system, input_rows=input_rows)
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return [TextContent(type="text", text=str(_unsupported_source_response("chart_dashboard", query, resolved_source)))]
     param = _curation_lookup(query)
     if not param:
         return [TextContent(type="text", text=f'"{query}" Tier A 매핑 없음')]
@@ -4801,11 +4976,15 @@ async def chart_dashboard(
 async def chain_full_analysis(
     query: str, region: str = "전국",
     api_key: Optional[str] = None,
+    source_system: Optional[str] = None,
 ) -> list:
     """[⛓] 종합 분석 재료 번들: 통계+추세+예측재료+이상치+차트.
 
     LLM이 필요한 부분만 골라 해석하도록 계산 재료를 묶어 반환한다.
     """
+    resolved_source = _resolve_tool_source_system(query, source_system)
+    if resolved_source and resolved_source != "KOSIS":
+        return [TextContent(type="text", text=str(_unsupported_source_response("chain_full_analysis", query, resolved_source)))]
     latest = await quick_stat(query, region, "latest", api_key)
     if "오류" in latest:
         return [TextContent(type="text", text=str(latest))]
