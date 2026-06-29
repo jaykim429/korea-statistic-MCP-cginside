@@ -12,6 +12,7 @@ import os
 from hmac import compare_digest
 from typing import Any
 
+from mcp.server.transport_security import TransportSecuritySettings
 from kosis_mcp_server import mcp
 
 
@@ -78,6 +79,9 @@ class OptionalBearerAuthMiddleware:
 
 
 def _build_app() -> Any:
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
     raw_app = mcp.streamable_http_app()
     return OptionalBearerAuthMiddleware(raw_app, os.environ.get("KOSIS_MCP_AUTH_TOKEN"))
 
