@@ -4030,6 +4030,8 @@ async def quick_trend(
     api_key: Optional[str] = None,
     extra_params: Optional[dict[str, Any]] = None,
     source_system: Optional[str] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> dict:
     """[⚡] 시계열 데이터 조회 (분석/시각화 입력으로 사용).
 
@@ -4037,6 +4039,8 @@ async def quick_trend(
         query: 통계 키워드
         region: 지역 (영문·풀네임 자동 정규화)
         years: 최근 N년 (기본 10)
+        start_year: 명시 조회 시작 연도. 지정 시 years보다 우선
+        end_year: 명시 조회 종료 연도. start_year와 함께 지정
 
     extra_params는 quick_stat과 동일하게 실제 슬라이싱에 사용하지 않고
     응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
@@ -4045,9 +4049,90 @@ async def quick_trend(
     if resolved_source and resolved_source != "KOSIS":
         return _unsupported_source_response("quick_trend", query, resolved_source)
     ignored_params = sorted((extra_params or {}).keys())
-    result = await _quick_trend_core(query, region, years, api_key)
+    result = await _quick_trend_core(
+        query=query,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
     result = _attach_ignored_params(result, ignored_params, "quick_trend")
     return _attach_shortcut_contract(result, tool="quick_trend", ignored_params=ignored_params)
+
+
+def _normalize_year_bound(value: Optional[Any], *, field: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    if value is None or value == "":
+        return None, None
+    text = str(value).strip()
+    if re.fullmatch(r"\d{4}", text):
+        return text, None
+    return None, {
+        "status": "invalid_input",
+        "오류": f"{field}는 4자리 연도여야 합니다.",
+        "field": field,
+        "value": value,
+        "expected_format": "YYYY",
+    }
+
+
+def _normalize_explicit_year_range(
+    start_year: Optional[Any],
+    end_year: Optional[Any],
+) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
+    start, error = _normalize_year_bound(start_year, field="start_year")
+    if error:
+        return None, None, error
+    end, error = _normalize_year_bound(end_year, field="end_year")
+    if error:
+        return None, None, error
+    if end and not start:
+        return None, None, {
+            "status": "invalid_input",
+            "오류": "end_year만 단독으로 지정할 수 없습니다. start_year를 함께 지정하세요.",
+            "field": "end_year",
+            "value": end_year,
+        }
+    if start and end and int(start) > int(end):
+        return None, None, {
+            "status": "invalid_input",
+            "오류": "start_year는 end_year보다 클 수 없습니다.",
+            "start_year": start,
+            "end_year": end,
+        }
+    return start, end, None
+
+
+def _explicit_period_metadata(
+    *,
+    start_year: Optional[str],
+    end_year: Optional[str],
+    start_period: Optional[str],
+    end_period: Optional[str],
+    times: list[str],
+) -> dict[str, Any]:
+    if not start_year:
+        return {}
+    available_period = [times[0], times[-1]] if times else None
+    missing_periods: list[str] = []
+    if not times:
+        missing_periods.append(f"{start_year}~{end_year or 'latest'} 전체 미수록")
+    else:
+        if start_period and times[0] > start_period:
+            missing_periods.append(f"{start_period} 이전 미수록")
+        if end_period and times[-1] < end_period:
+            missing_periods.append(f"{times[-1]} 이후~{end_period} 미수록")
+    return {
+        "requested_period": {
+            "start_year": start_year,
+            "end_year": end_year,
+            "start_period": start_period,
+            "end_period": end_period,
+        },
+        "available_period": available_period,
+        "period_selection_mode": "explicit_range",
+        "missing_periods": missing_periods,
+    }
 
 
 async def _quick_trend_core(
@@ -4056,6 +4141,9 @@ async def _quick_trend_core(
     start_year: Optional[str] = None,
     end_year: Optional[str] = None,
 ) -> dict:
+    normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return period_error
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
@@ -4079,9 +4167,9 @@ async def _quick_trend_core(
     period_type = _default_period_type(param)
     latest_count = _latest_count_for_years(years, period_type)
     start_period = end_period = None
-    if start_year:
-        start_period, _ = _period_bounds(start_year, period_type)
-        _, end_period = _period_bounds(end_year or str(datetime.now().year), period_type)
+    if normalized_start_year:
+        start_period, _ = _period_bounds(normalized_start_year, period_type)
+        _, end_period = _period_bounds(normalized_end_year or str(datetime.now().year), period_type)
 
     async with httpx.AsyncClient() as client:
         data = await _fetch_series(
@@ -4097,6 +4185,7 @@ async def _quick_trend_core(
 
     data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
     series = [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data]
+    times, _ = _values_from_series(series)
     used_period = str(series[-1]["시점"]) if series else ""
     age = NaturalLanguageAnswerEngine._period_age_years(used_period)
     result = {
@@ -4110,6 +4199,13 @@ async def _quick_trend_core(
         "요청_시점수": latest_count if not start_period else None,
     }
     if start_period:
+        result.update(_explicit_period_metadata(
+            start_year=normalized_start_year,
+            end_year=normalized_end_year,
+            start_period=start_period,
+            end_period=end_period,
+            times=times,
+        ))
         result["요청_시작시점"] = start_period
         result["요청_종료시점"] = end_period
     elif period_type in {"M", "Q"}:
@@ -4312,6 +4408,8 @@ async def analyze_trend(
     include_interpretation: bool = False,
     input_rows: Optional[list[dict[str, Any]]] = None,
     source_system: Optional[str] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> dict:
     """[📊] 통계적 추세 재료와 재현 가능한 계산값을 반환.
 
@@ -4320,6 +4418,9 @@ async def analyze_trend(
       - 선형회귀 계수, fitted_values, residuals, formula
       - 극값, 최근 변화
     """
+    _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return period_error
     method_requested = str(method or "linear").lower().strip()
     valid_methods = ["linear"]
     if method_requested not in valid_methods:
@@ -4344,7 +4445,14 @@ async def analyze_trend(
         resolved_source = _resolve_tool_source_system(query, source_system)
         if resolved_source and resolved_source != "KOSIS":
             return _unsupported_source_response("analyze_trend", query, resolved_source)
-        series_result = await quick_trend(query, region, years, api_key)
+        series_result = await quick_trend(
+            query=query,
+            region=region,
+            years=years,
+            api_key=api_key,
+            start_year=start_year,
+            end_year=end_year,
+        )
     if "오류" in series_result:
         return series_result
     times, values = _values_from_series(series_result.get("시계열", []))
@@ -4383,6 +4491,10 @@ async def analyze_trend(
         "method": method_requested,
         "통계명": series_result.get("통계명"), "지역": region,
         "기간": f"{times[0]} ~ {times[-1]}",
+        "requested_period": series_result.get("requested_period"),
+        "available_period": series_result.get("available_period"),
+        "period_selection_mode": series_result.get("period_selection_mode", "latest_n"),
+        "missing_periods": series_result.get("missing_periods", []),
         "데이터수": len(values),
         "must_know": _analysis_must_know(series_result, times, values),
         "input": _analysis_input_materials(times, values),
@@ -4430,9 +4542,10 @@ async def analyze_trend(
         "단위": series_result.get("단위"),
     }
     if include_interpretation:
+        period_label = f"{times[0]}~{times[-1]}" if start_year else f"{years}년간"
         result["추세_라벨"] = trend_label
         result["해석"] = (
-            f"{years}년간 {trend_label}. "
+            f"{period_label} {trend_label}. "
             f"평균 연 {avg_growth:+.2f}% 변화, "
             f"회귀 R²={r2:.2f} (p={p_value:.3f})."
         )
@@ -4446,12 +4559,33 @@ async def correlate_stats(
     api_key: Optional[str] = None,
     include_interpretation: bool = False,
     include_legacy_aliases: bool = False,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> dict:
     """[📊] 두 통계의 상관계수와 재현 가능한 정합 데이터를 반환."""
-    a = await quick_trend(query_a, region, years, api_key)
-    b = await quick_trend(query_b, region, years, api_key)
-    if "오류" in a or "오류" in b:
-        return {"오류": "데이터 수집 실패"}
+    _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return period_error
+    a = await quick_trend(
+        query=query_a,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
+    b = await quick_trend(
+        query=query_b,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
+    if "오류" in a:
+        return a
+    if "오류" in b:
+        return b
 
     ta, va = _values_from_series(a["시계열"])
     tb, vb = _values_from_series(b["시계열"])
@@ -4486,6 +4620,10 @@ async def correlate_stats(
         "통계_A": a.get("통계명"), "통계_B": b.get("통계명"),
         "지역": region, "공통_시점수": len(common),
         "기간": f"{common[0]} ~ {common[-1]}",
+        "requested_period": a.get("requested_period") or b.get("requested_period"),
+        "available_period": [common[0], common[-1]],
+        "period_selection_mode": a.get("period_selection_mode", "latest_n"),
+        "missing_periods": list(dict.fromkeys((a.get("missing_periods") or []) + (b.get("missing_periods") or []))),
         "must_know": {
             "source": "KOSIS",
             "period_range": [common[0], common[-1]],
@@ -4920,8 +5058,13 @@ async def chart_line(
     api_key: Optional[str] = None,
     source_system: Optional[str] = None,
     input_rows: Optional[list[dict[str, Any]]] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> list:
     """[🎨] 시계열 라인 차트 SVG (챗봇에 인라인 렌더링)."""
+    _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return [TextContent(type="text", text=str(period_error))]
     if input_rows is not None:
         materials = _input_rows_series_materials(input_rows)
         times = materials["times"]
@@ -4950,7 +5093,14 @@ async def chart_line(
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return [TextContent(type="text", text=str(_unsupported_source_response("chart_line", query, resolved_source)))]
-    s = await quick_trend(query, region, years, api_key)
+    s = await quick_trend(
+        query=query,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
     if "오류" in s:
         return [TextContent(type="text", text=str(s))]
     times, values = _values_from_series(s["시계열"])
@@ -4965,7 +5115,7 @@ async def chart_line(
     )
     return [
         _svg_to_image(svg),
-        TextContent(type="text", text=f"{s.get('통계명')} 시계열 — {region}, {len(times)}개 시점"),
+        TextContent(type="text", text=f"{s.get('통계명')} 시계열 — {region}, {times[0]}~{times[-1]}, {len(times)}개 시점"),
     ]
 
 
@@ -5009,12 +5159,25 @@ async def chart_correlation(
     api_key: Optional[str] = None,
     source_system: Optional[str] = None,
     input_rows: Optional[list[dict[str, Any]]] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> list:
     """[🎨] 두 통계 산점도 + 회귀선."""
+    _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return [TextContent(type="text", text=str(period_error))]
     resolved_source = _resolve_tool_source_system(f"{query_a} {query_b}", source_system)
     if resolved_source and resolved_source != "KOSIS":
         return [TextContent(type="text", text=str(_unsupported_source_response("chart_correlation", f"{query_a} {query_b}", resolved_source)))]
-    corr = await correlate_stats(query_a, query_b, region, years, api_key)
+    corr = await correlate_stats(
+        query_a=query_a,
+        query_b=query_b,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
     if "오류" in corr:
         return [TextContent(type="text", text=str(corr))]
     aligned = corr.get("정합데이터", [])
@@ -5051,6 +5214,8 @@ async def chart_heatmap(
     years: int = 10,
     api_key: Optional[str] = None,
     source_system: Optional[str] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> list:
     """[🎨] 지역 × 시점 매트릭스 히트맵.
 
@@ -5061,6 +5226,9 @@ async def chart_heatmap(
         regions: 비교할 지역. None이면 17개 시도 전체.
         years: 최근 N년 (기본 10)
     """
+    _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return [TextContent(type="text", text=str(period_error))]
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return [TextContent(type="text", text=str(_unsupported_source_response("chart_heatmap", query, resolved_source)))]
@@ -5078,7 +5246,14 @@ async def chart_heatmap(
     all_years: set[str] = set()
     region_data: dict[str, dict[str, float]] = {}
     for r in regions:
-        result = await quick_trend(query, r, years, api_key)
+        result = await quick_trend(
+            query=query,
+            region=r,
+            years=years,
+            api_key=api_key,
+            start_year=start_year,
+            end_year=end_year,
+        )
         if "오류" in result:
             continue
         times, values = _values_from_series(result.get("시계열", []))
@@ -5192,6 +5367,8 @@ async def chart_dual_axis(
     region: str = "전국",
     years: int = 10,
     api_key: Optional[str] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> list:
     """[🎨] 두 통계를 단위 다른 축으로 한 차트에 (이중 Y축).
 
@@ -5202,8 +5379,25 @@ async def chart_dual_axis(
         query_b: 오른쪽 축 통계 (빨간 점선)
         region: 같은 지역으로 정합
     """
-    a = await quick_trend(query_a, region, years, api_key)
-    b = await quick_trend(query_b, region, years, api_key)
+    _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
+    if period_error:
+        return [TextContent(type="text", text=str(period_error))]
+    a = await quick_trend(
+        query=query_a,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
+    b = await quick_trend(
+        query=query_b,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=start_year,
+        end_year=end_year,
+    )
     if "오류" in a or "오류" in b:
         return [TextContent(type="text", text=f"데이터 수집 실패: A={a.get('오류','OK')}, B={b.get('오류','OK')}")]
 

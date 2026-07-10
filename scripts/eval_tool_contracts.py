@@ -545,6 +545,149 @@ async def test_quick_tool_schemas_do_not_require_unsupported() -> None:
         assert "extra_params" in (schema.get("properties") or {}), schema
 
 
+async def test_explicit_period_schema_exposed_for_trend_and_charts() -> None:
+    tools = await kosis_mcp_server.mcp.list_tools()
+    by_name = {tool.name: tool.inputSchema for tool in tools}
+    for name in (
+        "quick_trend",
+        "analyze_trend",
+        "correlate_stats",
+        "chart_line",
+        "chart_correlation",
+        "chart_heatmap",
+        "chart_dual_axis",
+    ):
+        schema = by_name[name]
+        properties = schema.get("properties") or {}
+        assert "start_year" in properties, schema
+        assert "end_year" in properties, schema
+        assert "start_year" not in (schema.get("required") or []), schema
+        assert "end_year" not in (schema.get("required") or []), schema
+
+
+async def test_quick_trend_explicit_period_uses_bounds_not_latest_n() -> None:
+    original_fetch_series = kosis_mcp_server._fetch_series
+    calls: list[dict[str, Any]] = []
+
+    async def fake_fetch_series(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        calls.append(dict(kwargs))
+        return [
+            {"PRD_DE": "2021", "DT": "10"},
+            {"PRD_DE": "2022", "DT": "11"},
+            {"PRD_DE": "2023", "DT": "12"},
+        ]
+
+    try:
+        kosis_mcp_server._fetch_series = fake_fetch_series  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_trend(
+            "인구",
+            api_key="dummy",
+            years=3,
+            start_year="2021",
+            end_year="2025",
+        )
+    finally:
+        kosis_mcp_server._fetch_series = original_fetch_series  # type: ignore[assignment]
+
+    assert calls, result
+    call = calls[0]
+    assert call["start_year"] == "2021", call
+    assert call["end_year"] == "2025", call
+    assert call["latest_n"] is None, call
+    assert result["period_selection_mode"] == "explicit_range", result
+    assert result["requested_period"]["start_year"] == "2021", result
+    assert result["requested_period"]["end_year"] == "2025", result
+    assert result["available_period"] == ["2021", "2023"], result
+    assert result["missing_periods"], result
+
+
+async def test_quick_trend_recent_years_keeps_latest_n() -> None:
+    original_fetch_series = kosis_mcp_server._fetch_series
+    calls: list[dict[str, Any]] = []
+
+    async def fake_fetch_series(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        calls.append(dict(kwargs))
+        return [{"PRD_DE": "2024", "DT": "1"}]
+
+    try:
+        kosis_mcp_server._fetch_series = fake_fetch_series  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_trend("인구", api_key="dummy", years=5)
+    finally:
+        kosis_mcp_server._fetch_series = original_fetch_series  # type: ignore[assignment]
+
+    assert calls, result
+    call = calls[0]
+    assert call["start_year"] is None, call
+    assert call["end_year"] is None, call
+    assert call["latest_n"] == 5, call
+    assert "period_selection_mode" not in result, result
+
+
+async def test_quick_trend_rejects_invalid_explicit_period_before_fetch() -> None:
+    original_fetch_series = kosis_mcp_server._fetch_series
+    calls: list[dict[str, Any]] = []
+
+    async def fake_fetch_series(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        calls.append(dict(kwargs))
+        return []
+
+    try:
+        kosis_mcp_server._fetch_series = fake_fetch_series  # type: ignore[assignment]
+        result = await kosis_mcp_server.quick_trend(
+            "인구",
+            api_key="dummy",
+            start_year="2025",
+            end_year="2021",
+        )
+    finally:
+        kosis_mcp_server._fetch_series = original_fetch_series  # type: ignore[assignment]
+
+    assert result["status"] == "invalid_input", result
+    assert not calls, calls
+
+
+async def test_chart_and_analysis_forward_explicit_period_to_quick_trend() -> None:
+    original_quick_trend = kosis_mcp_server.quick_trend
+    calls: list[dict[str, Any]] = []
+
+    async def fake_quick_trend(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, "kwargs": dict(kwargs)})
+        query = kwargs.get("query") or (args[0] if args else "fake")
+        return {
+            "통계명": str(query),
+            "지역": kwargs.get("region", "전국"),
+            "단위": "명",
+            "통계표": "fake table",
+            "시계열": [
+                {"시점": "2018", "값": "10"},
+                {"시점": "2019", "값": "11"},
+                {"시점": "2020", "값": "12"},
+                {"시점": "2021", "값": "13"},
+            ],
+            "requested_period": {"start_year": "2018", "end_year": "2021"},
+            "available_period": ["2018", "2021"],
+            "period_selection_mode": "explicit_range",
+            "missing_periods": [],
+        }
+
+    try:
+        kosis_mcp_server.quick_trend = fake_quick_trend  # type: ignore[assignment]
+        await kosis_mcp_server.analyze_trend("a", api_key="dummy", start_year="2018", end_year="2021")
+        await kosis_mcp_server.correlate_stats("a", "b", api_key="dummy", start_year="2018", end_year="2021")
+        await kosis_mcp_server.chart_line("a", api_key="dummy", start_year="2018", end_year="2021")
+        await kosis_mcp_server.chart_correlation("a", "b", api_key="dummy", start_year="2018", end_year="2021")
+        await kosis_mcp_server.chart_heatmap("실업률", regions=["전국"], api_key="dummy", start_year="2018", end_year="2021")
+        await kosis_mcp_server.chart_dual_axis("a", "b", api_key="dummy", start_year="2018", end_year="2021")
+    finally:
+        kosis_mcp_server.quick_trend = original_quick_trend  # type: ignore[assignment]
+
+    assert calls, calls
+    for call in calls:
+        kwargs = call["kwargs"]
+        assert kwargs["start_year"] == "2018", call
+        assert kwargs["end_year"] == "2021", call
+
+
 async def test_missing_api_key_returns_structured_payload() -> None:
     import kosis_analysis.client as client_mod
 
@@ -2818,6 +2961,11 @@ async def main() -> None:
         ("compute_indicator_in_planner", lambda: test_compute_indicator_in_planner_available_tools()),
         ("search_query_preserved", lambda: test_search_kosis_preserves_original_query()),
         ("quick_schema_no_unsupported", lambda: test_quick_tool_schemas_do_not_require_unsupported()),
+        ("explicit_period_schema_exposed", lambda: test_explicit_period_schema_exposed_for_trend_and_charts()),
+        ("quick_trend_explicit_period_bounds", lambda: test_quick_trend_explicit_period_uses_bounds_not_latest_n()),
+        ("quick_trend_recent_years_latest_n", lambda: test_quick_trend_recent_years_keeps_latest_n()),
+        ("quick_trend_invalid_explicit_period", lambda: test_quick_trend_rejects_invalid_explicit_period_before_fetch()),
+        ("chart_analysis_explicit_period_forwarding", lambda: test_chart_and_analysis_forward_explicit_period_to_quick_trend()),
         ("missing_key_structured", lambda: test_missing_api_key_returns_structured_payload()),
         ("variable_compatibility", lambda: test_check_variable_compatibility_reports_common_period_and_units()),
         ("variable_compatibility_tier_a_miss_candidates", lambda: test_check_variable_compatibility_surfaces_tier_a_miss_candidates()),
