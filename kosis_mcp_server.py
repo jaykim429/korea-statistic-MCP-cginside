@@ -316,6 +316,9 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "source": payload.get("source") or payload.get("출처"),
         "table_id": payload.get("table_id") or payload.get("tbl_id") or payload.get("통계표ID"),
         "period_age_years": payload.get("period_age_years"),
+        "requested_period": payload.get("requested_period"),
+        "available_period": payload.get("available_period"),
+        "period_selection_mode": payload.get("period_selection_mode"),
     }
     metadata = {k: v for k, v in metadata_keys.items() if v not in (None, "", [], {})}
 
@@ -366,6 +369,9 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "region": metadata.get("region"),
         "used_period": payload.get("used_period") or metadata.get("period"),
         "period_age_years": metadata.get("period_age_years"),
+        "requested_period": payload.get("requested_period"),
+        "available_period": payload.get("available_period"),
+        "period_selection_mode": payload.get("period_selection_mode"),
         "data": data,
         "comparison": payload.get("comparison") or payload.get("비교"),
         "calculation": payload.get("calculation") or payload.get("계산"),
@@ -2600,15 +2606,23 @@ class NaturalLanguageAnswerEngine:
         region: str,
         direct_key: Optional[str] = None,
         route_payload: Optional[dict[str, Any]] = None,
+        start_year: Optional[str] = None,
+        end_year: Optional[str] = None,
     ) -> dict[str, Any]:
         route_payload = route_payload or self._route_payload(query)
         direct_key = direct_key or self._infer_direct_stat_key(query, route_payload) or query
         route_payload["route"]["direct_stat_key"] = direct_key
         q = self._norm(query)
+        explicit_start_year = start_year
+        explicit_end_year = end_year
+        query_start_year, query_end_year = _extract_year_range(query)
+        if query_start_year and query_end_year:
+            explicit_start_year = explicit_start_year or query_start_year
+            explicit_end_year = explicit_end_year or query_end_year
 
         if self._is_growth_question(query, route_payload):
             period_count = self._growth_period_count(query)
-            start_p, end_p = _extract_year_range(query)
+            start_p, end_p = explicit_start_year, explicit_end_year
             if start_p and end_p:
                 span = max(int(end_p) - int(start_p) + 1, period_count)
             else:
@@ -2644,6 +2658,66 @@ class NaturalLanguageAnswerEngine:
                 "route": route_payload["route"],
                 "출처": comparison.get("출처", "통계청 KOSIS"),
             }
+
+        if explicit_start_year or explicit_end_year:
+            normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(
+                explicit_start_year,
+                explicit_end_year,
+            )
+            if period_error:
+                return {
+                    "상태": "failed",
+                    "코드": STATUS_INVALID_PERIOD_RANGE,
+                    "답변유형": "tier_a_trend_failed",
+                    "질문": query,
+                    "answer": "요청한 기간 형식을 해석할 수 없습니다.",
+                    "상세": period_error,
+                    "지역": region,
+                    "검증_주의": self._validation_notes(route_payload),
+                    "route": route_payload["route"],
+                    "출처": "통계청 KOSIS",
+                }
+            span_end_year = normalized_end_year or str(datetime.now().year)
+            trend = await _quick_trend_core(
+                direct_key,
+                region,
+                max(int(span_end_year) - int(normalized_start_year) + 1, 1),
+                self.api_key,
+                start_year=normalized_start_year,
+                end_year=normalized_end_year,
+            )
+            if "오류" in trend:
+                return await self._answer_search_fallback(query, route_payload)
+            rows = trend.get("시계열", [])
+            used_period = trend.get("used_period")
+            if not used_period and rows and isinstance(rows[-1], dict):
+                used_period = rows[-1].get("시점")
+            result: dict[str, Any] = {
+                "상태": "executed",
+                "코드": STATUS_EXECUTED,
+                "답변유형": "tier_a_trend",
+                "질문": query,
+                "answer": (
+                    f"{region}의 {trend.get('통계명', direct_key)} "
+                    f"{normalized_start_year}년부터 {normalized_end_year or '최신'}까지 "
+                    f"{len(rows)}개 시점 자료를 조회했습니다."
+                ),
+                "표": rows,
+                "단위": trend.get("단위"),
+                "지역": region,
+                "데이터수": len(rows),
+                "통계표": trend.get("통계표"),
+                "used_period": used_period,
+                "requested_period": trend.get("requested_period"),
+                "available_period": trend.get("available_period"),
+                "period_selection_mode": trend.get("period_selection_mode"),
+                "missing_periods": trend.get("missing_periods"),
+                "추천_시각화": ["line_chart"],
+                "검증_주의": self._validation_notes(route_payload),
+                "route": route_payload["route"],
+                "출처": "통계청 KOSIS",
+            }
+            return result
 
         if any(term in q for term in ("추이", "최근", "시계열", "그래프", "선그래프", "분석")):
             years_match = re.search(r"최근\s*(\d+)\s*년", query)
@@ -3302,9 +3376,21 @@ class NaturalLanguageAnswerEngine:
             )
         return hints
 
-    async def answer(self, query: str, region: str = "전국") -> dict[str, Any]:
+    async def answer(
+        self,
+        query: str,
+        region: str = "전국",
+        start_year: Optional[str] = None,
+        end_year: Optional[str] = None,
+    ) -> dict[str, Any]:
         route_payload = self._route_payload(query)
-        result = await self._dispatch(query, region, precomputed_route=route_payload)
+        result = await self._dispatch(
+            query,
+            region,
+            precomputed_route=route_payload,
+            start_year=start_year,
+            end_year=end_year,
+        )
         return self._finalize_response(result, query=query, route_payload=route_payload)
 
     async def _dispatch(
@@ -3312,16 +3398,26 @@ class NaturalLanguageAnswerEngine:
         query: str,
         region: str,
         precomputed_route: Optional[dict[str, Any]] = None,
+        start_year: Optional[str] = None,
+        end_year: Optional[str] = None,
     ) -> dict[str, Any]:
         route_payload = precomputed_route or self._route_payload(query)
         plan = AnswerPlanner(self).build(query, region, route_payload)
-        return await self._execute_plan(query, route_payload, plan)
+        return await self._execute_plan(
+            query,
+            route_payload,
+            plan,
+            start_year=start_year,
+            end_year=end_year,
+        )
 
     async def _execute_plan(
         self,
         query: str,
         route_payload: dict[str, Any],
         plan: AnswerPlan,
+        start_year: Optional[str] = None,
+        end_year: Optional[str] = None,
     ) -> dict[str, Any]:
         params = plan.params
         direct_key = plan.direct_key
@@ -3367,7 +3463,14 @@ class NaturalLanguageAnswerEngine:
         if plan.action == "direct" and direct_key:
             if not route_payload["route"].get("direct_stat_key"):
                 route_payload["route"]["direct_stat_key"] = direct_key
-            return await self._answer_direct(query, plan.region, direct_key, route_payload)
+            return await self._answer_direct(
+                query,
+                plan.region,
+                direct_key,
+                route_payload,
+                start_year=start_year,
+                end_year=end_year,
+            )
         return await self._answer_search_fallback(query, route_payload)
 
     @staticmethod
@@ -5665,11 +5768,14 @@ async def answer_query(
     region: str = "전국",
     api_key: Optional[str] = None,
     verbose: bool = False,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> dict:
     """[🤖] 자연어 질문을 실제 답변 또는 안전한 분석계획으로 생성.
 
     검증된 Tier A 질문은 KOSIS API를 호출해 수치·표·계산 재료를 반환하고,
     복합/상위어 질문은 실제 KOSIS 검색 후보와 분석계획을 반환한다.
+    start_year/end_year가 있으면 최신 단일값 shortcut 대신 명시 기간 시계열을 반환한다.
     verbose=False를 지정하면 data/metadata/notes 중심의 슬림 응답을 반환한다.
     """
     try:
@@ -5683,7 +5789,10 @@ async def answer_query(
         raise
     engine = NaturalLanguageAnswerEngine(key)
     try:
-        result = await asyncio.wait_for(engine.answer(query, region), timeout=ANSWER_QUERY_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(
+            engine.answer(query, region, start_year=start_year, end_year=end_year),
+            timeout=ANSWER_QUERY_TIMEOUT_SECONDS,
+        )
         result = _attach_gemma_deprecation_warning(result)
         return result if verbose else _compact_answer_query_response(result, query=query, region=region)
     except asyncio.TimeoutError:

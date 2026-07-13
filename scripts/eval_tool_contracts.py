@@ -1246,6 +1246,53 @@ def test_answer_query_compact_response_hides_control_contract() -> None:
     assert "llm_guardrails" not in compact, compact
 
 
+async def test_answer_query_explicit_period_uses_trend_not_latest_value() -> None:
+    original_quick_trend_core = kosis_mcp_server._quick_trend_core
+    original_resolve_key = kosis_mcp_server._resolve_key
+    calls: list[dict[str, Any]] = []
+
+    async def fake_quick_trend_core(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, "kwargs": kwargs})
+        return {
+            "통계명": "실업률",
+            "지역": "전국",
+            "단위": "%",
+            "시계열": [
+                {"시점": "2010", "값": "3.7"},
+                {"시점": "2011", "값": "3.4"},
+                {"시점": "2012", "값": "3.2"},
+                {"시점": "2013", "값": "3.1"},
+                {"시점": "2014", "값": "3.5"},
+            ],
+            "통계표": "경제활동인구조사",
+            "requested_period": {"start_year": "2010", "end_year": "2014"},
+            "available_period": ["2010", "2014"],
+            "period_selection_mode": "explicit_range",
+        }
+
+    try:
+        kosis_mcp_server._resolve_key = lambda api_key=None: "dummy"  # type: ignore[assignment]
+        kosis_mcp_server._quick_trend_core = fake_quick_trend_core  # type: ignore[assignment]
+        result = await kosis_mcp_server.answer_query(
+            "실업률 알려줘",
+            start_year="2010",
+            end_year="2014",
+            api_key="dummy",
+        )
+    finally:
+        kosis_mcp_server._quick_trend_core = original_quick_trend_core  # type: ignore[assignment]
+        kosis_mcp_server._resolve_key = original_resolve_key  # type: ignore[assignment]
+
+    assert calls, result
+    assert calls[0]["kwargs"]["start_year"] == "2010", calls
+    assert calls[0]["kwargs"]["end_year"] == "2014", calls
+    assert result["answer_type"] == "tier_a_trend", result
+    assert result["used_period"] == "2014", result
+    assert result["requested_period"]["start_year"] == "2010", result
+    assert result["period_selection_mode"] == "explicit_range", result
+    assert result["data"][0]["시점"] == "2010", result
+
+
 def test_marker_guidance_in_contract() -> None:
     contract = kosis_mcp_server._mcp_tool_output_contract(
         role="test",
@@ -2987,6 +3034,7 @@ async def main() -> None:
         ("resolve_empty_contract", lambda: test_resolve_concepts_empty_list_has_contract()),
         ("answer_query_convenience_contract", lambda: test_answer_query_convenience_contract()),
         ("answer_query_compact_response", lambda: test_answer_query_compact_response_hides_control_contract()),
+        ("answer_query_explicit_period_trend", lambda: test_answer_query_explicit_period_uses_trend_not_latest_value()),
         ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
         ("output_contract_compact_default", lambda: test_output_contract_compact_by_default()),
         ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),
