@@ -7,6 +7,45 @@ from typing import Any, Optional
 STATUS_INVALID_PERIOD_RANGE = "INVALID_PERIOD_RANGE"
 STATUS_PERIOD_NOT_FOUND = "PERIOD_NOT_FOUND"
 
+LATEST_AVAILABLE = "latest_available"
+LATEST_ANNUAL = "latest_annual"
+LATEST_MONTHLY = "latest_monthly"
+LATEST_QUARTERLY = "latest_quarterly"
+LATEST_OBSERVED = "latest_observed"
+
+_LATEST_PERIOD_POLICIES = {
+    "": LATEST_AVAILABLE,
+    "latest": LATEST_AVAILABLE,
+    "latestavailable": LATEST_AVAILABLE,
+    "latest_available": LATEST_AVAILABLE,
+    "최근": LATEST_AVAILABLE,
+    "최신": LATEST_AVAILABLE,
+    "가장최근": LATEST_AVAILABLE,
+    "제일최근": LATEST_AVAILABLE,
+    "최근값": LATEST_AVAILABLE,
+    "최신값": LATEST_AVAILABLE,
+    "최신치": LATEST_AVAILABLE,
+    "최근시점": LATEST_AVAILABLE,
+    "최신시점": LATEST_AVAILABLE,
+    "현재": LATEST_AVAILABLE,
+    "latestannual": LATEST_ANNUAL,
+    "latest_annual": LATEST_ANNUAL,
+    "latestyearly": LATEST_ANNUAL,
+    "latest_yearly": LATEST_ANNUAL,
+    "latestmonthly": LATEST_MONTHLY,
+    "latest_monthly": LATEST_MONTHLY,
+    "latestquarterly": LATEST_QUARTERLY,
+    "latest_quarterly": LATEST_QUARTERLY,
+    "latestobserved": LATEST_OBSERVED,
+    "latest_observed": LATEST_OBSERVED,
+}
+
+_LATEST_POLICY_CADENCE = {
+    LATEST_ANNUAL: "Y",
+    LATEST_MONTHLY: "M",
+    LATEST_QUARTERLY: "Q",
+}
+
 # KOSIS PRD meta returns one row per cadence; pick the finest one so
 # staleness checks reflect the most granular data available.
 # Korean: 월 > 분기 > 반기 > 년 / English aliases: M Q H Y.
@@ -100,21 +139,87 @@ def _parse_year_token(text: str) -> Optional[str]:
 def _is_latest_period_text(text: Any) -> bool:
     if text is None:
         return True
-    compact = re.sub(r"\s+", "", str(text)).lower()
-    return compact in {
-        "",
-        "latest",
-        "최근",
-        "최신",
-        "가장최근",
-        "제일최근",
-        "최근값",
-        "최신값",
-        "최신치",
-        "최근시점",
-        "최신시점",
-        "현재",
+    return _latest_period_policy(text) in {
+        LATEST_AVAILABLE,
+        LATEST_ANNUAL,
+        LATEST_MONTHLY,
+        LATEST_QUARTERLY,
     }
+
+
+def _latest_period_policy(text: Any) -> Optional[str]:
+    """Return the explicit latest-selection policy, if ``text`` names one."""
+    if text is None:
+        return LATEST_AVAILABLE
+    compact = re.sub(r"\s+", "", str(text)).lower()
+    return _LATEST_PERIOD_POLICIES.get(compact)
+
+
+def _latest_policy_period_types(
+    supported_periods: tuple[str, ...] | list[str],
+    policy: str,
+) -> tuple[str, ...]:
+    """Resolve a latest policy to normalized KOSIS cadences.
+
+    ``latest_available`` deliberately keeps every supported cadence.  The
+    caller must fetch one latest row per cadence and compare their actual end
+    points; tuple order is not a freshness signal.
+    """
+    normalized = tuple(
+        cadence
+        for cadence in (_api_period_type(value) for value in supported_periods)
+        if cadence
+    ) or ("Y",)
+    normalized = tuple(dict.fromkeys(normalized))
+    if policy == LATEST_AVAILABLE:
+        return normalized
+    requested = _LATEST_POLICY_CADENCE.get(policy)
+    if not requested or requested not in normalized:
+        return ()
+    return (requested,)
+
+
+def _period_end_sort_key(period: Any, period_type: Optional[str]) -> tuple[int, int, int, int, str]:
+    """Map a KOSIS period code to a comparable calendar end point.
+
+    Annual ``2025`` ends after monthly ``2025.11`` but ties monthly ``2025.12``.
+    On a tie, the finer cadence wins so the selected policy remains explicit.
+    Unknown formats sort deterministically behind parseable values.
+    """
+    text = re.sub(r"[^0-9]", "", str(period or ""))
+    cadence = _api_period_type(period_type)
+    if len(text) < 4:
+        return (0, 0, 0, 0, text)
+    year = int(text[:4])
+    month = 12
+    day = 31
+    if cadence == "M" and len(text) >= 6:
+        month = min(12, max(1, int(text[4:6])))
+        day = 31
+    elif cadence == "Q" and len(text) >= 5:
+        quarter = min(4, max(1, int(text[4:5])))
+        month = quarter * 3
+        day = 31
+    elif cadence == "H" and len(text) >= 5:
+        half = min(2, max(1, int(text[4:5])))
+        month = half * 6
+        day = 31
+    fineness = {"Y": 0, "H": 1, "Q": 2, "M": 3}.get(cadence or "", -1)
+    return (year, month, day, fineness, text)
+
+
+def _select_latest_period_candidate(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Pick the candidate whose actual period endpoint is latest."""
+    usable = [candidate for candidate in candidates if candidate.get("row")]
+    if not usable:
+        return None
+    return max(
+        usable,
+        key=lambda candidate: _period_end_sort_key(
+            candidate["row"].get("PRD_DE") or candidate["row"].get("prdDe"),
+            candidate.get("period_type"),
+        ),
+    )
 
 
 def _relative_year(compact_text: str) -> Optional[int]:

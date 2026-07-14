@@ -67,6 +67,11 @@ from kosis_analysis.metadata import (
     _validate_query_table_filters,
 )
 from kosis_analysis.periods import (
+    LATEST_AVAILABLE,
+    LATEST_ANNUAL,
+    LATEST_MONTHLY,
+    LATEST_OBSERVED,
+    LATEST_QUARTERLY,
     _api_period_de,
     _api_period_type,
     _current_quarter,
@@ -77,6 +82,8 @@ from kosis_analysis.periods import (
     _format_period_label,
     _is_latest_period_text,
     _is_yearly_period_type,
+    _latest_period_policy,
+    _latest_policy_period_types,
     _latest_count_for_years,
     _normalize_period_bound,
     _parse_month_token,
@@ -88,6 +95,7 @@ from kosis_analysis.periods import (
     _periods_per_year,
     _pick_finest_period,
     _pick_query_table_period_row,
+    _select_latest_period_candidate,
     _query_table_data_nature,
     _relative_year,
     _validate_query_period_range,
@@ -1044,6 +1052,183 @@ def _resolve_classification_term(
     return matches[0][1]
 
 
+def _region_label_key(value: Any) -> str:
+    label = re.sub(r"[\s()]+", "", str(value or "")).lower()
+    return re.sub(r"(?:특별자치도|특별자치시|특별시|광역시|자치시|자치구|도|시|군|구)$", "", label)
+
+
+class RegionResolutionUnavailable(RuntimeError):
+    """The table metadata could not be checked, so support is unknown."""
+
+
+def _region_failure_response(
+    *,
+    code: str,
+    region: str,
+    param: QuickStatParam,
+    message: str,
+    detail: Optional[str] = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "상태": "failed",
+        "코드": code,
+        "오류": message,
+        "요청_지역": region,
+        "지원_지역": list(param.region_scheme.keys()) if param.region_scheme else ["전국"],
+        "통계표": param.tbl_nm,
+    }
+    if detail:
+        result["상세"] = detail
+    return result
+
+
+def _region_failure_answer(
+    result: dict[str, Any],
+    query: str,
+    route_payload: dict[str, Any],
+    answer_type: str,
+) -> Optional[dict[str, Any]]:
+    if result.get("코드") not in {"REGION_UNSUPPORTED", "REGION_LOOKUP_UNAVAILABLE"}:
+        return None
+    return {
+        **result,
+        "답변유형": answer_type,
+        "질문": query,
+        "answer": result.get("오류"),
+        "route": route_payload.get("route", {}),
+        "출처": "통계청 KOSIS",
+    }
+
+
+def _deprecated_mapping_response(query: str, param: QuickStatParam) -> Optional[dict[str, Any]]:
+    if param.replacement_status != "deprecated":
+        return None
+    return {
+        "상태": "failed",
+        "코드": "TABLE_MAPPING_DEPRECATED",
+        "오류": f'"{query}"의 현재 통계표 매핑은 최신값 조회에 사용할 수 없습니다.',
+        "기관ID": param.org_id,
+        "통계표ID": param.tbl_id,
+        "통계표": param.tbl_nm,
+        "교체상태": param.replacement_status,
+        "마지막검증일": param.verified_at,
+        "사유": param.note,
+        "권고": "search_kosis → explore_table로 현행 후보의 항목·단위·지역축·주기를 확인한 뒤 카탈로그를 교체하세요.",
+    }
+
+
+def _topic_stat_status(name: str) -> str:
+    param = _curation_lookup(name)
+    if not param:
+        return "미검증"
+    return "교체필요" if param.replacement_status == "deprecated" else "확정"
+
+
+async def _resolve_region_dynamically(
+    org_id: str,
+    tbl_id: str,
+    region: str,
+    api_key: Optional[str] = None,
+    *,
+    region_obj: str = "obj_l1",
+    region_code_hint: Optional[str] = None,
+) -> Optional[str]:
+    """Return a municipality code only when table metadata proves the match."""
+    try:
+        classifications = await _fetch_classifications(org_id, tbl_id, api_key)
+    except Exception as exc:
+        # HTTPStatusError may contain the full request URL including apiKey.
+        # Never expose exception text to an MCP response.
+        raise RegionResolutionUnavailable(type(exc).__name__) from exc
+
+    region_rows = [
+        row for row in classifications
+        if any(token in str(row.get("OBJ_NM") or "") for token in ("지역", "시도", "시군구", "행정구역"))
+    ]
+    region_axis_ids = list(dict.fromkeys(
+        str(row.get("OBJ_ID"))
+        for row in region_rows
+        if row.get("OBJ_ID") not in (None, "")
+    ))
+    if len(region_axis_ids) == 1:
+        target_axis_id = region_axis_ids[0]
+    elif region_code_hint:
+        matching_axes = {
+            str(row.get("OBJ_ID"))
+            for row in region_rows
+            if str(row.get("ITM_ID") or "") == str(region_code_hint)
+        }
+        if len(matching_axes) != 1:
+            return None
+        target_axis_id = next(iter(matching_axes))
+    else:
+        return None
+
+    axis_rows = [
+        row for row in region_rows
+        if str(row.get("OBJ_ID") or "") == target_axis_id
+    ]
+    if not axis_rows:
+        return None
+
+    compact = re.sub(r"[\s()]+", "", str(region or ""))
+    province: Optional[str] = None
+    locality = compact
+    if compact.startswith("경기도"):
+        province, locality = "경기", compact[3:]
+    elif compact.startswith("경기"):
+        province, locality = "경기", compact[2:]
+    elif compact.endswith("경기도"):
+        province, locality = "경기", compact[:-3]
+    elif compact.endswith("경기"):
+        province, locality = "경기", compact[:-2]
+
+    target_key = _region_label_key(locality)
+    province_key = _region_label_key(province) if province else None
+
+    def locality_key(row: dict[str, Any]) -> str:
+        raw_label = re.sub(r"[\s()]+", "", str(row.get("ITM_NM") or "")).lower()
+        # Some KOSIS tables use a combined label such as "경기도 광주시"
+        # instead of an UP_ITM_ID hierarchy.
+        for prefix in ("경기도", "경기"):
+            if raw_label.startswith(prefix) and len(raw_label) > len(prefix):
+                raw_label = raw_label[len(prefix):]
+                break
+        return _region_label_key(raw_label)
+
+    candidates = [row for row in axis_rows if locality_key(row) == target_key]
+    if not candidates:
+        return None
+
+    if province:
+        rows_by_id = {
+            str(row.get("ITM_ID")): row
+            for row in axis_rows
+            if row.get("ITM_ID") not in (None, "")
+        }
+
+        def belongs_to_province(row: dict[str, Any]) -> bool:
+            combined_label = re.sub(r"[\s()]+", "", str(row.get("ITM_NM") or "")).lower()
+            if province_key and combined_label.startswith(("경기도", province_key)) and locality_key(row) == target_key:
+                return True
+            parent_id = str(row.get("UP_ITM_ID") or "")
+            visited: set[str] = set()
+            while parent_id and parent_id not in visited:
+                visited.add(parent_id)
+                parent = rows_by_id.get(parent_id)
+                if not parent:
+                    return False
+                if _region_label_key(parent.get("ITM_NM")) == province_key:
+                    return True
+                parent_id = str(parent.get("UP_ITM_ID") or "")
+            return False
+
+        candidates = [row for row in candidates if belongs_to_province(row)]
+
+    ids = [str(row.get("ITM_ID") or "") for row in candidates if row.get("ITM_ID")]
+    return ids[0] if len(set(ids)) == 1 else None
+
+
 def _kosis_view_url(org_id: str, tbl_id: str) -> str:
     return f"https://kosis.kr/statHtml/statHtml.do?orgId={org_id}&tblId={tbl_id}"
 
@@ -1151,6 +1336,55 @@ async def _fetch_series(
         return aggregated
 
     return await _kosis_call(client, "Param/statisticsParameterData.do", p)
+
+
+async def _fetch_latest_by_policy(
+    client: httpx.AsyncClient,
+    key: str,
+    param: QuickStatParam,
+    region_code: Optional[str],
+    policy: str,
+) -> tuple[list[dict], str, tuple[str, ...]]:
+    """Fetch the latest row for every policy cadence and select by endpoint."""
+    supported = tuple(getattr(param, "supported_periods", ()) or ("Y",))
+    period_types = _latest_policy_period_types(supported, policy)
+    if not period_types:
+        requested_label = {
+            LATEST_ANNUAL: "연간(Y)",
+            LATEST_MONTHLY: "월간(M)",
+            LATEST_QUARTERLY: "분기(Q)",
+        }.get(policy, policy)
+        supported_label = ", ".join(supported)
+        raise ValueError(
+            f"요청한 최신값 주기 {requested_label}를 이 통계표가 지원하지 않습니다. "
+            f"지원 주기: {supported_label}"
+        )
+
+    fetched = await asyncio.gather(*(
+        _fetch_series(
+            client,
+            key,
+            param,
+            region_code,
+            period_type=period_type,
+            latest_n=1,
+        )
+        for period_type in period_types
+    ))
+    candidates: list[dict[str, Any]] = []
+    for period_type, rows in zip(period_types, fetched):
+        if not rows:
+            continue
+        rows.sort(key=lambda row: str(row.get("PRD_DE") or row.get("prdDe") or ""))
+        candidates.append({
+            "period_type": period_type,
+            "row": rows[-1],
+            "rows": rows,
+        })
+    selected = _select_latest_period_candidate(candidates)
+    if not selected:
+        return [], period_types[0], period_types
+    return selected["rows"], selected["period_type"], period_types
 
 
 def _values_from_series(series: list[dict]) -> tuple[list[str], list[float]]:
@@ -2687,6 +2921,11 @@ class NaturalLanguageAnswerEngine:
                 end_year=normalized_end_year,
             )
             if "오류" in trend:
+                region_failure = _region_failure_answer(
+                    trend, query, route_payload, "tier_a_region_failed",
+                )
+                if region_failure:
+                    return region_failure
                 return await self._answer_search_fallback(query, route_payload)
             rows = trend.get("시계열", [])
             used_period = trend.get("used_period")
@@ -2731,6 +2970,11 @@ class NaturalLanguageAnswerEngine:
                 start_year=open_start_year,
             )
             if "오류" in trend:
+                region_failure = _region_failure_answer(
+                    trend, query, route_payload, "tier_a_region_failed",
+                )
+                if region_failure:
+                    return region_failure
                 return await self._answer_search_fallback(query, route_payload)
             if open_start_year:
                 answer = (
@@ -2799,6 +3043,11 @@ class NaturalLanguageAnswerEngine:
         period = self._period_argument(query, route_payload)
         stat = await quick_stat(direct_key, region, period, self.api_key)
         if "오류" in stat:
+            region_failure = _region_failure_answer(
+                stat, query, route_payload, "tier_a_region_failed",
+            )
+            if region_failure:
+                return region_failure
             return await self._answer_search_fallback(query, route_payload)
         if "값" not in stat:
             return {
@@ -2828,6 +3077,9 @@ class NaturalLanguageAnswerEngine:
                 "지역": stat.get("지역"),
                 "통계표": stat.get("통계표"),
             }],
+            "최신값_선택정책": stat.get("최신값_선택정책"),
+            "선택_수록주기": stat.get("선택_수록주기"),
+            "비교_수록주기": stat.get("비교_수록주기"),
             "검증_주의": route_payload["validation"].get("warnings", []),
             "route": route_payload["route"],
             "출처": stat.get("출처", "통계청 KOSIS"),
@@ -2860,6 +3112,9 @@ class NaturalLanguageAnswerEngine:
             "표": rows,
             "상위": top,
             "하위": bottom,
+            "최신값_선택정책": comparison.get("최신값_선택정책"),
+            "선택_수록주기": comparison.get("선택_수록주기"),
+            "비교_수록주기": comparison.get("비교_수록주기"),
             "추천_시각화": ["bar_chart"],
             "검증_주의": route_payload["validation"].get("warnings", []),
             "route": route_payload["route"],
@@ -3859,7 +4114,9 @@ async def quick_stat(
         query: 통계 키워드 ("인구", "실업률", "중소기업 사업체수")
         region: 17개 시도명 (기본 "전국"). 영문·풀네임도 자동 정규화
                 (Seoul, 서울특별시, 서울시 → 서울).
-        period: "latest" 또는 "2023", "2023.03", "작년", "올해"
+        period: "latest"(지원 주기 중 실제 최신), "latest_annual",
+            "latest_monthly", "latest_quarterly" 또는 "2023", "2023.03",
+            "작년", "올해"
 
     extra_params: 빠른 단일값 도구가 직접 지원하지 않는 보조 조건.
         예: {"industry": "제조업"}. 실제 슬라이싱에는 사용하지 않고,
@@ -3878,13 +4135,29 @@ async def _quick_stat_core(
     query: str, region: str = "전국", period: str = "latest",
     api_key: Optional[str] = None,
 ) -> dict:
+    if _latest_period_policy(period) == LATEST_OBSERVED:
+        return {
+            "상태": "unsupported",
+            "코드": "LATEST_OBSERVED_UNSUPPORTED",
+            "오류": "latest_observed는 현재 지원하지 않습니다.",
+            "사유": (
+                "KOSIS 통계자료 응답만으로는 관측값과 전망값을 일관되게 구분할 수 없습니다. "
+                "표별 전망/실적 구분 메타가 확인된 뒤 지원해야 합니다."
+            ),
+            "지원_최신값_정책": [
+                LATEST_AVAILABLE,
+                LATEST_ANNUAL,
+                LATEST_MONTHLY,
+                LATEST_QUARTERLY,
+            ],
+        }
+    param = _lookup_quick(query)
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
         if _is_missing_key_error(exc):
             return _missing_api_key_response("quick_stat", query=query, region=region, period=period)
         raise
-    param = _lookup_quick(query)
     query_region = _extract_single_region_from_query(query)
     if region == "전국" and query_region:
         region = query_region
@@ -3931,24 +4204,50 @@ async def _quick_stat_core(
         if param.region_scheme:
             region_code = param.region_scheme.get(canonical)
             if not region_code:
-                return {
-                    "오류": f'지역 "{region}" 이 통계에서 미지원',
-                    "정규화_지역": canonical if canonical != region else None,
-                    "지원_지역": list(param.region_scheme.keys()),
-                    "통계표": param.tbl_nm,
-                }
+                try:
+                    region_code = await _resolve_region_dynamically(
+                        param.org_id,
+                        param.tbl_id,
+                        region,
+                        api_key,
+                        region_obj=param.region_obj,
+                        region_code_hint=getattr(param, param.region_obj, None),
+                    )
+                except RegionResolutionUnavailable as exc:
+                    return _region_failure_response(
+                        code="REGION_LOOKUP_UNAVAILABLE",
+                        region=region,
+                        param=param,
+                        message=f'지역 "{region}" 지원 여부를 확인하지 못했습니다.',
+                        detail=str(exc),
+                    )
+            if not region_code:
+                return _region_failure_response(
+                    code="REGION_UNSUPPORTED",
+                    region=region,
+                    param=param,
+                    message=f'지역 "{region}" 이 통계에서 미지원',
+                )
         elif canonical != "전국":
-            return {
-                "오류": f'이 통계는 지역별 조회가 검증되지 않았습니다: "{region}"',
-                "지원_지역": ["전국"],
-                "통계표": param.tbl_nm,
-                "권고": "지역별 값으로 포장하지 않도록 차단했습니다. search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요.",
-            }
+            result = _region_failure_response(
+                code="REGION_UNSUPPORTED",
+                region=region,
+                param=param,
+                message=f'이 통계는 지역별 조회가 검증되지 않았습니다: "{region}"',
+            )
+            result["권고"] = "지역별 값으로 포장하지 않도록 차단했습니다. search_kosis로 지역 분류가 있는 통계표를 먼저 확인하세요."
+            return result
         region = canonical
 
         period_type = _default_period_type(param)
-        effective_period = "latest" if _is_latest_period_text(period) else period
-        latest_alias = str(period) if str(period) != "latest" and effective_period == "latest" else None
+        latest_policy = _latest_period_policy(period)
+        effective_period = "latest" if latest_policy else period
+        latest_alias = (
+            str(period)
+            if latest_policy == LATEST_AVAILABLE
+            and str(period) not in {"latest", LATEST_AVAILABLE}
+            else None
+        )
         range_start = _extract_open_start_year(effective_period)
         if effective_period != "latest" and range_start:
             years_hint = max(1, datetime.now().year - int(range_start) + 1)
@@ -3977,14 +4276,32 @@ async def _quick_stat_core(
                 "통계표": param.tbl_nm,
                 "지원_기간유형": period_type,
             }
+        queried_period_types: tuple[str, ...] = (period_type,)
         async with httpx.AsyncClient() as client:
             try:
-                data = await _fetch_series(
-                    client, key, param, region_code,
-                    period_type=period_type,
-                    start_year=start_period, end_year=end_period,
-                    latest_n=1 if not start_period else None,
-                )
+                if latest_policy:
+                    data, period_type, queried_period_types = await _fetch_latest_by_policy(
+                        client,
+                        key,
+                        param,
+                        region_code,
+                        latest_policy,
+                    )
+                else:
+                    data = await _fetch_series(
+                        client, key, param, region_code,
+                        period_type=period_type,
+                        start_year=start_period, end_year=end_period,
+                    )
+            except ValueError as e:
+                return {
+                    "상태": "failed",
+                    "코드": "PERIOD_TYPE_UNSUPPORTED",
+                    "오류": str(e),
+                    "통계표": param.tbl_nm,
+                    "요청_최신값_정책": latest_policy,
+                    "지원_기간유형": list(param.supported_periods),
+                }
             except RuntimeError as e:
                 return {"오류": str(e), "통계표": param.tbl_nm, "권고": verification_warning}
 
@@ -3998,7 +4315,7 @@ async def _quick_stat_core(
                         f"'{period}' → {resolved_year}년으로 해석했지만 이 통계표의 수록 시점에 "
                         f"포함되지 않음. 최신값을 원하면 period='latest'를 사용하세요."
                     )
-            return {
+            missing_result = {
                 "상태": "failed",
                 "코드": STATUS_PERIOD_NOT_FOUND,
                 "결과": "데이터 없음",
@@ -4013,6 +4330,13 @@ async def _quick_stat_core(
                 "⚠️ 정밀도_다운그레이드": precision_downgrade,
                 "⚠️ 기간_해석": relative_hint,
             }
+            if latest_policy:
+                missing_result.update({
+                    "최신값_선택정책": latest_policy,
+                    "선택_수록주기": None,
+                    "비교_수록주기": list(queried_period_types),
+                })
+            return missing_result
 
         data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
         row = data[-1]
@@ -4032,6 +4356,12 @@ async def _quick_stat_core(
             "지역": region, "통계표": param.tbl_nm,
             "출처": "통계청 KOSIS",
         }
+        if latest_policy:
+            result.update({
+                "최신값_선택정책": latest_policy,
+                "선택_수록주기": period_type,
+                "비교_수록주기": list(queried_period_types),
+            })
         if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
             result["⚠️ 데이터_신선도"] = (
                 f"사용 시점 {used_period} (약 {age:.1f}년 경과) — 최신 데이터가 아닐 수 있음. "
@@ -4247,13 +4577,17 @@ async def _quick_trend_core(
     normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(start_year, end_year)
     if period_error:
         return period_error
+    param = _lookup_quick(query)
+    if param:
+        deprecated = _deprecated_mapping_response(query, param)
+        if deprecated:
+            return deprecated
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
         if _is_missing_key_error(exc):
             return _missing_api_key_response("quick_trend", query=query, region=region, years=years)
         raise
-    param = _lookup_quick(query)
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
     canonical = _canonical_region(region) or region
@@ -4262,9 +4596,37 @@ async def _quick_trend_core(
     if param.region_scheme:
         region_code = param.region_scheme.get(canonical)
         if not region_code:
-            return {"오류": f'지역 "{region}" 미지원', "지원_지역": list(param.region_scheme.keys())}
+            try:
+                region_code = await _resolve_region_dynamically(
+                    param.org_id,
+                    param.tbl_id,
+                    region,
+                    api_key,
+                    region_obj=param.region_obj,
+                    region_code_hint=getattr(param, param.region_obj, None),
+                )
+            except RegionResolutionUnavailable as exc:
+                return _region_failure_response(
+                    code="REGION_LOOKUP_UNAVAILABLE",
+                    region=region,
+                    param=param,
+                    message=f'지역 "{region}" 지원 여부를 확인하지 못했습니다.',
+                    detail=str(exc),
+                )
+        if not region_code:
+            return _region_failure_response(
+                code="REGION_UNSUPPORTED",
+                region=region,
+                param=param,
+                message=f'지역 "{region}" 미지원',
+            )
     elif canonical != "전국":
-        return {"오류": f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.', "지원_지역": ["전국"]}
+        return _region_failure_response(
+            code="REGION_UNSUPPORTED",
+            region=region,
+            param=param,
+            message=f'"{query}"는 지역별 시계열 조회가 검증되지 않았습니다.',
+        )
     region = canonical
 
     period_type = _default_period_type(param)
@@ -4347,13 +4709,24 @@ async def _quick_region_compare_core(
     query: str, period: str = "latest", sort: str = "desc",
     api_key: Optional[str] = None,
 ) -> dict:
+    if _latest_period_policy(period) == LATEST_OBSERVED:
+        return {
+            "상태": "unsupported",
+            "코드": "LATEST_OBSERVED_UNSUPPORTED",
+            "오류": "latest_observed는 현재 지원하지 않습니다.",
+            "사유": "표별 관측값·전망값 구분 메타가 확인되지 않았습니다.",
+        }
+    param = _lookup_quick(query)
+    if param:
+        deprecated = _deprecated_mapping_response(query, param)
+        if deprecated:
+            return deprecated
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
         if _is_missing_key_error(exc):
             return _missing_api_key_response("quick_region_compare", query=query, period=period, sort=sort)
         raise
-    param = _lookup_quick(query)
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
     if not param.region_scheme:
@@ -4364,7 +4737,8 @@ async def _quick_region_compare_core(
         }
 
     period_type = _default_period_type(param)
-    effective_period = "latest" if _is_latest_period_text(period) else period
+    latest_policy = _latest_period_policy(period)
+    effective_period = "latest" if latest_policy else period
     start_period, end_period = _period_bounds(effective_period, period_type)
     if effective_period != "latest" and not start_period:
         return {
@@ -4372,18 +4746,36 @@ async def _quick_region_compare_core(
             "통계표": param.tbl_nm,
             "지원_기간유형": period_type,
         }
+    queried_period_types: tuple[str, ...] = (period_type,)
     async with httpx.AsyncClient() as client:
         try:
-            data = await _fetch_series(
-                client,
-                key,
-                param,
-                "ALL",
-                period_type=period_type,
-                start_year=start_period,
-                end_year=end_period,
-                latest_n=1 if not start_period else None,
-            )
+            if latest_policy:
+                data, period_type, queried_period_types = await _fetch_latest_by_policy(
+                    client,
+                    key,
+                    param,
+                    "ALL",
+                    latest_policy,
+                )
+            else:
+                data = await _fetch_series(
+                    client,
+                    key,
+                    param,
+                    "ALL",
+                    period_type=period_type,
+                    start_year=start_period,
+                    end_year=end_period,
+                )
+        except ValueError as e:
+            return {
+                "상태": "failed",
+                "코드": "PERIOD_TYPE_UNSUPPORTED",
+                "오류": str(e),
+                "통계표": param.tbl_nm,
+                "요청_최신값_정책": latest_policy,
+                "지원_기간유형": list(param.supported_periods),
+            }
         except RuntimeError as e:
             return {"오류": str(e), "통계표": param.tbl_nm}
 
@@ -4426,6 +4818,9 @@ async def _quick_region_compare_core(
         "used_period": used_period,
         "period_age_years": age,
         "단위": param.unit,
+        "최신값_선택정책": latest_policy,
+        "선택_수록주기": period_type,
+        "비교_수록주기": list(queried_period_types),
         "정렬": "내림차순" if reverse else "오름차순",
         "지역수": len(rows),
         "표": rows,
@@ -4455,6 +4850,13 @@ async def daily_term_lookup(daily_term: str) -> dict:
     # 먼저 Tier A 직접 매핑 있는지 확인
     tier_a = _curation_lookup(daily_term)
     if tier_a:
+        deprecated = _deprecated_mapping_response(daily_term, tier_a)
+        if deprecated:
+            return {
+                "입력": daily_term,
+                "정밀_매핑": deprecated,
+                "안내": "기존 Tier A 표가 오래되어 직접 조회를 차단했습니다. 현행 표를 다시 탐색하세요.",
+            }
         return {
             "입력": daily_term,
             "정밀_매핑": {
@@ -4501,10 +4903,10 @@ async def browse_topic(topic: Optional[str] = None) -> dict:
     return {
         "주제": topic,
         "대표_통계": [
-            {"이름": name, "상태": "확정" if name in TIER_A_STATS else "미검증"}
+            {"이름": name, "상태": _topic_stat_status(name)}
             for name in hints
         ],
-        "안내": "상태가 확정인 통계는 stat_detail로 바로 호출 정보를 받고, 미검증인 통계도 stat_detail이 후보를 찾아줍니다.",
+        "안내": "확정 통계는 stat_detail로 호출 정보를 받고, 교체필요 통계는 현행 표 재검증 후 사용하며, 미검증 통계는 검색 후보를 확인하세요.",
     }
 
 
@@ -4518,19 +4920,25 @@ async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
     이 함수는 새 조회/검색 로직을 만들지 않고 기존 TIER_A_STATS와
     answer_query의 검색 폴백을 그대로 재사용한다.
     """
-    try:
-        key = _resolve_key(api_key)
-    except RuntimeError as exc:
-        if _is_missing_key_error(exc):
-            return _missing_api_key_response("stat_detail", query=name)
-        raise
-
-    param = TIER_A_STATS.get(name)
+    param = _curation_lookup(name)
+    if param and param.replacement_status == "deprecated":
+        return {
+            "확정상태": "교체필요",
+            "통계표명": param.tbl_nm,
+            "기관ID": param.org_id,
+            "통계표ID": param.tbl_id,
+            "교체상태": param.replacement_status,
+            "마지막검증일": param.verified_at,
+            "주의": param.note,
+            "권고": "search_kosis와 explore_table로 현행 후보를 검증한 뒤 카탈로그를 교체하세요.",
+        }
     if param and param.verification_status != "broken":
         region_list = list(param.region_scheme.keys()) if param.region_scheme else ["전국"]
         response: dict[str, Any] = {
             "확정상태": "확정",
             "통계표명": param.tbl_nm,
+            "기관ID": param.org_id,
+            "통계표ID": param.tbl_id,
             "지원_지역": region_list,
             "지원_기간": list(param.supported_periods),
             "호출_예시": {
@@ -4544,6 +4952,13 @@ async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
                 f"(사유: {param.note or '미상'})."
             )
         return response
+
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("stat_detail", query=name)
+        raise
 
     engine = NaturalLanguageAnswerEngine(key)
     fallback = await engine._answer_search_fallback(name)
@@ -5409,6 +5824,7 @@ async def chart_heatmap(
     # 각 지역의 시계열 수집
     all_years: set[str] = set()
     region_data: dict[str, dict[str, float]] = {}
+    missing_regions: list[dict[str, str]] = []
     for r in regions:
         result = await quick_trend(
             query=query,
@@ -5419,15 +5835,31 @@ async def chart_heatmap(
             end_year=end_year,
         )
         if "오류" in result:
+            missing_regions.append({"지역": r, "사유": str(result.get("오류") or "조회 실패")})
             continue
         times, values = _values_from_series(result.get("시계열", []))
+        if not times:
+            missing_regions.append({"지역": r, "사유": "시계열 데이터 없음"})
+            continue
         region_data[r] = dict(zip(times, values))
         all_years.update(times)
 
     if not region_data or not all_years:
-        return [TextContent(type="text", text="히트맵 생성에 충분한 데이터 없음")]
+        return [TextContent(type="text", text=json.dumps({
+            "상태": "failed",
+            "코드": "HEATMAP_NO_REGION_DATA",
+            "오류": "히트맵 생성에 충분한 데이터 없음",
+            "요청_지역수": len(regions),
+            "포함_지역": [],
+            "누락_지역": missing_regions,
+        }, ensure_ascii=False))]
 
     sorted_years = sorted(all_years)
+    missing_periods: list[dict[str, Any]] = []
+    for region_name, values_by_period in region_data.items():
+        missing = [period for period in sorted_years if period not in values_by_period]
+        if missing:
+            missing_periods.append({"지역": region_name, "시점": missing})
     # 매트릭스: rows=regions, cols=years
     matrix: list[list[Optional[float]]] = []
     valid_rows: list[str] = []
@@ -5447,7 +5879,15 @@ async def chart_heatmap(
         _svg_to_image(svg),
         TextContent(
             type="text",
-            text=f"{param.description} 히트맵 — {len(valid_rows)}개 지역 × {len(sorted_years)}년",
+            text=json.dumps({
+                "상태": "partial" if missing_regions or missing_periods else "success",
+                "요약": f"{param.description} 히트맵 — {len(valid_rows)}개 지역 × {len(sorted_years)}개 시점",
+                "요청_지역수": len(regions),
+                "포함_지역": valid_rows,
+                "누락_지역": missing_regions,
+                "누락_시점": missing_periods,
+                "시점": sorted_years,
+            }, ensure_ascii=False),
         ),
     ]
 
@@ -6097,6 +6537,9 @@ async def stat_time_compare(
                 "오류": f'"{query}" 사전 매핑 없음',
                 "질문": query,
             }
+        deprecated = _deprecated_mapping_response(query, param)
+        if deprecated:
+            return deprecated
 
         canonical = _canonical_region(region) or region
         region_code = None
@@ -10309,7 +10752,7 @@ async def explore_table(
         "PRD": len(period_rows) if isinstance(period_rows, list) else 0,
         "SOURCE": len(source_rows) if isinstance(source_rows, list) else 0,
     }
-    if not meta_errors and not any(meta_counts.values()):
+    if not any(meta_counts.values()):
         return {
             "상태": "failed",
             "status": "failed",
