@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
+from collections import deque
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
 import httpx
@@ -18,8 +21,28 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default) or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 META_CACHE_TTL = _env_float("KOSIS_MCP_META_CACHE_TTL", 3600.0)
 _META_CACHE: dict[tuple[Any, ...], tuple[float, list[dict]]] = {}
+
+RATE_LIMIT_CALLS = max(1, _env_int("KOSIS_MCP_RATE_LIMIT_CALLS", 180))
+RATE_LIMIT_WINDOW_SECONDS = max(
+    0.001, _env_float("KOSIS_MCP_RATE_LIMIT_WINDOW_SECONDS", 60.0)
+)
+RATE_LIMIT_RETRIES = max(0, _env_int("KOSIS_MCP_RATE_LIMIT_RETRIES", 2))
+RATE_LIMIT_BACKOFF_SECONDS = max(
+    0.0, _env_float("KOSIS_MCP_RATE_LIMIT_BACKOFF_SECONDS", 0.5)
+)
+RATE_LIMIT_MAX_BACKOFF_SECONDS = max(
+    RATE_LIMIT_BACKOFF_SECONDS,
+    _env_float("KOSIS_MCP_RATE_LIMIT_MAX_BACKOFF_SECONDS", 5.0),
+)
 
 ERROR_MAP = {
     # Official KOSIS API error codes
@@ -46,6 +69,67 @@ ERROR_MAP = {
 }
 
 
+class KosisRateLimitError(RuntimeError):
+    """KOSIS rate-limit failure after bounded retries.
+
+    ``source`` distinguishes an HTTP transport response (``http_429``) from
+    the KOSIS JSON error contract (``api_40``), which need separate operational
+    metrics even though callers may handle both as one retryable failure class.
+    """
+
+    def __init__(self, source: str, attempts: int, retry_after: Optional[float] = None):
+        self.source = source
+        self.attempts = attempts
+        self.retry_after = retry_after
+        retry_hint = f", retry_after={retry_after:.3f}s" if retry_after is not None else ""
+        super().__init__(
+            f"[KOSIS RATE_LIMIT {source}] {attempts}회 시도 후 호출 제한 지속{retry_hint}"
+        )
+
+
+class AsyncSlidingWindowLimiter:
+    """Single-process async sliding-window limiter.
+
+    Every real HTTP attempt must acquire here, so fan-out and retry traffic are
+    counted too. This deliberately does not coordinate multiple MCP processes;
+    deployments with multiple instances need a shared Redis/proxy limiter or a
+    proportionally lower ``KOSIS_MCP_RATE_LIMIT_CALLS`` value per instance.
+    """
+
+    def __init__(
+        self,
+        max_calls: int,
+        window_seconds: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.max_calls = max(1, max_calls)
+        self.window_seconds = max(0.001, window_seconds)
+        self._clock = clock
+        self._sleeper = sleeper
+        self._timestamps: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = self._clock()
+                cutoff = now - self.window_seconds
+                while self._timestamps and self._timestamps[0] <= cutoff:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_calls:
+                    self._timestamps.append(now)
+                    return
+                wait_seconds = self._timestamps[0] + self.window_seconds - now
+            await self._sleeper(max(wait_seconds, 0.001))
+
+
+_KOSIS_RATE_LIMITER = AsyncSlidingWindowLimiter(
+    RATE_LIMIT_CALLS, RATE_LIMIT_WINDOW_SECONDS
+)
+
+
 def _resolve_key(provided: Optional[str]) -> str:
     key = provided or API_KEY_DEFAULT
     if not key:
@@ -56,15 +140,46 @@ def _resolve_key(provided: Optional[str]) -> str:
 async def _kosis_call(client: httpx.AsyncClient, endpoint: str, params: dict) -> list[dict]:
     url = f"{KOSIS_BASE}/{endpoint}"
     clean = {k: v for k, v in params.items() if v not in (None, "")}
-    resp = await client.get(url, params=clean, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict) and "err" in data:
-        code = str(data["err"])
-        if code == "30":
-            return []
-        raise RuntimeError(f"[KOSIS {code}] {ERROR_MAP.get(code, '미상')}")
-    return data if isinstance(data, list) else [data]
+    attempts = RATE_LIMIT_RETRIES + 1
+    for attempt in range(attempts):
+        await _KOSIS_RATE_LIMITER.acquire()
+        resp = await client.get(url, params=clean, timeout=HTTP_TIMEOUT)
+        if resp.status_code == 429:
+            retry_after = _retry_delay(resp, attempt)
+            if attempt + 1 >= attempts:
+                raise KosisRateLimitError("http_429", attempts, retry_after)
+            await asyncio.sleep(retry_after)
+            continue
+
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "err" in data:
+            code = str(data["err"])
+            if code == "30":
+                return []
+            if code == "40":
+                retry_after = _retry_delay(resp, attempt)
+                if attempt + 1 >= attempts:
+                    raise KosisRateLimitError("api_40", attempts, retry_after)
+                await asyncio.sleep(retry_after)
+                continue
+            raise RuntimeError(f"[KOSIS {code}] {ERROR_MAP.get(code, '미상')}")
+        return data if isinstance(data, list) else [data]
+    raise AssertionError("unreachable KOSIS retry loop")
+
+
+def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """Return a bounded delay, honoring numeric Retry-After when available."""
+    retry_after = resp.headers.get("Retry-After")
+    try:
+        requested = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        requested = None
+    fallback = RATE_LIMIT_BACKOFF_SECONDS * (2 ** attempt)
+    return min(
+        RATE_LIMIT_MAX_BACKOFF_SECONDS,
+        max(0.0, requested if requested is not None else fallback),
+    )
 
 
 async def _fetch_meta(
@@ -156,4 +271,3 @@ async def _fetch_table_name(
     key = _resolve_key(api_key)
     async with httpx.AsyncClient() as client:
         return await _fetch_meta(client, key, org_id, tbl_id, "TBL")
-
