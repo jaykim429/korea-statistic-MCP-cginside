@@ -153,6 +153,54 @@ REGION_ALIASES: dict[str, str] = {
 }
 
 
+# 라우터에서는 지역 후보로만 인식한다. 실제 표 지원 여부는 조회 시
+# KOSIS 분류축을 확인해 결정한다.
+GYEONGGI_MUNICIPALITIES: tuple[str, ...] = (
+    "수원", "성남", "의정부", "안양", "부천", "광명", "평택", "동두천",
+    "안산", "고양", "과천", "구리", "남양주", "오산", "시흥", "군포",
+    "의왕", "하남", "용인", "파주", "이천", "안성", "김포", "화성",
+    "광주", "양주", "포천", "여주", "연천", "가평", "양평",
+)
+
+
+def extract_region_candidate(query: str) -> Optional[str]:
+    """Extract a region candidate without claiming that a table supports it."""
+    text = str(query or "")
+    compact = re.sub(r"[\s()]+", "", text)
+    particle = r"(?:의|은|는|이|가|에서|와|과)?"
+    boundary = r"(?![가-힣A-Za-z0-9])"
+    if (
+        re.search(rf"경기(?:도)?\s*광주(?:시)?{particle}{boundary}", text)
+        or re.search(rf"광주(?:시)?\s*\(?경기(?:도)?\)?{particle}{boundary}", text)
+    ):
+        return "경기 광주"
+    for municipality in sorted(GYEONGGI_MUNICIPALITIES, key=len, reverse=True):
+        if municipality == "광주":
+            continue
+        if re.search(
+            rf"경기(?:도)?\s*{re.escape(municipality)}(?:시|군)?{particle}{boundary}",
+            text,
+        ):
+            return municipality
+
+    for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
+        if region != "전국" and re.sub(r"\s+", "", region) in compact:
+            return region
+    if "전국" in compact:
+        return "전국"
+
+    # 짧은 이름은 바로 뒤에 통계 지표가 이어질 때만 허용한다.
+    indicator = r"(?:인구|출산|사망|혼인|평균\s*초혼|실업|고용|사업체|전입|전출|주택|가구|통계)"
+    for municipality in sorted(GYEONGGI_MUNICIPALITIES, key=len, reverse=True):
+        if municipality == "광주":
+            continue
+        explicit_pattern = rf"(?<![가-힣A-Za-z0-9]){re.escape(municipality)}(?:시|군){particle}{boundary}"
+        contextual_pattern = rf"(?<![가-힣A-Za-z0-9]){re.escape(municipality)}{particle}\s*{indicator}"
+        if re.search(explicit_pattern, text) or re.search(contextual_pattern, text):
+            return municipality
+    return None
+
+
 # Composite regions expand into a list of canonical regions. Used by
 # region-sum/share-ratio handlers that can iterate over the component
 # administrative regions.
@@ -191,6 +239,9 @@ def canonical_region(region: Optional[str]) -> Optional[str]:
 # ============================================================================
 
 VerificationStatus = Literal["verified", "unverified", "needs_check", "broken"]
+ValueKind = Literal["raw", "provider_index", "mcp_derived"]
+TimeSemantics = Literal["observed", "projection", "mixed"]
+ReplacementStatus = Literal["current", "candidate", "deprecated"]
 
 
 @dataclass
@@ -213,6 +264,16 @@ class QuickStatParam:
     display_decimals: Optional[int] = None # 답변 텍스트 표시용 소수 자릿수
     verification_status: VerificationStatus = "verified"
     note: str = ""                        # 메모/특이사항
+    domain: Optional[str] = None
+    value_kind: ValueKind = "raw"
+    time_semantics: TimeSemantics = "observed"
+    latest_policy: str = "latest_available"
+    replacement_status: ReplacementStatus = "current"
+    verified_at: Optional[str] = None
+
+    @property
+    def table_identity(self) -> tuple[str, str]:
+        return (self.org_id, self.tbl_id)
 
 
 # Tier A 데이터: 110+ 항목
@@ -376,7 +437,9 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         item_id="13103134474999",
         unit="십억원",
         verification_status="verified",
-        note="검증 OK: KOSIS latest 호출 기준 (2023년 2236329.4 십억원). 데이터 신선도 경고 대상.",
+        replacement_status="deprecated",
+        verified_at="2026-07-14",
+        note="구 표는 2023 종료. 현행 후보(DT_200Y105 등)는 항목·명목/실질 검증 후 교체 필요.",
     ),
     "GRDP": QuickStatParam(
         org_id="101", tbl_id="DT_1C81",
@@ -385,7 +448,9 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         obj_l1="00", obj_l2="Z10", item_id="T1", unit="백만원",
         region_scheme=REGION_DEMOGRAPHIC,
         verification_status="verified",
-        note="Verified via KOSIS API: objL2=Z10 (2022 2,165,717,327)",
+        replacement_status="deprecated",
+        verified_at="2026-07-14",
+        note="구 표는 2022 종료. 2024 수록 현행 후보를 지역축·단위까지 재검증 후 교체 필요.",
     ),
     "경제성장률": QuickStatParam(
         org_id="301", tbl_id="DT_200Y101",
@@ -597,7 +662,9 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         description="총 사업체 수",
         obj_l1="00", obj_l2="0", obj_l3="0", item_id="T1", unit="개",
         verification_status="verified",
-        note="Verified via KOSIS API: industry=0, establishment=0 (2016 3,950,192)",
+        replacement_status="deprecated",
+        verified_at="2026-07-14",
+        note="구 전국사업체조사 표는 2016 종료. 현행 경제총조사/기업통계 후보 재탐색 필요.",
     ),
 
     # ========================================================================
@@ -759,7 +826,10 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         region_scheme=REGION_HOUSING,
         supported_periods=("M",),
         verification_status="verified",
-        note="explore 검증. region이 단일 분류축(obj_l1). 주택 전세지수와 별개.",
+        replacement_status="deprecated",
+        verified_at="2026-07-14",
+        value_kind="provider_index",
+        note="구 표는 2025.03 종료. 408/DT_30404_B013 계열 후보를 기준시점·지역축까지 검증 후 교체 필요.",
     ),
     "자동차등록대수": QuickStatParam(
         org_id="101", tbl_id="DT_1YL20731",
@@ -2603,13 +2673,9 @@ class NaturalLanguageRouter:
                     slots.secondary_indicators.append(indicator)
                     seen_indicators.add(indicator)
 
-        for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
-            if region != "전국" and self.normalize(region) in q_norm:
-                slots.region = region
-                slots.code_mapping_needed.append("region")
-                break
-        if not slots.region and "전국" in q_norm:
-            slots.region = "전국"
+        slots.region = extract_region_candidate(q)
+        if slots.region:
+            slots.code_mapping_needed.append("region")
 
         for key, value in _INDUSTRY_TERMS.items():
             if self.normalize(key) in q_norm:

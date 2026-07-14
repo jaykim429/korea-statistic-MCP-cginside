@@ -3,7 +3,12 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from kosis_curation import QuickStatParam, REGION_COMPOSITES, canonical_region as _canonical_region
+from kosis_curation import (
+    QuickStatParam,
+    REGION_COMPOSITES,
+    canonical_region as _canonical_region,
+    extract_region_candidate,
+)
 from kosis_analysis.metadata import _compact_text
 
 STATUS_UNVERIFIED_FORMULA = "UNVERIFIED_FORMULA"
@@ -21,6 +26,9 @@ _DIRECT_REGION_NAMES = (
 
 def _extract_single_region_from_query(query: str) -> Optional[str]:
     q = str(query or "")
+    candidate = extract_region_candidate(q)
+    if candidate and (candidate not in _DIRECT_REGION_NAMES or " " in candidate):
+        return candidate
     matches: list[str] = []
     for name in sorted(_DIRECT_REGION_NAMES, key=len, reverse=True):
         if name in q:
@@ -41,8 +49,11 @@ def _quick_stat_unsupported_dimensions(query: str) -> list[str]:
     dimensions: list[str] = []
     if (
         re.search(r"\d+\s*[-~]\s*\d+\s*세", q)
+        or re.search(r"\d+\s*세", q)
         or re.search(r"\d{2,3}\s*대", q)
-        or any(term in compact for term in ("청년", "연령별", "연령", "나이"))
+        or any(term in compact for term in ("청년", "연령별", "나이별", "연령대", "연령구간"))
+        or ("연령" in compact and "평균초혼연령" not in compact)
+        or "나이" in compact
     ):
         dimensions.append("age")
     if any(term in compact for term in ("여성", "여자", "남성", "남자", "성별")):
