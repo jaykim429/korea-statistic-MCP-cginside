@@ -87,6 +87,16 @@ class KosisRateLimitError(RuntimeError):
         )
 
 
+class KosisTransportError(RuntimeError):
+    """URL과 query string을 노출하지 않는 KOSIS 전송 오류."""
+
+    def __init__(self, code: str, *, status_code: Optional[int] = None):
+        self.code = code
+        self.status_code = status_code
+        status_hint = f" HTTP {status_code}" if status_code is not None else ""
+        super().__init__(f"[KOSIS {code}]{status_hint} {ERROR_MAP.get(code, '전송 오류')}")
+
+
 class AsyncSlidingWindowLimiter:
     """Single-process async sliding-window limiter.
 
@@ -143,7 +153,12 @@ async def _kosis_call(client: httpx.AsyncClient, endpoint: str, params: dict) ->
     attempts = RATE_LIMIT_RETRIES + 1
     for attempt in range(attempts):
         await _KOSIS_RATE_LIMITER.acquire()
-        resp = await client.get(url, params=clean, timeout=HTTP_TIMEOUT)
+        try:
+            resp = await client.get(url, params=clean, timeout=HTTP_TIMEOUT)
+        except httpx.TimeoutException:
+            raise KosisTransportError("TIMEOUT") from None
+        except httpx.RequestError:
+            raise KosisTransportError("NETWORK") from None
         if resp.status_code == 429:
             retry_after = _retry_delay(resp, attempt)
             if attempt + 1 >= attempts:
@@ -151,8 +166,12 @@ async def _kosis_call(client: httpx.AsyncClient, endpoint: str, params: dict) ->
             await asyncio.sleep(retry_after)
             continue
 
-        resp.raise_for_status()
-        data = resp.json()
+        if resp.is_error:
+            raise KosisTransportError("NETWORK", status_code=resp.status_code)
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            raise KosisTransportError("E002", status_code=resp.status_code) from None
         if isinstance(data, dict) and "err" in data:
             code = str(data["err"])
             if code == "30":
