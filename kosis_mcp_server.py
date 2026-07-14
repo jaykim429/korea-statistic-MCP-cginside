@@ -1150,8 +1150,26 @@ async def _resolve_region_dynamically(
         for row in region_rows
         if row.get("OBJ_ID") not in (None, "")
     ))
-    if len(region_axis_ids) == 1:
-        target_axis_id = region_axis_ids[0]
+    all_axis_ids = sorted({
+        str(row.get("OBJ_ID"))
+        for row in classifications
+        if row.get("OBJ_ID") not in (None, "")
+    })
+    requested_axis_index = {"obj_l1": 0, "obj_l2": 1, "obj_l3": 2}.get(region_obj)
+    requested_axis_id = (
+        all_axis_ids[requested_axis_index]
+        if requested_axis_index is not None and requested_axis_index < len(all_axis_ids)
+        else None
+    )
+    if requested_axis_id in region_axis_ids and (
+        region_code_hint is None
+        or any(
+            str(row.get("OBJ_ID")) == requested_axis_id
+            and str(row.get("ITM_ID") or "") == str(region_code_hint)
+            for row in region_rows
+        )
+    ):
+        target_axis_id = requested_axis_id
     elif region_code_hint:
         matching_axes = {
             str(row.get("OBJ_ID"))
@@ -1161,6 +1179,8 @@ async def _resolve_region_dynamically(
         if len(matching_axes) != 1:
             return None
         target_axis_id = next(iter(matching_axes))
+    elif len(region_axis_ids) == 1:
+        target_axis_id = region_axis_ids[0]
     else:
         return None
 
@@ -4152,6 +4172,10 @@ async def _quick_stat_core(
             ],
         }
     param = _lookup_quick(query)
+    if param:
+        deprecated = _deprecated_mapping_response(query, param)
+        if deprecated:
+            return deprecated
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
@@ -6802,6 +6826,7 @@ async def _search_kosis_keywords(
     tier_a_match = _lookup_quick(query)
     tier_a_hint: Optional[dict[str, Any]] = None
     if tier_a_match is not None:
+        deprecated = tier_a_match.replacement_status == "deprecated"
         tier_a_hint = {
             "지표": tier_a_match.description,
             "통계표": tier_a_match.tbl_nm,
@@ -6810,7 +6835,11 @@ async def _search_kosis_keywords(
             "단위": tier_a_match.unit,
             "주기": list(tier_a_match.supported_periods),
             "검증상태": tier_a_match.verification_status,
+            "교체상태": tier_a_match.replacement_status,
+            "마지막검증일": tier_a_match.verified_at,
             "권고_호출": (
+                "현재 매핑은 오래된 통계표이므로 직접 조회하지 말고 search 결과에서 현행 표를 검증하세요."
+                if deprecated else
                 f"quick_stat('{query}', region='전국', period='latest') 으로 바로 호출 가능. "
                 "search 결과를 다시 매핑할 필요 없음."
             ),
@@ -6824,6 +6853,8 @@ async def _search_kosis_keywords(
     if tier_a_hint is not None:
         search_markers.append("tier_a_available")
     search_explanation = (
+        "Tier A mapping is deprecated; validate a current search candidate before retrieval."
+        if tier_a_match is not None and tier_a_match.replacement_status == "deprecated" else
         "Search returned no candidate tables; LLM should broaden the query or rely on the planner workflow."
         if not unique else
         "Tier A direct mapping is available; prefer it over re-ranking the search list."
@@ -9755,6 +9786,8 @@ async def check_stat_availability(
         "broken": "❌ 호출 실패 확정 — quick_stat은 폴백으로 작동, KOSIS 사이트에서 신 통계표 ID 확인 필요",
         "unverified": "❓ 미검증 — 호출 시도 가능하나 결과 확인 필수",
     }
+    if p.replacement_status == "deprecated":
+        status_messages[p.verification_status] = "⛔ 교체 필요 — 오래된 통계표이므로 즉시 호출 불가"
 
     result: dict[str, Any] = {
         "쿼리": query,
@@ -9765,13 +9798,15 @@ async def check_stat_availability(
         "설명": p.description,
         "단위": p.unit,
         "검증_상태": p.verification_status,
+        "교체_상태": p.replacement_status,
+        "마지막_검증일": p.verified_at,
         "상태_의미": status_messages.get(p.verification_status, "알 수 없음"),
         "메모": p.note,
         "지원_지역": list(p.region_scheme.keys()) if p.region_scheme else "지역 분류 없음 (전국만)",
         "주기": p.supported_periods,
     }
 
-    if live_period_check and p.verification_status != "broken":
+    if live_period_check and p.verification_status != "broken" and p.replacement_status != "deprecated":
         try:
             period_rows = await _fetch_period_range(p.org_id, p.tbl_id, api_key)
         except Exception as exc:
@@ -10023,6 +10058,8 @@ async def query_table(
     tbl_id: str,
     filters: dict[str, Any],
     period_range: Optional[list[str]] = None,
+    period_type: Optional[str] = None,
+    latest_count: Optional[int] = None,
     aggregation: str = "none",
     group_by: Optional[list[str]] = None,
     include_raw: bool = False,
@@ -10030,7 +10067,10 @@ async def query_table(
 ) -> dict:
     """[🧪] 검증된 메타 코드로 KOSIS 표를 raw 조회한다.
 
-    filters는 explore_table/resolve_concepts가 반환한 OBJ_ID와 ITM_ID만 받는다.
+    filters는 explore_table/resolve_concepts가 반환한 OBJ_ID/ITM_ID를 받는다.
+    REST 어댑터 호환을 위해 objL1~objL3와 itmId 별칭도 메타 축 순서에 따라
+    검증한 뒤 실제 OBJ_ID/ITEM 축으로 변환한다. period_type은 표의 수록주기를
+    선택하고, period_range가 없을 때 latest_count는 KOSIS newEstPrdCnt로 전달된다.
     여러 코드는 서버 내부 fan-out으로 조회한다. 기본 aggregation="none"은
     개별 rows만 반환한다. aggregation="sum_by_group"은 호출자가 가법성을
     명시적으로 책임지는 경우에만 합산한다.
@@ -10076,6 +10116,8 @@ async def query_table(
                 tbl_id=tbl_id,
                 filters=filters,
                 period_range=period_range,
+                period_type=period_type,
+                latest_count=latest_count,
             )
         raise
     fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -10166,12 +10208,32 @@ async def query_table(
                 ),
             }
 
-        selected_period = _pick_query_table_period_row(period_rows, period_range) if isinstance(period_rows, list) else None
+        requested_period_type = _api_period_type(period_type)
+        selected_period = (
+            _pick_query_table_period_row(period_rows, period_range, requested_period_type)
+            if isinstance(period_rows, list) else None
+        )
+        if requested_period_type and not selected_period:
+            return {
+                "상태": "failed",
+                "status": "unsupported",
+                "코드": "PERIOD_TYPE_NOT_FOUND",
+                "code": "PERIOD_TYPE_NOT_FOUND",
+                "오류": f'요청 주기 "{requested_period_type}"를 지원하지 않습니다.',
+                "지원_주기": sorted({
+                    str(_api_period_type(_period_type(row)))
+                    for row in period_rows
+                    if _api_period_type(_period_type(row))
+                }),
+                "filters_used": normalized_filters,
+                "metadata_source": metadata_source,
+            }
         period_type_label = _period_type(selected_period)
         period_type = _api_period_type(period_type_label)
         effective_period_range = period_range
         auto_default_period_range: Optional[list[str]] = None
-        if not effective_period_range and selected_period and selected_period.get("END_PRD_DE"):
+        safe_latest_count = max(1, min(int(latest_count), 100)) if latest_count is not None else None
+        if not effective_period_range and safe_latest_count is None and selected_period and selected_period.get("END_PRD_DE"):
             end_period = str(selected_period.get("END_PRD_DE"))
             effective_period_range = [end_period, end_period]
             auto_default_period_range = effective_period_range
@@ -10303,6 +10365,7 @@ async def query_table(
                         axis_order,
                         effective_period_range,
                         period_type,
+                        safe_latest_count,
                     ),
                     "apiKey": key,
                 }
@@ -10429,6 +10492,7 @@ async def query_table(
         "filters_used": normalized_filters,
         "auto_default_filters": auto_defaults,
         "period_range": effective_period_range,
+        "latest_count": safe_latest_count,
         "period_type": period_type,
         "period_type_label": period_type_label,
         "auto_default_period_range": auto_default_period_range,
