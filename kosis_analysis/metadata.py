@@ -460,7 +460,41 @@ def _validate_query_table_filters(
     errors: list[dict[str, Any]] = []
     auto_defaults: dict[str, list[str]] = {}
 
-    for axis_id, raw_codes in filters.items():
+    data_axes = [axis for axis in axis_order if axis != "ITEM"]
+    positional_aliases = {
+        "objL1": data_axes[0] if len(data_axes) > 0 else None,
+        "obj_l1": data_axes[0] if len(data_axes) > 0 else None,
+        "objL2": data_axes[1] if len(data_axes) > 1 else None,
+        "obj_l2": data_axes[1] if len(data_axes) > 1 else None,
+        "objL3": data_axes[2] if len(data_axes) > 2 else None,
+        "obj_l3": data_axes[2] if len(data_axes) > 2 else None,
+        "itmId": "ITEM" if "ITEM" in axes else None,
+        "itm_id": "ITEM" if "ITEM" in axes else None,
+    }
+    translated_filters: dict[str, Any] = {}
+    for raw_axis, raw_codes in filters.items():
+        raw_axis_text = str(raw_axis)
+        axis = positional_aliases.get(raw_axis_text, raw_axis_text)
+        if axis is None:
+            errors.append({
+                "axis": raw_axis_text,
+                "오류": "요청한 위치의 분류축이 통계표에 없음",
+                "available_axes": [
+                    {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM")}
+                    for obj_id in axis_order
+                ],
+            })
+            continue
+        if axis in translated_filters and translated_filters[axis] != raw_codes:
+            errors.append({
+                "axis": axis,
+                "오류": "동일 분류축에 서로 다른 별칭 필터가 중복 지정됨",
+                "aliases": [raw_axis_text, axis],
+            })
+            continue
+        translated_filters[axis] = raw_codes
+
+    for axis_id, raw_codes in translated_filters.items():
         axis = str(axis_id)
         if axis not in axes:
             errors.append({
@@ -527,6 +561,7 @@ def _query_table_params(
     axis_order: list[str],
     period_range: Optional[list[str]],
     period_type: Optional[str],
+    latest_count: Optional[int] = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "method": "getList",
@@ -558,6 +593,8 @@ def _query_table_params(
         elif len(bounds) >= 2:
             params["startPrdDe"] = _api_period_de(bounds[0])
             params["endPrdDe"] = _api_period_de(bounds[1])
+    elif latest_count is not None:
+        params["newEstPrdCnt"] = max(1, int(latest_count))
     return params
 
 

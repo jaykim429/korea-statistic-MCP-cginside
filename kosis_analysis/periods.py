@@ -110,8 +110,15 @@ def _period_range_looks_yearly(period_range: Optional[list[str]]) -> bool:
 def _pick_query_table_period_row(
     period_rows: list[dict],
     period_range: Optional[list[str]],
+    preferred_period_type: Optional[str] = None,
 ) -> Optional[dict]:
     if not period_rows:
+        return None
+    preferred = _api_period_type(preferred_period_type)
+    if preferred:
+        for row in period_rows:
+            if _api_period_type(_period_type(row)) == preferred:
+                return row
         return None
     if _period_range_looks_yearly(period_range):
         for row in period_rows:
