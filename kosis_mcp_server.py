@@ -93,7 +93,7 @@ from kosis_analysis.periods import (
     _period_range_looks_yearly,
     _period_type,
     _periods_per_year,
-    _pick_finest_period,
+    _pick_freshest_period,
     _pick_query_table_period_row,
     _select_latest_period_candidate,
     _query_table_data_nature,
@@ -9970,7 +9970,7 @@ async def check_stat_availability(
         if not period_rows:
             result["⚠️ 라이브_수록기간"] = "KOSIS 메타 API가 수록 시점을 반환하지 않음"
             return result
-        latest = _pick_finest_period(period_rows)
+        latest = _pick_freshest_period(period_rows)
         live_period = str(
             latest.get("END_PRD_DE") or latest.get("endPrdDe")
             or latest.get("PRD_DE") or latest.get("prdDe") or ""
@@ -10110,7 +10110,7 @@ async def check_variable_compatibility(
 
         try:
             period_rows = await _fetch_period_range(param.org_id, param.tbl_id, api_key)
-            latest = _pick_finest_period(period_rows or [])
+            latest = _pick_freshest_period(period_rows or [])
         except Exception as exc:
             report["period_metadata_status"] = "fetch_failed"
             report["period_metadata_error"] = repr(exc)
@@ -11049,7 +11049,7 @@ async def explore_table(
     used_period = None
     period_metadata_inconsistencies = _period_metadata_inconsistencies(period_rows)
     if isinstance(period_rows, list) and period_rows:
-        latest = _pick_finest_period(period_rows)
+        latest = _pick_freshest_period(period_rows)
         used_period = str(
             latest.get("END_PRD_DE") or latest.get("endPrdDe")
             or latest.get("PRD_DE") or latest.get("prdDe") or ""

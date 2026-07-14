@@ -69,6 +69,25 @@ def _pick_finest_period(period_rows: list[dict]) -> Optional[dict]:
     return sorted(period_rows, key=rank)[0]
 
 
+def _pick_freshest_period(period_rows: list[dict]) -> Optional[dict]:
+    """Return the cadence whose recorded endpoint is actually latest."""
+    usable = [
+        row for row in period_rows
+        if row.get("END_PRD_DE") or row.get("endPrdDe")
+        or row.get("PRD_DE") or row.get("prdDe")
+    ]
+    if not usable:
+        return _pick_finest_period(period_rows)
+    return max(
+        usable,
+        key=lambda row: _period_end_sort_key(
+            row.get("END_PRD_DE") or row.get("endPrdDe")
+            or row.get("PRD_DE") or row.get("prdDe"),
+            _period_type(row),
+        ),
+    )
+
+
 def _period_type(row: Optional[dict]) -> Optional[str]:
     if not row:
         return None
@@ -124,7 +143,7 @@ def _pick_query_table_period_row(
         for row in period_rows:
             if _is_yearly_period_type(_period_type(row)):
                 return row
-    return _pick_finest_period(period_rows)
+    return _pick_freshest_period(period_rows)
 
 
 def _parse_year_token(text: str) -> Optional[str]:
