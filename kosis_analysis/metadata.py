@@ -641,10 +641,16 @@ def _normalize_query_table_rows(
             }
 
         value_info = _normalize_stat_value(row.get("DT"))
+        statistic_code = next((
+            row.get(field)
+            for field in ("STAT_ID", "STAT_CD", "STAT_CODE", "STATISTIC_CODE")
+            if row.get(field) not in (None, "")
+        ), None)
         normalized_rows.append({
             "period": row.get("PRD_DE"),
             "unit": row.get("UNIT_NM") or (dimensions.get("ITEM") or {}).get("unit"),
             "dimensions": dimensions,
+            "statistic_code": statistic_code,
             "raw": row,
             **value_info,
         })

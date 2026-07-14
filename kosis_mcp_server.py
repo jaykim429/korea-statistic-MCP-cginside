@@ -134,6 +134,21 @@ STATUS_RUNTIME_ERROR = "RUNTIME_ERROR"
 STATUS_MISSING_API_KEY = "MISSING_KEY"
 STATUS_FANOUT_LIMIT_EXCEEDED = "FANOUT_LIMIT_EXCEEDED"
 
+KOSIS_CATALOG_VIEW_CODES = {
+    "MT_ZTITLE": "국내통계 주제별",
+    "MT_OTITLE": "국내통계 기관별",
+    "MT_GTITLE01": "e-지방지표 주제별",
+    "MT_GTITLE02": "e-지방지표 지역별",
+    "MT_CHOSUN_TITLE": "광복이전통계",
+    "MT_HANKUK_TITLE": "대한민국통계연감",
+    "MT_STOP_TITLE": "작성중지통계",
+    "MT_RTITLE": "국제통계",
+    "MT_BUKHAN": "북한통계",
+    "MT_TM1_TITLE": "대상별통계",
+    "MT_TM2_TITLE": "이슈별통계",
+    "MT_ETITLE": "영문 KOSIS",
+}
+
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     try:
@@ -4931,6 +4946,146 @@ async def browse_topic(topic: Optional[str] = None) -> dict:
             for name in hints
         ],
         "안내": "확정 통계는 stat_detail로 호출 정보를 받고, 교체필요 통계는 현행 표 재검증 후 사용하며, 미검증 통계는 검색 후보를 확인하세요.",
+    }
+
+
+@mcp.tool()
+async def browse_kosis_catalog(
+    query: Optional[str] = None,
+    view_code: str = "MT_ZTITLE",
+    parent_id: str = "A",
+    limit: int = 20,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🔎] KOSIS 공식 카탈로그에서 통계 종류나 통계표를 탐색.
+
+    ``query``가 있으면 KOSIS 통합검색으로 관련 통계표 후보를 찾고,
+    없으면 ``statisticsList.do``의 목록 계층 한 단계만 조회한다.
+    전체 카탈로그를 재귀 수집하지 않으므로 분당 200건 제한 안에서 사용자가
+    선택한 폴더만 단계적으로 탐색할 수 있다.
+
+    Args:
+        query: "중소기업"처럼 찾을 통계 주제. 전체 분류를 볼 때는 생략.
+        view_code: 공식 서비스뷰 코드. 기본값은 국내통계 주제별.
+        parent_id: 조회할 공식 목록 ID. 국내통계 주제별 루트는 A.
+        limit: 한 번에 반환할 최대 폴더/통계표 수(1~50).
+    """
+    safe_limit = max(1, min(int(limit or 20), 50))
+    normalized_query = str(query or "").strip()
+    if normalized_query:
+        search = await search_kosis(
+            normalized_query,
+            limit=safe_limit,
+            use_routing=True,
+            api_key=api_key,
+        )
+        if not isinstance(search, dict):
+            return {
+                "상태": "failed",
+                "status": "invalid_search_response",
+                "오류": "KOSIS 통합검색 응답 형식이 올바르지 않습니다.",
+            }
+        if search.get("code") == STATUS_MISSING_API_KEY or search.get("코드") == STATUS_MISSING_API_KEY:
+            return search
+        candidates = search.get("결과", [])
+        return {
+            "상태": "candidate_tables" if candidates else "empty",
+            "status": "candidate_tables" if candidates else "empty",
+            "source_system": "KOSIS",
+            "provider": "statisticsSearch.do",
+            "mode": "search",
+            "입력": normalized_query,
+            "검색결과": candidates,
+            "결과수": len(candidates),
+            "사용된_검색어": search.get("사용된_검색어", []),
+            "안내": (
+                "검색 결과는 후보입니다. 번호나 통계표명을 선택한 뒤 explore_table로 "
+                "분류축·항목·기간을 확인하고 query_table로 실제 값을 조회하세요."
+            ),
+        }
+
+    normalized_view_code = str(view_code or "MT_ZTITLE").strip().upper()
+    if normalized_view_code not in KOSIS_CATALOG_VIEW_CODES:
+        return {
+            "상태": "failed",
+            "status": "invalid_view_code",
+            "오류": f'지원하지 않는 KOSIS 서비스뷰 코드 "{view_code}"',
+            "지원_서비스뷰": KOSIS_CATALOG_VIEW_CODES,
+        }
+    normalized_parent_id = str(parent_id or "A").strip() or "A"
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response(
+                "browse_kosis_catalog",
+                view_code=normalized_view_code,
+                parent_id=normalized_parent_id,
+            )
+        raise
+
+    async with httpx.AsyncClient() as client:
+        rows = await _kosis_call(client, "statisticsList.do", {
+            "method": "getList",
+            "apiKey": key,
+            "vwCd": normalized_view_code,
+            "parentId": normalized_parent_id,
+            "format": "json",
+            "jsonVD": "Y",
+        })
+
+    folders: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
+    for row in rows[:safe_limit]:
+        org_id = row.get("ORG_ID")
+        tbl_id = row.get("TBL_ID")
+        if org_id and tbl_id:
+            tables.append({
+                "통계표명": row.get("TBL_NM"),
+                "기관ID": str(org_id),
+                "통계표ID": str(tbl_id),
+                "통계조사ID": row.get("STAT_ID"),
+                "최종갱신일": row.get("SEND_DE"),
+                "추천통계표": row.get("REC_TBL_SE"),
+            })
+            continue
+        list_id = row.get("LIST_ID")
+        if list_id:
+            folders.append({
+                "목록명": row.get("LIST_NM"),
+                "목록ID": str(list_id),
+                "다음_호출": {
+                    "tool": "browse_kosis_catalog",
+                    "args": {
+                        "view_code": normalized_view_code,
+                        "parent_id": str(list_id),
+                    },
+                },
+            })
+
+    return {
+        "상태": "browsed",
+        "status": "browsed",
+        "source_system": "KOSIS",
+        "provider": "statisticsList.do",
+        "mode": "hierarchy",
+        "서비스뷰": {
+            "코드": normalized_view_code,
+            "이름": KOSIS_CATALOG_VIEW_CODES[normalized_view_code],
+        },
+        "상위목록ID": normalized_parent_id,
+        "하위목록": folders,
+        "검색결과": tables,
+        "반환수": len(folders) + len(tables),
+        "잘림": len(rows) > safe_limit,
+        "안내": (
+            "하위목록의 다음_호출로 한 단계씩 탐색하세요. 통계표를 선택하면 "
+            "explore_table로 상세·조회 방법을 확인한 뒤 query_table로 실제 값을 조회하세요."
+        ),
+        "범위_주의": (
+            "이 결과는 KOSIS 공식 카탈로그의 현재 한 계층입니다. "
+            "수작업 TOPICS 목록이나 MCP 즉시조회 42개 표의 전체 범위와 동일하지 않습니다."
+        ),
     }
 
 
