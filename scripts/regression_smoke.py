@@ -17,9 +17,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from kosis_mcp_server import (
-    answer_query, check_stat_availability, explore_table, indicator_dependency_map,
-    plan_query, query_table, quick_region_compare, quick_stat, quick_trend,
-    resolve_concepts, select_table_for_query,
+    answer_query, browse_topic, check_stat_availability, explore_table,
+    indicator_dependency_map, plan_query, query_table, quick_region_compare,
+    quick_stat, quick_trend, resolve_concepts, select_table_for_query, stat_detail,
 )
 
 
@@ -723,6 +723,35 @@ TESTS: list[dict[str, Any]] = [
             "dropped_dimensions_contains": ["age", "time_series"],
         },
     },
+    {
+        "name": "browse_topic_status_field",
+        "tool": browse_topic,
+        "args": ("금융·재정",),
+        "expect": {"success": True, "대표_통계_first_status": "미검증"},
+    },
+    {
+        "name": "browse_topic_no_topic_regression",
+        "tool": browse_topic,
+        "args": (),
+        "expect": {"success": True},
+    },
+    {
+        "name": "stat_detail_confirmed",
+        "tool": stat_detail,
+        "args": ("합계출산율",),
+        "expect": {"success": True, "확정상태": "확정", "호출_예시_tool": "quick_stat"},
+    },
+    {
+        "name": "stat_detail_unverified_fallback",
+        "tool": stat_detail,
+        "args": ("중소기업 대출잔액",),
+        "expect": {
+            "success": True,
+            "확정상태": "후보(미검증)",
+            "검색결과_len_min": 1,
+            "호출_예시_tool": "explore_table",
+        },
+    },
 ]
 
 
@@ -819,6 +848,16 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "filters": result.get("filters") or {},
         "unresolved": result.get("unresolved") or [],
         "warnings": result.get("warnings") or result.get("주의") or [],
+        "확정상태": result.get("확정상태"),
+        "검색결과_len": len(result.get("검색결과") or []),
+        "호출_예시_tool": (result.get("호출_예시") or {}).get("tool"),
+        "대표_통계_first_status": (
+            result["대표_통계"][0].get("상태")
+            if isinstance(result.get("대표_통계"), list)
+            and result["대표_통계"]
+            and isinstance(result["대표_통계"][0], dict)
+            else None
+        ),
     }
 
 
@@ -1049,6 +1088,14 @@ def check(result: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         problems.append("slot_enrichment_missing")
     if expect.get("status") == "executed" and summary["used_period"] in (None, ""):
         problems.append("missing_used_period")
+    if "확정상태" in expect and summary["확정상태"] != expect["확정상태"]:
+        problems.append(f"확정상태={summary['확정상태']}")
+    if "검색결과_len_min" in expect and summary["검색결과_len"] < expect["검색결과_len_min"]:
+        problems.append(f"검색결과_len={summary['검색결과_len']}")
+    if "호출_예시_tool" in expect and summary["호출_예시_tool"] != expect["호출_예시_tool"]:
+        problems.append(f"호출_예시_tool={summary['호출_예시_tool']}")
+    if "대표_통계_first_status" in expect and summary["대표_통계_first_status"] != expect["대표_통계_first_status"]:
+        problems.append(f"대표_통계_first_status={summary['대표_통계_first_status']}")
     return problems
 
 

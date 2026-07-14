@@ -4485,6 +4485,10 @@ async def browse_topic(topic: Optional[str] = None) -> dict:
     13개 주제: 인구·가구, 고용·노동, 물가·소비, 주거·부동산, 경제·성장,
     중소기업·소상공인, 업종·산업, 금융·재정, 복지·소득, 교육, 보건·의료,
     환경·기후, 지역.
+
+    "대표_통계" 각 항목의 "상태"가 "확정"이면 stat_detail(이름)로 바로
+    호출 정보(지원 지역/기간/호출 예시)를 받을 수 있고, "미검증"이면
+    stat_detail이 검색 후보를 찾아준다.
     """
     if not topic:
         return {
@@ -4496,8 +4500,65 @@ async def browse_topic(topic: Optional[str] = None) -> dict:
         return {"오류": f'주제 "{topic}" 없음', "가능_주제": list(TOPICS.keys())}
     return {
         "주제": topic,
-        "대표_통계": hints,
-        "안내": "각 통계명을 search_kosis 또는 quick_stat에 넘겨 호출하세요.",
+        "대표_통계": [
+            {"이름": name, "상태": "확정" if name in TIER_A_STATS else "미검증"}
+            for name in hints
+        ],
+        "안내": "상태가 확정인 통계는 stat_detail로 바로 호출 정보를 받고, 미검증인 통계도 stat_detail이 후보를 찾아줍니다.",
+    }
+
+
+@mcp.tool()
+async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
+    """[🔎] 통계 하나의 상세 정보와 실행 가능한 다음 호출 예시를 반환.
+
+    browse_topic이 알려준 통계 이름(또는 그와 비슷한 자유 검색어)을 받아,
+    바로 조회 가능한 통계면 지원 지역·기간·quick_stat 호출 예시를,
+    아직 확정 안 된 통계면 검색 후보와 explore_table 호출 예시를 반환한다.
+    이 함수는 새 조회/검색 로직을 만들지 않고 기존 TIER_A_STATS와
+    answer_query의 검색 폴백을 그대로 재사용한다.
+    """
+    try:
+        key = _resolve_key(api_key)
+    except RuntimeError as exc:
+        if _is_missing_key_error(exc):
+            return _missing_api_key_response("stat_detail", query=name)
+        raise
+
+    param = TIER_A_STATS.get(name)
+    if param and param.verification_status != "broken":
+        region_list = list(param.region_scheme.keys()) if param.region_scheme else ["전국"]
+        response: dict[str, Any] = {
+            "확정상태": "확정",
+            "통계표명": param.tbl_nm,
+            "지원_지역": region_list,
+            "지원_기간": list(param.supported_periods),
+            "호출_예시": {
+                "tool": "quick_stat",
+                "args": {"query": name, "region": region_list[0], "period": "latest"},
+            },
+        }
+        if param.verification_status != "verified":
+            response["주의"] = (
+                f"이 통계표는 검증 상태가 '{param.verification_status}'입니다 "
+                f"(사유: {param.note or '미상'})."
+            )
+        return response
+
+    engine = NaturalLanguageAnswerEngine(key)
+    fallback = await engine._answer_search_fallback(name)
+    candidates = fallback.get("검색결과") or []
+    if not candidates:
+        return {"확정상태": "실패", "오류": f'"{name}"에 대한 통계표를 찾지 못함'}
+    top = candidates[0]
+    return {
+        "확정상태": "후보(미검증)",
+        "검색결과": candidates,
+        "사용된_검색어": fallback.get("사용된_검색어", []),
+        "호출_예시": {
+            "tool": "explore_table",
+            "args": {"org_id": top.get("기관ID"), "tbl_id": top.get("통계표ID")},
+        },
     }
 
 
