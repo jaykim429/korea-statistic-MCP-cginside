@@ -4992,6 +4992,7 @@ async def browse_kosis_catalog(
         if search.get("code") == STATUS_MISSING_API_KEY or search.get("코드") == STATUS_MISSING_API_KEY:
             return search
         candidates = search.get("결과", [])
+        capability_state = "candidate_found" if candidates else "no_data"
         return {
             "상태": "candidate_tables" if candidates else "empty",
             "status": "candidate_tables" if candidates else "empty",
@@ -5002,9 +5003,15 @@ async def browse_kosis_catalog(
             "검색결과": candidates,
             "결과수": len(candidates),
             "사용된_검색어": search.get("사용된_검색어", []),
+            "capability_state": capability_state,
+            "actual_query_supported": False,
+            "direct_kosis_search": {
+                "query": normalized_query,
+                "url": "https://kosis.kr/search/search.do",
+            },
             "안내": (
-                "검색 결과는 후보입니다. 번호나 통계표명을 선택한 뒤 explore_table로 "
-                "분류축·항목·기간을 확인하고 query_table로 실제 값을 조회하세요."
+                "검색 결과는 통계표 후보일 뿐이며 실제 수치 조회 가능 여부는 아직 확인되지 않았습니다. "
+                "후보를 선택해 분류축·항목·기간을 확인한 뒤 실제 자료 행 조회를 진행하세요."
             ),
         }
 
@@ -9679,9 +9686,12 @@ async def resolve_concepts(
         if status == "partial" or unresolved or ambiguities else
         "All concepts resolved to metadata codes valid for this table."
     )
+    capability_state = "query_ready" if status == "resolved" and not ambiguities else "metadata_verified"
     return {
         "상태": status,
         "status": status,
+        "capability_state": capability_state,
+        "actual_query_supported": False,
         "verification_level": "metadata_match",
         "confidence": "medium" if status == "resolved" else "low",
         "org_id": org_id,
@@ -9693,6 +9703,10 @@ async def resolve_concepts(
         "matches_by_concept": matches_by_concept,
         "unresolved": unresolved,
         "ambiguities": ambiguities,
+        "direct_kosis_search": {
+            "query": table_name or tbl_id,
+            "url": "https://kosis.kr/search/search.do",
+        },
         "available_axes": [
             {"OBJ_ID": obj_id, "OBJ_NM": axes[obj_id].get("OBJ_NM"), "item_count": len(axes[obj_id].get("items") or {})}
             for obj_id in axis_order
@@ -10687,10 +10701,14 @@ async def query_table(
             {key: value for key, value in row.items() if key != "raw"}
             for row in normalized_rows
         ]
+    has_actual_values = any(row.get("value") is not None for row in normalized_rows)
+    query_status = "executed" if has_actual_values else "no_data"
     result = {
-        "상태": "executed",
-        "status": "executed",
-        "verification_level": "explored_raw",
+        "상태": query_status,
+        "status": query_status,
+        "capability_state": "query_executed" if has_actual_values else "no_data",
+        "actual_query_supported": has_actual_values,
+        "verification_level": "query_rows" if has_actual_values else "no_data",
         "confidence": "medium",
         "aggregation": aggregation,
         "group_by": group_by or None,
@@ -10731,6 +10749,10 @@ async def query_table(
         "row_count": len(normalized_rows),
         "missing_value_count": missing_value_count,
         "missing_value_examples": missing_value_examples,
+        "direct_kosis_search": None if has_actual_values else {
+            "query": table_name or tbl_id,
+            "url": "https://kosis.kr/search/search.do",
+        },
         "metadata_source": metadata_source,
         "수록기간": {
             "주기": latest_period.get("PRD_SE") if latest_period else None,
@@ -11159,6 +11181,10 @@ async def explore_table(
         metadata_coverage["조회_실패"] = meta_errors
 
     result: dict[str, Any] = {
+        "상태": "metadata_verified",
+        "status": "metadata_verified",
+        "capability_state": "metadata_verified",
+        "actual_query_supported": False,
         "통계표ID": tbl_id,
         "기관ID": org_id,
         "통계표명": table_name,
@@ -11171,6 +11197,11 @@ async def explore_table(
         "분류축": classifications,
         "메타_완성도": metadata_coverage,
         "출처_KOSIS_API": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD/SOURCE",
+        "direct_kosis_search": {
+            "query": table_name or tbl_id,
+            "url": "https://kosis.kr/search/search.do",
+        },
+        "안내": "메타데이터만 확인된 상태입니다. 실제 수치 조회 가능 여부는 유효한 분류코드로 자료 행을 조회해야 확정됩니다.",
     }
 
     if period_age is not None and period_age >= DATA_FRESHNESS_WARNING_YEARS:

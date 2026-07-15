@@ -39,7 +39,12 @@ def _extract_single_region_from_query(query: str) -> Optional[str]:
 
 
 def _extract_single_year_from_query(query: str) -> Optional[str]:
-    years = list(dict.fromkeys(re.findall(r"(19\d{2}|20\d{2})", str(query or ""))))
+    text = str(query or "")
+    years = list(dict.fromkeys(
+        match.group(0)
+        for match in re.finditer(r"(?:19|20)\d{2}", text)
+        if not re.match(r"\s*=\s*100\b", text[match.end():])
+    ))
     return years[0] if len(years) == 1 else None
 
 
