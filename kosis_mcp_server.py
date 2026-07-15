@@ -1139,6 +1139,53 @@ def _topic_stat_status(name: str) -> str:
     return "교체필요" if param.replacement_status == "deprecated" else "확정"
 
 
+def _catalog_candidate_with_query_status(candidate: dict[str, Any]) -> dict[str, Any]:
+    """카탈로그 후보가 실제 값 조회 전임을 후보 행마다 명시한다."""
+    org_id = str(candidate.get("기관ID") or candidate.get("ORG_ID") or "").strip()
+    tbl_id = str(candidate.get("통계표ID") or candidate.get("TBL_ID") or "").strip()
+    mappings = [
+        param
+        for param in TIER_A_STATS.values()
+        if param.table_identity == (org_id, tbl_id)
+    ]
+    current = [param for param in mappings if param.replacement_status != "deprecated"]
+
+    if any(param.verification_status == "verified" for param in current):
+        query_status = {
+            "상태코드": "mapped_for_direct_query",
+            "표시": "MCP 기본조건 즉시조회 대상",
+            "실제값_조회확인": False,
+            "KOSIS_직접확인_필요": False,
+            "안내": "검증된 직접 매핑이 있지만 지역·기간 조건에 따라 실패할 수 있으며, 실제 값은 별도 조회 후 확정됩니다.",
+        }
+    elif current:
+        query_status = {
+            "상태코드": "mapped_needs_verification",
+            "표시": "MCP 매핑 미검증 · 상세 확인 필요",
+            "실제값_조회확인": False,
+            "KOSIS_직접확인_필요": True,
+            "안내": "MCP 매핑은 있으나 검증 완료 상태가 아닙니다. 상세·분류축 확인 후 실제 행을 조회하세요.",
+        }
+    elif mappings:
+        query_status = {
+            "상태코드": "blocked_deprecated_mapping",
+            "표시": "MCP 직접조회 차단 · KOSIS 현행표 확인",
+            "실제값_조회확인": False,
+            "KOSIS_직접확인_필요": True,
+            "안내": "MCP에 등록된 기존 매핑이 폐기되어 직접 조회할 수 없습니다. KOSIS에서 현행 통계표를 확인하세요.",
+        }
+    else:
+        query_status = {
+            "상태코드": "needs_metadata_verification",
+            "표시": "MCP 실제조회 미확인 · 상세 확인 필요",
+            "실제값_조회확인": False,
+            "KOSIS_직접확인_필요": True,
+            "안내": "KOSIS 검색 후보일 뿐입니다. 상세·분류축을 검증하고 실제 자료 행이 반환돼야 MCP 조회 가능으로 확정됩니다.",
+        }
+
+    return {**candidate, "MCP_조회판정": query_status}
+
+
 async def _resolve_region_dynamically(
     org_id: str,
     tbl_id: str,
@@ -4991,7 +5038,11 @@ async def browse_kosis_catalog(
             }
         if search.get("code") == STATUS_MISSING_API_KEY or search.get("코드") == STATUS_MISSING_API_KEY:
             return search
-        candidates = search.get("결과", [])
+        candidates = [
+            _catalog_candidate_with_query_status(candidate)
+            for candidate in search.get("결과", [])
+            if isinstance(candidate, dict)
+        ]
         capability_state = "candidate_found" if candidates else "no_data"
         return {
             "상태": "candidate_tables" if candidates else "empty",
@@ -5051,14 +5102,14 @@ async def browse_kosis_catalog(
         org_id = row.get("ORG_ID")
         tbl_id = row.get("TBL_ID")
         if org_id and tbl_id:
-            tables.append({
+            tables.append(_catalog_candidate_with_query_status({
                 "통계표명": row.get("TBL_NM"),
                 "기관ID": str(org_id),
                 "통계표ID": str(tbl_id),
                 "통계조사ID": row.get("STAT_ID"),
                 "최종갱신일": row.get("SEND_DE"),
                 "추천통계표": row.get("REC_TBL_SE"),
-            })
+            }))
             continue
         list_id = row.get("LIST_ID")
         if list_id:
@@ -7099,7 +7150,7 @@ async def _search_kosis_keywords(
             query,
             str(record.get("통계표명") or ""),
         )
-        result_rows.append(record)
+        result_rows.append(_catalog_candidate_with_query_status(record))
     result_rows = _sort_search_candidates(query, result_rows)
     quality_summary = _search_quality_summary(query, result_rows)
     if result_rows and quality_summary["full_query_match_count"] == 0:
