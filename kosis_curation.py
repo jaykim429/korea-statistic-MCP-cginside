@@ -2403,6 +2403,14 @@ class NaturalLanguageRouter:
     def normalize(text: str) -> str:
         return _norm_key(text)
 
+    @staticmethod
+    def _matches_indicator_term(query: str, query_norm: str, term: str) -> bool:
+        """짧은 영문 약어가 다른 단어 내부에서 오인되지 않도록 한다."""
+        normalized_term = _norm_key(term)
+        if normalized_term == "rd":
+            return re.search(r"(?<![a-z0-9])rd(?![a-z0-9])", query.lower()) is not None
+        return normalized_term in query_norm
+
     def _build_concepts(self) -> dict[str, Concept]:
         concepts: dict[str, Concept] = {}
 
@@ -2444,6 +2452,10 @@ class NaturalLanguageRouter:
     def _contains_concept(self, query: str, query_norm: str, concept: Concept) -> bool:
         for alias in concept.aliases:
             alias_norm = self.normalize(alias)
+            if alias_norm == "rd":
+                if re.search(r"(?<![a-z0-9])rd(?![a-z0-9])", query.lower()):
+                    return True
+                continue
             if alias in query or alias_norm in query_norm:
                 return True
         return False
@@ -2658,7 +2670,7 @@ class NaturalLanguageRouter:
         indicator_matches = [
             (key, value)
             for key, value in _INDICATOR_TERMS.items()
-            if self.normalize(key) in q_norm
+            if self._matches_indicator_term(q, q_norm, key)
         ]
         if indicator_matches:
             indicator_matches = sorted(
@@ -2944,7 +2956,11 @@ class NaturalLanguageRouter:
             *(parsed.specific_keys),
             *(parsed.generic_keys),
             *(label for term, label in _TARGET_TERMS.items() if term in q_norm),
-            *(label for term, label in _INDICATOR_TERMS.items() if term in q_norm),
+            *(
+                label
+                for term, label in _INDICATOR_TERMS.items()
+                if self._matches_indicator_term(query, q_norm, term)
+            ),
             *([slots.target] if slots.target else []),
             *([slots.indicator] if slots.indicator else []),
         ])

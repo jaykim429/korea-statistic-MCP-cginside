@@ -25,7 +25,6 @@ CASES: list[dict[str, Any]] = [
         "query": "서울 1인당 GRDP",
         "metrics": ["GRDP"],
         "must_not_metrics": ["R&D 투자 규모"],
-        "quarantined_metrics": ["R&D 투자 규모"],
     },
     {
         "name": "composite_query_preserves_all_metrics",
@@ -39,7 +38,6 @@ CASES: list[dict[str, Any]] = [
         "rank_orders": ["desc", "asc"],
         "rank_limit": 3,
         "must_not_metrics": ["R&D 투자 규모"],
-        "quarantined_metrics": ["R&D 투자 규모"],
     },
     {
         "name": "year_range_parsing",
@@ -245,7 +243,6 @@ CASES: list[dict[str, Any]] = [
         "query": "최근 5년간 서울 GRDP 추이",
         "metrics": ["GRDP"],
         "must_not_metrics": ["R&D 투자 규모"],
-        "quarantined_metrics": ["R&D 투자 규모"],
         "time_type": "relative_period",
         "table_required_dimensions": ["region", "time"],
         "must_not_table_required_dimensions": ["year"],
@@ -269,7 +266,6 @@ CASES: list[dict[str, Any]] = [
         "rank_limit": 3,
         "calculations": ["per_capita"],
         "must_not_metrics": ["R&D 투자 규모"],
-        "quarantined_metrics": ["R&D 투자 규모"],
     },
     {
         "name": "preserve_unmapped_industry_phrase",
