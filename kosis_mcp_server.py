@@ -4629,6 +4629,9 @@ async def _quick_trend_core(
         raise
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
+    query_region = _extract_single_region_from_query(query)
+    if region == "전국" and query_region:
+        region = query_region
     canonical = _canonical_region(region) or region
 
     region_code = None
@@ -4696,6 +4699,7 @@ async def _quick_trend_core(
         "통계명": param.description, "지역": region, "단위": param.unit,
         "시계열": series,
         "데이터수": len(data), "통계표": param.tbl_nm,
+        "org_id": param.org_id, "tbl_id": param.tbl_id,
         "used_period": used_period,
         "period_age_years": age,
         "수록주기": period_type,
@@ -5810,6 +5814,29 @@ async def detect_outliers(
 
 # ---- L3: Viz Layer ----
 
+def _chart_query_failure_payload(
+    query: str,
+    requested_region: str,
+    result: dict[str, Any],
+    *,
+    state: str = "unsupported",
+) -> dict[str, Any]:
+    return {
+        "상태": "failed",
+        "status": state,
+        "capability_state": state,
+        "actual_query_supported": False,
+        "query": query,
+        "requested_region": requested_region,
+        "reason_code": result.get("코드") or result.get("code") or "QUERY_FAILED",
+        "error": result.get("오류") or result.get("error") or "통계 자료를 조회하지 못했습니다.",
+        "direct_kosis_search": {
+            "query": query,
+            "url": "https://kosis.kr/search/search.do",
+        },
+        "user_guidance": "이 조건은 실제 자료 행이 확인되지 않았습니다. KOSIS 통합검색에서 통계표와 지역 지원 범위를 직접 확인해 주세요.",
+    }
+
 @mcp.tool()
 async def chart_line(
     query: str, region: str = "전국", years: int = 10,
@@ -5820,6 +5847,10 @@ async def chart_line(
     end_year: Optional[str] = None,
 ) -> list:
     """[🎨] 시계열 라인 차트 SVG (챗봇에 인라인 렌더링)."""
+    query_region = _extract_single_region_from_query(query)
+    requested_region = query_region or region
+    if region == "전국" and query_region:
+        region = query_region
     _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
     if period_error:
         return [TextContent(type="text", text=str(period_error))]
@@ -5840,14 +5871,23 @@ async def chart_line(
             source=" · ".join(materials.get("source_systems") or ["input_rows"]),
             note=f"returned rows: {materials.get('numeric_row_count')}",
         )
-        return [
-            _svg_to_image(svg),
-            TextContent(type="text", text=str({
-                "status": "executed",
-                "source": "input_rows",
-                "input_row_profile": materials,
-            })),
-        ]
+        return [TextContent(type="text", text=json.dumps({
+            "상태": "executed",
+            "status": "executed",
+            "capability_state": "query_executed",
+            "actual_query_supported": True,
+            "verification_level": "provided_rows",
+            "query": query,
+            "requested_region": requested_region,
+            "used_region": region,
+            "unit": materials.get("unit") or "",
+            "period_range": [times[0], times[-1]],
+            "rows": input_rows,
+            "row_count": len(input_rows),
+            "source": "input_rows",
+            "svg": svg,
+            "text_summary": f"{region}, {times[0]}~{times[-1]}, {len(times)}개 시점의 실제 제공 행으로 생성했습니다.",
+        }, ensure_ascii=False))]
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return [TextContent(type="text", text=str(_unsupported_source_response("chart_line", query, resolved_source)))]
@@ -5860,21 +5900,43 @@ async def chart_line(
         end_year=end_year,
     )
     if "오류" in s:
-        return [TextContent(type="text", text=str(s))]
+        return [TextContent(type="text", text=json.dumps(
+            _chart_query_failure_payload(query, requested_region, s),
+            ensure_ascii=False,
+        ))]
     times, values = _values_from_series(s["시계열"])
     if not times:
-        return [TextContent(type="text", text="데이터 없음")]
+        return [TextContent(type="text", text=json.dumps(
+            _chart_query_failure_payload(query, requested_region, s, state="no_data"),
+            ensure_ascii=False,
+        ))]
     svg = _chart_line_svg(
         list(zip(times, values)),
-        title=f"{s.get('통계명')} ({region})",
+        title=f"{s.get('통계명')} ({s.get('지역')})",
         ylabel=s.get("단위", ""),
         source=f"KOSIS · {s.get('통계표')}",
         note=f"최근: {times[-1]}",
     )
-    return [
-        _svg_to_image(svg),
-        TextContent(type="text", text=f"{s.get('통계명')} 시계열 — {region}, {times[0]}~{times[-1]}, {len(times)}개 시점"),
-    ]
+    return [TextContent(type="text", text=json.dumps({
+        "상태": "executed",
+        "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
+        "query": query,
+        "requested_region": requested_region,
+        "used_region": s.get("지역"),
+        "org_id": s.get("org_id"),
+        "tbl_id": s.get("tbl_id"),
+        "table_name": s.get("통계표"),
+        "unit": s.get("단위", ""),
+        "period_range": [times[0], times[-1]],
+        "rows": s.get("시계열", []),
+        "row_count": len(times),
+        "source": f"KOSIS · {s.get('통계표')}",
+        "svg": svg,
+        "text_summary": f"{s.get('지역')}, {times[0]}~{times[-1]}, {len(times)}개 실제 조회 시점으로 생성했습니다.",
+    }, ensure_ascii=False))]
 
 
 @mcp.tool()
