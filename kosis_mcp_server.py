@@ -5651,14 +5651,28 @@ async def analyze_trend(
             start_year=start_year,
             end_year=end_year,
         )
-    if "오류" in series_result:
+    series_status = str(series_result.get("status") or series_result.get("상태") or "").lower()
+    if (
+        "오류" in series_result
+        or series_result.get("actual_value_retrieved") is False
+        or series_result.get("actual_query_supported") is False
+        or series_status in {"unsupported", "failed", "no_data"}
+    ):
         return series_result
     times, values = _values_from_series(series_result.get("시계열", []))
     if input_rows is not None:
         times = row_materials["times"]
         values = row_materials["values"]
     if len(values) < 3:
-        return {"오류": "분석에 충분한 데이터 없음 (3개 미만)"}
+        return {
+            "상태": "failed",
+            "status": "insufficient_data",
+            "코드": "INSUFFICIENT_DATA",
+            "actual_query_supported": True,
+            "actual_value_retrieved": bool(values),
+            "오류": "분석에 충분한 데이터 없음 (3개 미만)",
+            "data_point_count": len(values),
+        }
 
     x = np.arange(len(values))
     y = np.array(values)
