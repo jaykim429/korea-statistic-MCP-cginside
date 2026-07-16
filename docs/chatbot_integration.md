@@ -120,6 +120,9 @@ Gemma는 `answer`가 `null`인 계획 응답을 사용자에게 최종 답처럼
 
 - `status: "needs_clarification"`
 - `status: "unsupported"`
+- `status: "failed"`와 `capability_state: "service_unavailable"`: 통계 부재가 아니라
+  KOSIS 연결·호출 장애입니다. 잠시 후 재시도하거나 KOSIS 통합검색을 안내합니다.
+- `actual_query_supported: false`: 탐색·매핑·메타 확인 단계이거나 실제값 조회 실패입니다.
 - `validation_errors`
 - `missing_metrics`
 - `quarantined_metrics`

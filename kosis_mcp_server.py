@@ -306,6 +306,15 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
         or bool(result.get("semantic_rewrite"))
         or has_candidate_only_payload
     )
+    actual_evidence = any(result.get(key) not in (None, "", [], {}) for key in ("값", "value", "시계열", "표", "rows", "data"))
+    if final_answer_expected and actual_evidence:
+        result.setdefault("상태", "executed")
+        result["status"] = "executed"
+        result["capability_state"] = "query_executed"
+        result["actual_query_supported"] = True
+        result.setdefault("verification_level", "query_value")
+    else:
+        result.setdefault("actual_query_supported", False)
     result["mcp_output_contract"] = _mcp_tool_output_contract(
         role="shortcut_tool",
         final_answer_expected=final_answer_expected,
@@ -383,8 +392,13 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
     diagnostics = {k: v for k, v in diagnostics.items() if v not in (None, "", [], {})}
 
     compact = {
-        "status": payload.get("상태") or payload.get("execution_status") or payload.get("status") or "unknown",
+        # Machine status carries fulfillment checks (for example partial when an
+        # age dimension was dropped) and must win over the legacy Korean status.
+        "status": payload.get("status") or payload.get("execution_status") or payload.get("상태") or "unknown",
         "code": payload.get("code") or payload.get("코드"),
+        "capability_state": payload.get("capability_state"),
+        "actual_query_supported": payload.get("actual_query_supported"),
+        "verification_level": payload.get("verification_level"),
         "answer_type": metadata.get("answer_type"),
         "answer": payload.get("answer") or payload.get("답변"),
         "error": payload.get("error") or payload.get("오류"),
@@ -3786,23 +3800,40 @@ class NaturalLanguageAnswerEngine:
             for term in (route.get("search_terms") or [])
             if str(term).strip()
         ]
-        search_keywords: list[str] = []
+        # 라우팅 확장어가 있어도 사용자의 원문을 첫 검색어로 보존한다.
+        search_keywords: list[str] = [query]
+        if enriched_query != query:
+            search_keywords.append(enriched_query)
         for term in route_terms:
             missing_slot_terms = [slot_term for slot_term in slot_terms if slot_term not in term]
             if missing_slot_terms:
                 search_keywords.append((" ".join([*missing_slot_terms, term])).strip())
             search_keywords.append(term)
-        if not search_keywords:
-            search_keywords.append(enriched_query)
-
         deduped_keywords = list(dict.fromkeys(search_keywords))[:6]
         search = await _search_kosis_keywords(
-            enriched_query,
+            query,
             deduped_keywords,
             8,
             self.api_key,
             used_routing=bool(route_terms),
         )
+        if search.get("status") == "failed":
+            return {
+                "상태": "failed",
+                "status": "failed",
+                "코드": search.get("code") or "KOSIS_SEARCH_UNAVAILABLE",
+                "code": search.get("code") or "KOSIS_SEARCH_UNAVAILABLE",
+                "오류": search.get("error") or "KOSIS 검색 서비스를 사용할 수 없습니다.",
+                "error": search.get("error") or "KOSIS 검색 서비스를 사용할 수 없습니다.",
+                "질문": query,
+                "사용된_검색어": search.get("사용된_검색어", deduped_keywords),
+                "capability_state": "service_unavailable",
+                "actual_query_supported": False,
+                "direct_kosis_search": {
+                    "query": query,
+                    "url": "https://kosis.kr/search/search.do",
+                },
+            }
         slot_enrichment = None
         if slot_terms or route_terms:
             slot_enrichment = {
@@ -4355,7 +4386,12 @@ class NaturalLanguageAnswerEngine:
             result["answer"] = cls._polish_answer_text(result["answer"])
 
         if result.get("상태") != "executed":
+            result.setdefault("actual_query_supported", False)
             return result
+        result["status"] = "executed"
+        result["capability_state"] = "query_executed"
+        result["actual_query_supported"] = True
+        result.setdefault("verification_level", "query_value")
         used = result.get("used_period") or cls._extract_used_period(result)
         notes = list(result.get("검증_주의") or [])
         if used:
@@ -5281,6 +5317,19 @@ async def browse_kosis_catalog(
             }
         if search.get("code") == STATUS_MISSING_API_KEY or search.get("코드") == STATUS_MISSING_API_KEY:
             return search
+        if search.get("status") == "failed" or search.get("상태") == "failed":
+            return {
+                **search,
+                "provider": "statisticsSearch.do",
+                "mode": "search",
+                "입력": normalized_query,
+                "capability_state": "service_unavailable",
+                "actual_query_supported": False,
+                "direct_kosis_search": search.get("direct_kosis_search") or {
+                    "query": normalized_query,
+                    "url": "https://kosis.kr/search/search.do",
+                },
+            }
         candidates = [
             _catalog_candidate_with_query_status(candidate)
             for candidate in search.get("결과", [])
@@ -5408,6 +5457,10 @@ async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
     if param and param.replacement_status == "deprecated":
         return {
             "확정상태": "교체필요",
+            "status": "blocked_deprecated_mapping",
+            "capability_state": "unsupported",
+            "actual_query_supported": False,
+            "verification_level": "mapping_only",
             "통계표명": param.tbl_nm,
             "기관ID": param.org_id,
             "통계표ID": param.tbl_id,
@@ -5415,11 +5468,16 @@ async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
             "마지막검증일": param.verified_at,
             "주의": param.note,
             "권고": "search_kosis와 explore_table로 현행 후보를 검증한 뒤 카탈로그를 교체하세요.",
+            "direct_kosis_search": {"query": name, "url": "https://kosis.kr/search/search.do"},
         }
-    if param and param.verification_status != "broken":
+    if param and param.verification_status == "verified":
         region_list = list(param.region_scheme.keys()) if param.region_scheme else ["전국"]
         response: dict[str, Any] = {
-            "확정상태": "확정",
+            "확정상태": "매핑확정(실조회미확인)",
+            "status": "mapping_verified",
+            "capability_state": "mapping_verified",
+            "actual_query_supported": False,
+            "verification_level": "mapping_only",
             "통계표명": param.tbl_nm,
             "기관ID": param.org_id,
             "통계표ID": param.tbl_id,
@@ -5429,13 +5487,23 @@ async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
                 "tool": "quick_stat",
                 "args": {"query": name, "region": region_list[0], "period": "latest"},
             },
+            "안내": "통계표 매핑만 검증되었습니다. quick_stat을 실제 호출해 값·단위·시점·출처가 반환된 뒤에만 조회 가능으로 확정하세요.",
         }
-        if param.verification_status != "verified":
-            response["주의"] = (
-                f"이 통계표는 검증 상태가 '{param.verification_status}'입니다 "
-                f"(사유: {param.note or '미상'})."
-            )
         return response
+    if param:
+        return {
+            "확정상태": "매핑미검증",
+            "status": "mapping_unverified",
+            "capability_state": "unsupported",
+            "actual_query_supported": False,
+            "verification_level": "mapping_only",
+            "통계표명": param.tbl_nm,
+            "기관ID": param.org_id,
+            "통계표ID": param.tbl_id,
+            "주의": f"검증 상태가 '{param.verification_status}'이므로 실제 조회 가능으로 안내할 수 없습니다. {param.note or ''}".strip(),
+            "호출_예시": {"tool": "browse_kosis_catalog", "args": {"query": name}},
+            "direct_kosis_search": {"query": name, "url": "https://kosis.kr/search/search.do"},
+        }
 
     try:
         key = _resolve_key(api_key)
@@ -5446,6 +5514,19 @@ async def stat_detail(name: str, api_key: Optional[str] = None) -> dict:
 
     engine = NaturalLanguageAnswerEngine(key)
     fallback = await engine._answer_search_fallback(name)
+    if fallback.get("status") == "failed" or fallback.get("상태") == "failed":
+        return {
+            "확정상태": "조회불가(서비스장애)",
+            "status": "failed",
+            "code": fallback.get("code") or fallback.get("코드") or "KOSIS_SEARCH_UNAVAILABLE",
+            "error": fallback.get("error") or fallback.get("오류") or "KOSIS 검색 서비스를 사용할 수 없습니다.",
+            "capability_state": "service_unavailable",
+            "actual_query_supported": False,
+            "direct_kosis_search": fallback.get("direct_kosis_search") or {
+                "query": name,
+                "url": "https://kosis.kr/search/search.do",
+            },
+        }
     candidates = fallback.get("검색결과") or []
     if not candidates:
         return {"확정상태": "실패", "오류": f'"{name}"에 대한 통계표를 찾지 못함'}
@@ -7625,6 +7706,8 @@ async def _search_kosis_keywords(
 
     async with httpx.AsyncClient() as client:
         all_results = []
+        successful_calls = 0
+        failures: list[str] = []
         for kw in keywords:
             try:
                 r = await _kosis_call(client, "statisticsSearch.do", {
@@ -7634,8 +7717,29 @@ async def _search_kosis_keywords(
                 for item in r:
                     item["_검색어"] = kw
                 all_results.extend(r)
-            except RuntimeError:
+                successful_calls += 1
+            except RuntimeError as exc:
+                failures.append(type(exc).__name__)
                 continue
+
+    if failures and successful_calls == 0:
+        failure_types = list(dict.fromkeys(failures))
+        return {
+            "상태": "failed",
+            "status": "failed",
+            "코드": "KOSIS_SEARCH_UNAVAILABLE",
+            "code": "KOSIS_SEARCH_UNAVAILABLE",
+            "오류": "KOSIS 검색 서비스 호출이 모두 실패했습니다. 통계가 없다는 뜻이 아닙니다.",
+            "error": "KOSIS search service unavailable",
+            "capability_state": "service_unavailable",
+            "actual_query_supported": False,
+            "입력": query,
+            "사용된_검색어": keywords,
+            "실패호출수": len(failures),
+            "실패유형": failure_types,
+            "결과": [],
+            "direct_kosis_search": {"query": query, "url": "https://kosis.kr/search/search.do"},
+        }
 
     # 중복 제거
     seen = set()
@@ -7676,6 +7780,8 @@ async def _search_kosis_keywords(
         search_markers.append("search_empty")
     if used_routing:
         search_markers.append("routing_expanded")
+    if failures:
+        search_markers.append("partial_transport_failure")
     if tier_a_hint is not None:
         search_markers.append("tier_a_available")
     search_explanation = (
@@ -7716,6 +7822,8 @@ async def _search_kosis_keywords(
         "original_query_preserved": bool(keywords and keywords[0] == query),
         "결과수": len(unique),
         "result_count": len(unique),
+        "partial_failure_count": len(failures),
+        "partial_failure_types": list(dict.fromkeys(failures)),
         "Tier_A_직접_매핑": tier_a_hint,
         "결과": result_rows,
         "deprecated_aliases": {"results": "Use 결과; duplicate results payload is omitted by default."},
