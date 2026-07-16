@@ -833,7 +833,7 @@ NABO 원자료는 같은 `ITEM.label`이 여러 코드에서 반복될 수 있�
 
 `decode_error`는 비공식 코드뿐 아니라 KOSIS 공식 코드 `42` ("사용자별 이용 제한")을 인식하도록 확장되었습니다.
 
-차트 도구(`chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`)는 SVG를 fenced ``` ```svg ``` ``` 블록에 담은 `TextContent`로 반환합니다 — MCP 표준이 `image/svg+xml` ImageContent를 받지 않아 발생하던 콘텐츠 포맷 오류를 회피.
+차트 도구(`chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`, `chart_distribution`, `chart_dual_axis`, `chart_dashboard`)는 실제 조회 `rows`, `row_count`, 요청·사용 지역, 검증 상태와 raw `svg`를 하나의 구조화 응답으로 반환합니다. 호출자는 `capability_state="query_executed"`, `actual_query_supported=true`, 행·지역 일치를 검증한 뒤에만 SVG를 표시해야 합니다.
 
 `answer` 자연어 텍스트는 다음 후처리를 거칩니다:
 

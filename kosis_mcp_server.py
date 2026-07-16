@@ -6138,6 +6138,11 @@ def _chart_query_failure_payload(
         "user_guidance": "이 조건은 실제 자료 행이 확인되지 않았습니다. KOSIS 통합검색에서 통계표와 지역 지원 범위를 직접 확인해 주세요.",
     }
 
+
+def _chart_json_response(payload: dict[str, Any]) -> list:
+    """Return one parseable text payload so the chatbot can verify rows before rendering SVG."""
+    return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
 @mcp.tool()
 async def chart_line(
     query: str, region: str = "전국", years: int = 10,
@@ -6254,23 +6259,65 @@ async def chart_compare_regions(
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return [TextContent(type="text", text=str(_unsupported_source_response("chart_compare_regions", query, resolved_source)))]
-    items = []
-    for r in regions:
+    requested_regions = list(dict.fromkeys(str(region).strip() for region in regions if str(region).strip()))
+    items: list[tuple[str, float]] = []
+    rows: list[dict[str, Any]] = []
+    missing_regions: list[str] = []
+    for r in requested_regions:
         stat = await quick_stat(query, r, period, api_key)
         if "값" in stat:
             try:
-                items.append((r, float(stat["값"])))
+                value = float(stat["값"])
+                used_region = str(stat.get("지역") or r)
+                items.append((used_region, value))
+                rows.append({
+                    "region": used_region,
+                    "period": str(stat.get("used_period") or stat.get("시점") or period),
+                    "value": value,
+                    "unit": stat.get("단위"),
+                    "table_name": stat.get("통계표"),
+                    "source": stat.get("출처") or "통계청 KOSIS",
+                })
             except (ValueError, TypeError):
-                continue
+                missing_regions.append(r)
+        else:
+            missing_regions.append(r)
 
-    if not items:
-        return [TextContent(type="text", text="비교 가능한 데이터 없음")]
+    used_regions = [row["region"] for row in rows]
+    if not requested_regions or missing_regions or used_regions != requested_regions:
+        return _chart_json_response({
+            "상태": "failed",
+            "status": "partial_data" if rows else "no_data",
+            "capability_state": "partial_data" if rows else "no_data",
+            "actual_query_supported": False,
+            "query": query,
+            "requested_regions": requested_regions,
+            "used_regions": used_regions,
+            "missing_regions": missing_regions,
+            "rows": rows,
+            "row_count": len(rows),
+            "error": "요청한 모든 지역의 실제 값을 확인하지 못해 비교 차트를 생성하지 않았습니다.",
+        })
 
     svg = _chart_bar_svg(items, title=f"{query} — 지역 비교", source="KOSIS")
-    return [
-        _svg_to_image(svg),
-        TextContent(type="text", text=f"{query} 지역 비교 ({len(items)}개 지역)"),
-    ]
+    return _chart_json_response({
+        "상태": "executed",
+        "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
+        "chart_type": "compare_regions",
+        "query": query,
+        "requested_regions": requested_regions,
+        "used_regions": used_regions,
+        "period_range": list(dict.fromkeys(row["period"] for row in rows)),
+        "unit": rows[0].get("unit"),
+        "rows": rows,
+        "row_count": len(rows),
+        "source": "통계청 KOSIS",
+        "svg": svg,
+        "text_summary": f"{query} 지역 비교를 {len(rows)}개 지역의 실제 조회 행으로 생성했습니다.",
+    })
 
 
 @mcp.tool()
@@ -6300,12 +6347,26 @@ async def chart_correlation(
         end_year=end_year,
     )
     if "오류" in corr:
-        return [TextContent(type="text", text=str(corr))]
+        return _chart_json_response(_chart_query_failure_payload(f"{query_a} {query_b}", region, corr))
     aligned = corr.get("정합데이터", [])
     if len(aligned) < 3:
-        return [TextContent(type="text", text="데이터 부족")]
+        return _chart_json_response({
+            "status": "no_data",
+            "capability_state": "no_data",
+            "actual_query_supported": False,
+            "query_a": query_a,
+            "query_b": query_b,
+            "requested_region": region,
+            "rows": [],
+            "error": "산점도 생성에 필요한 공통 시점 데이터가 부족합니다.",
+        })
 
     points = [(p[1], p[2]) for p in aligned]
+    rows = [
+        {"period": str(point[0]), "value_a": point[1], "value_b": point[2]}
+        for point in aligned
+        if isinstance(point, (list, tuple)) and len(point) >= 3
+    ]
     pearson = (corr.get("correlations") or {}).get("pearson") or {}
     if not pearson and isinstance(corr.get("Pearson"), dict):
         pearson = {
@@ -6323,10 +6384,53 @@ async def chart_correlation(
         f"Pearson r={r_value}, "
         f"p={pearson.get('p_value')}"
     )
-    return [_svg_to_image(svg), TextContent(type="text", text=summary)]
+    used_region = str(corr.get("지역") or region)
+    return _chart_json_response({
+        "상태": "executed",
+        "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
+        "chart_type": "correlation",
+        "query_a": query_a,
+        "query_b": query_b,
+        "requested_region": region,
+        "used_region": used_region,
+        "period_range": [rows[0]["period"], rows[-1]["period"]],
+        "rows": rows,
+        "row_count": len(rows),
+        "source": "통계청 KOSIS",
+        "svg": svg,
+        "text_summary": summary,
+        "correlations": corr.get("correlations"),
+    })
 
 
 # ---- Phase 2: 추가 차트 4종 ----
+
+def _resolve_heatmap_region_scope(
+    query: str,
+    regions: Optional[list[str]],
+    available_regions: list[str],
+) -> tuple[list[str], list[str]]:
+    requested_scope = [str(region).strip() for region in (regions or []) if str(region).strip()]
+    if not requested_scope:
+        requested_scope = NaturalLanguageAnswerEngine._extract_composite_regions(query)
+    if not requested_scope:
+        compact_query = re.sub(r"\s+", "", str(query))
+        requested_scope = [region for region in available_regions if region in compact_query]
+
+    if not requested_scope:
+        return ["전체 시도"], available_regions
+
+    expanded_regions: list[str] = []
+    for scope in requested_scope:
+        canonical = _canonical_region(scope) or scope
+        components = REGION_COMPOSITES.get(canonical, [canonical])
+        for component in components:
+            if component not in expanded_regions:
+                expanded_regions.append(component)
+    return requested_scope, expanded_regions
 
 @mcp.tool()
 async def chart_heatmap(
@@ -6359,9 +6463,12 @@ async def chart_heatmap(
     if not param.region_scheme:
         return [TextContent(type="text", text=f'"{query}"는 지역 분류가 없어 히트맵 불가.')]
 
-    # 기본 지역 = 전체 시도 (전국 제외)
-    if regions is None:
-        regions = [r for r in param.region_scheme.keys() if r != "전국"]
+    available_regions = [r for r in param.region_scheme.keys() if r != "전국"]
+    requested_region_scope, regions = _resolve_heatmap_region_scope(
+        query,
+        regions,
+        available_regions,
+    )
 
     # 각 지역의 시계열 수집
     all_years: set[str] = set()
@@ -6387,14 +6494,21 @@ async def chart_heatmap(
         all_years.update(times)
 
     if not region_data or not all_years:
-        return [TextContent(type="text", text=json.dumps({
+        return _chart_json_response({
             "상태": "failed",
+            "status": "no_data",
+            "capability_state": "no_data",
+            "actual_query_supported": False,
             "코드": "HEATMAP_NO_REGION_DATA",
             "오류": "히트맵 생성에 충분한 데이터 없음",
             "요청_지역수": len(regions),
+            "requested_region_scope": requested_region_scope,
+            "requested_regions": regions,
+            "used_regions": [],
+            "rows": [],
             "포함_지역": [],
             "누락_지역": missing_regions,
-        }, ensure_ascii=False))]
+        })
 
     sorted_years = sorted(all_years)
     missing_periods: list[dict[str, Any]] = []
@@ -6411,27 +6525,74 @@ async def chart_heatmap(
             matrix.append(row)
             valid_rows.append(r)
 
+    rows = [
+        {
+            "region": region_name,
+            "period": period,
+            "value": value,
+            "unit": param.unit,
+            "table_name": param.tbl_nm,
+            "source": "통계청 KOSIS",
+        }
+        for region_name in valid_rows
+        for period, value in region_data[region_name].items()
+    ]
+
+    if missing_regions or missing_periods or valid_rows != regions:
+        return _chart_json_response({
+            "상태": "partial",
+            "status": "partial_data",
+            "capability_state": "partial_data",
+            "actual_query_supported": False,
+            "chart_type": "heatmap",
+            "query": query,
+            "requested_region_scope": requested_region_scope,
+            "requested_regions": regions,
+            "used_regions": valid_rows,
+            "period_range": sorted_years,
+            "rows": rows,
+            "row_count": len(rows),
+            "요청_지역수": len(regions),
+            "포함_지역": valid_rows,
+            "누락_지역": missing_regions,
+            "누락_시점": missing_periods,
+            "시점": sorted_years,
+            "error": "요청한 지역·시점의 실제 행이 일부 누락되어 히트맵을 표시하지 않았습니다.",
+        })
+
     svg = chart_heatmap_svg(
         matrix, valid_rows, sorted_years,
         title=f"{param.description} — 지역 × 시점",
         source=f"KOSIS · {param.tbl_nm}",
         unit=param.unit,
     )
-    return [
-        _svg_to_image(svg),
-        TextContent(
-            type="text",
-            text=json.dumps({
-                "상태": "partial" if missing_regions or missing_periods else "success",
-                "요약": f"{param.description} 히트맵 — {len(valid_rows)}개 지역 × {len(sorted_years)}개 시점",
-                "요청_지역수": len(regions),
-                "포함_지역": valid_rows,
-                "누락_지역": missing_regions,
-                "누락_시점": missing_periods,
-                "시점": sorted_years,
-            }, ensure_ascii=False),
-        ),
-    ]
+    return _chart_json_response({
+        "상태": "executed",
+        "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
+        "chart_type": "heatmap",
+        "query": query,
+        "requested_region_scope": requested_region_scope,
+        "requested_regions": regions,
+        "used_regions": valid_rows,
+        "org_id": param.org_id,
+        "tbl_id": param.tbl_id,
+        "table_name": param.tbl_nm,
+        "unit": param.unit,
+        "period_range": sorted_years,
+        "rows": rows,
+        "row_count": len(rows),
+        "source": f"통계청 KOSIS · {param.tbl_nm}",
+        "svg": svg,
+        "text_summary": f"{param.description} 히트맵을 {len(valid_rows)}개 지역 × {len(sorted_years)}개 시점의 실제 조회 행으로 생성했습니다.",
+        "요청_지역수": len(regions),
+        "포함_지역": valid_rows,
+        "누락_지역": [],
+        "누락_시점": [],
+        "시점": sorted_years,
+    })
 
 
 @mcp.tool()
@@ -6456,6 +6617,8 @@ async def chart_distribution(
 
     regions = [r for r in param.region_scheme.keys() if r != "전국"]
     values: list[float] = []
+    rows: list[dict[str, Any]] = []
+    missing_regions: list[str] = []
     annotations: list[tuple[str, float]] = []
     for r in regions:
         stat = await quick_stat(query, r, period, api_key)
@@ -6463,13 +6626,35 @@ async def chart_distribution(
             try:
                 v = float(stat["값"])
                 values.append(v)
+                rows.append({
+                    "region": str(stat.get("지역") or r),
+                    "period": str(stat.get("used_period") or stat.get("시점") or period),
+                    "value": v,
+                    "unit": stat.get("단위") or param.unit,
+                    "table_name": stat.get("통계표") or param.tbl_nm,
+                    "source": stat.get("출처") or "통계청 KOSIS",
+                })
                 if highlight_regions and r in highlight_regions:
                     annotations.append((r, v))
             except (ValueError, TypeError):
-                continue
+                missing_regions.append(r)
+        else:
+            missing_regions.append(r)
 
-    if len(values) < 5:
-        return [TextContent(type="text", text=f"분포 그리기에 데이터 부족 ({len(values)}개)")]
+    if len(values) < 5 or missing_regions:
+        return _chart_json_response({
+            "status": "partial_data" if rows else "no_data",
+            "capability_state": "partial_data" if rows else "no_data",
+            "actual_query_supported": False,
+            "chart_type": "distribution",
+            "query": query,
+            "requested_regions": regions,
+            "used_regions": [row["region"] for row in rows],
+            "missing_regions": missing_regions,
+            "rows": rows,
+            "row_count": len(rows),
+            "error": "전체 지역의 실제 값을 확인하지 못해 분포 차트를 생성하지 않았습니다.",
+        })
 
     svg = chart_distribution_svg(
         values,
@@ -6491,8 +6676,22 @@ async def chart_distribution(
     )
     return {
         "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
         "chart_type": "distribution",
         "mime_type": "image/svg+xml",
+        "query": query,
+        "requested_regions": regions,
+        "used_regions": [row["region"] for row in rows],
+        "org_id": param.org_id,
+        "tbl_id": param.tbl_id,
+        "table_name": param.tbl_nm,
+        "unit": param.unit,
+        "period_range": list(dict.fromkeys(row["period"] for row in rows)),
+        "rows": rows,
+        "row_count": len(rows),
+        "source": f"통계청 KOSIS · {param.tbl_nm}",
         "svg": svg,
         "text_summary": summary,
         "rendering_note": "SVG is returned as a raw field, not a markdown code fence.",
@@ -6545,7 +6744,16 @@ async def chart_dual_axis(
         end_year=end_year,
     )
     if "오류" in a or "오류" in b:
-        return [TextContent(type="text", text=f"데이터 수집 실패: A={a.get('오류','OK')}, B={b.get('오류','OK')}")]
+        return _chart_json_response({
+            "status": "failed",
+            "capability_state": "unsupported",
+            "actual_query_supported": False,
+            "query_a": query_a,
+            "query_b": query_b,
+            "requested_region": region,
+            "rows": [],
+            "error": f"데이터 수집 실패: A={a.get('오류','OK')}, B={b.get('오류','OK')}",
+        })
 
     ta, va = _values_from_series(a["시계열"])
     tb, vb = _values_from_series(b["시계열"])
@@ -6553,7 +6761,31 @@ async def chart_dual_axis(
     series_b = list(zip(tb, vb))
 
     if not series_a or not series_b:
-        return [TextContent(type="text", text="시계열 데이터 부족")]
+        return _chart_json_response({
+            "status": "no_data",
+            "capability_state": "no_data",
+            "actual_query_supported": False,
+            "query_a": query_a,
+            "query_b": query_b,
+            "requested_region": region,
+            "rows": [],
+            "error": "이중축 차트에 필요한 시계열 데이터가 부족합니다.",
+        })
+
+    used_region_a = str(a.get("지역") or region)
+    used_region_b = str(b.get("지역") or region)
+    if used_region_a != region or used_region_b != region:
+        return _chart_json_response({
+            "status": "failed",
+            "capability_state": "region_mismatch",
+            "actual_query_supported": False,
+            "query_a": query_a,
+            "query_b": query_b,
+            "requested_region": region,
+            "used_regions": [used_region_a, used_region_b],
+            "rows": [],
+            "error": "요청 지역과 실제 조회 지역이 일치하지 않습니다.",
+        })
 
     svg = chart_dual_axis_svg(
         series_a, series_b,
@@ -6566,16 +6798,34 @@ async def chart_dual_axis(
     )
 
     common = set(ta) & set(tb)
-    return [
-        _svg_to_image(svg),
-        TextContent(
-            type="text",
-            text=(
-                f"이중축 비교: {a.get('통계명')} (왼쪽) vs {b.get('통계명')} (오른쪽). "
-                f"공통 시점 {len(common)}개. 상관관계는 correlate_stats로 확인."
-            ),
-        ),
+    rows = [
+        {"series": "a", "query": query_a, "period": period, "value": value, "unit": a.get("단위")}
+        for period, value in series_a
+    ] + [
+        {"series": "b", "query": query_b, "period": period, "value": value, "unit": b.get("단위")}
+        for period, value in series_b
     ]
+    return _chart_json_response({
+        "상태": "executed",
+        "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
+        "chart_type": "dual_axis",
+        "query_a": query_a,
+        "query_b": query_b,
+        "requested_region": region,
+        "used_region": region,
+        "period_range": sorted(set(ta) | set(tb)),
+        "rows": rows,
+        "row_count": len(rows),
+        "source": "통계청 KOSIS",
+        "svg": svg,
+        "text_summary": (
+            f"이중축 비교: {a.get('통계명')} (왼쪽) vs {b.get('통계명')} (오른쪽). "
+            f"공통 시점 {len(common)}개."
+        ),
+    })
 
 
 @mcp.tool()
@@ -6605,8 +6855,33 @@ async def chart_dashboard(
 
     # 시계열
     series_result = await quick_trend(query, region, 15, api_key)
+    if "오류" in series_result:
+        return _chart_json_response(_chart_query_failure_payload(query, region, series_result))
     times, values = _values_from_series(series_result.get("시계열", []))
     timeseries = list(zip(times, values))
+    used_region = str(series_result.get("지역") or region)
+    if not timeseries:
+        return _chart_json_response({
+            "status": "no_data",
+            "capability_state": "no_data",
+            "actual_query_supported": False,
+            "query": query,
+            "requested_region": region,
+            "used_region": used_region,
+            "rows": [],
+            "error": "대시보드의 기준 시계열 실제 행을 확인하지 못했습니다.",
+        })
+    if used_region != region:
+        return _chart_json_response({
+            "status": "failed",
+            "capability_state": "region_mismatch",
+            "actual_query_supported": False,
+            "query": query,
+            "requested_region": region,
+            "used_region": used_region,
+            "rows": [],
+            "error": "요청 지역과 실제 조회 지역이 일치하지 않습니다.",
+        })
 
     # 추세 분석
     trend = await analyze_trend(query, region, 15, api_key)
@@ -6680,17 +6955,50 @@ async def chart_dashboard(
         source=f"KOSIS · {param.tbl_nm}",
     )
 
-    return [
-        _svg_to_image(svg),
-        TextContent(
-            type="text",
-            text=(
-                f"{param.description} 대시보드 — 시계열 {len(timeseries)}개 + "
-                f"예측 {len(forecast_pts)}년 + 지역 비교 {len(items)}개. "
-                f"추세·요약 분석기간: {trend.get('기간', '확인 불가')}"
-            ),
-        ),
+    rows = [
+        {
+            "series": "timeseries",
+            "region": used_region,
+            "period": period,
+            "value": value,
+            "unit": series_result.get("단위") or param.unit,
+        }
+        for period, value in timeseries
+    ] + [
+        {
+            "series": "region_compare",
+            "region": region_name,
+            "period": "latest",
+            "value": value,
+            "unit": param.unit,
+        }
+        for region_name, value in items
     ]
+    return _chart_json_response({
+        "상태": "executed",
+        "status": "executed",
+        "capability_state": "query_executed",
+        "actual_query_supported": True,
+        "verification_level": "query_rows",
+        "chart_type": "dashboard",
+        "query": query,
+        "requested_region": region,
+        "used_region": used_region,
+        "org_id": series_result.get("org_id") or param.org_id,
+        "tbl_id": series_result.get("tbl_id") or param.tbl_id,
+        "table_name": series_result.get("통계표") or param.tbl_nm,
+        "unit": series_result.get("단위") or param.unit,
+        "period_range": [times[0], times[-1]],
+        "rows": rows,
+        "row_count": len(rows),
+        "source": f"통계청 KOSIS · {series_result.get('통계표') or param.tbl_nm}",
+        "svg": svg,
+        "text_summary": (
+            f"{param.description} 대시보드 — 시계열 {len(timeseries)}개 + "
+            f"예측 {len(forecast_pts)}년 + 지역 비교 {len(items)}개. "
+            f"추세·요약 분석기간: {trend.get('기간', '확인 불가')}"
+        ),
+    })
 
 
 # ---- Chain Layer ----

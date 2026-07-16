@@ -37,13 +37,14 @@ manifest와 운영 규칙을 정리합니다. 목표는 LLM의 선택 자유도�
 전문가 또는 분석용 manifest에 선택적으로 노출할 도구:
 
 - `analyze_trend`, `forecast_stat`, `correlate_stats`, `detect_outliers`, `chain_full_analysis`
-- `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_dashboard`
+- `chart_line`, `chart_compare_regions`, `chart_correlation`, `chart_heatmap`,
+  `chart_distribution`, `chart_dual_axis`, `chart_dashboard`
 - `search_nabo_terms`: NABO 통계 용어사전이 필요할 때만 사용합니다.
 
 기본 manifest에서 숨길 도구:
 
-- `quick_stat`, `quick_trend`, `quick_region_compare`: 빠른 편의 도구입니다.
-  정밀한 표/코드 검증이 필요한 챗봇에서는 절차형 도구를 우선합니다.
+- `quick_trend`, `quick_region_compare`: 빠른 편의 도구입니다. 정밀한 표/코드
+  검증이 필요한 챗봇에서는 절차형 도구를 우선합니다.
 - `verify_stat_claims`, `decode_error`, 일회성 진단 helper
 
 기본 manifest 예시는 [gemma_manifest.default.json](gemma_manifest.default.json)을
@@ -91,6 +92,12 @@ manifest와 운영 규칙을 정리합니다. 목표는 LLM의 선택 자유도�
 자연어 `해석`은 기본적으로 포함하지 않습니다. 필요할 때만 `include_interpretation=true`를 사용합니다.
 
 ## 응답 계약
+
+차트 도구는 SVG만 반환하지 않습니다. 성공 응답에는
+`capability_state: "query_executed"`, `actual_query_supported: true`, 실제
+`rows`, `row_count`, 요청·사용 지역, `svg`가 함께 들어갑니다. 일부 지역이나
+시점이 누락된 비교·히트맵·분포는 `actual_query_supported: false`이며 SVG를
+최종 차트로 표시하면 안 됩니다.
 
 `plan_query`는 답변이 아니라 증거 수집 계획입니다. 응답에는 아래 계약이 들어갑니다.
 

@@ -32,10 +32,12 @@
     "chart_line",
     "chart_compare_regions",
     "chart_correlation",
+    "chart_heatmap",
+    "chart_distribution",
+    "chart_dual_axis",
     "chart_dashboard"
   ],
   "hide_by_default": [
-    "quick_stat",
     "quick_trend",
     "quick_region_compare",
     "verify_stat_claims",
