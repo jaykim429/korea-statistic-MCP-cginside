@@ -1286,10 +1286,8 @@ SYNONYMS: dict[str, str] = {
     "전세": "전세가격지수", "전세가격": "전세가격지수", "전세가격지수": "전세가격지수",
 
     # 중소기업
-    "중소기업수": "중소기업_사업체수",
     "중소기업사업체": "중소기업_사업체수",
     "중소기업사업체수": "중소기업_사업체수",
-    "중소기업기업수": "중소기업_사업체수",
     "중소기업업체수": "중소기업_사업체수",
     "중소기업종사자": "중소기업_종사자수",
     "중소기업근로자": "중소기업_종사자수",
@@ -2409,6 +2407,14 @@ class NaturalLanguageRouter:
         normalized_term = _norm_key(term)
         if normalized_term == "rd":
             return re.search(r"(?<![a-z0-9])rd(?![a-z0-9])", query.lower()) is not None
+        if normalized_term == "기업" and any(
+            compound in query_norm
+            for compound in (
+                "중소기업", "대기업", "중기업", "소기업", "창업기업",
+                "신생기업", "여성기업", "수혜기업", "벤처기업",
+            )
+        ):
+            return False
         return normalized_term in query_norm
 
     def _build_concepts(self) -> dict[str, Concept]:
