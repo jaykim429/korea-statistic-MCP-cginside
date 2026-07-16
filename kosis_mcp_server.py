@@ -6990,9 +6990,12 @@ async def chart_dual_axis(
 @mcp.tool()
 async def chart_dashboard(
     query: str, region: str = "전국",
+    years: int = 10,
     api_key: Optional[str] = None,
     source_system: Optional[str] = None,
     input_rows: Optional[list[dict[str, Any]]] = None,
+    start_year: Optional[str] = None,
+    end_year: Optional[str] = None,
 ) -> list:
     """[🎨] 4분할 종합 대시보드 한 장.
 
@@ -7002,7 +7005,14 @@ async def chart_dashboard(
     Args:
         query: 통계 키워드
         region: 시계열의 기준 지역
+        years: 기간 미지정 시 최근 N개 연간 시점
     """
+    normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(
+        start_year,
+        end_year,
+    )
+    if period_error:
+        return [TextContent(type="text", text=str(period_error))]
     if input_rows is not None:
         return await chart_line(query, region=region, api_key=api_key, source_system=source_system, input_rows=input_rows)
     resolved_source = _resolve_tool_source_system(query, source_system)
@@ -7013,7 +7023,14 @@ async def chart_dashboard(
         return [TextContent(type="text", text=f'"{query}" Tier A 매핑 없음')]
 
     # 시계열
-    series_result = await quick_trend(query, region, 15, api_key)
+    series_result = await quick_trend(
+        query=query,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=normalized_start_year,
+        end_year=normalized_end_year,
+    )
     if "오류" in series_result:
         return _chart_json_response(_chart_query_failure_payload(query, region, series_result))
     times, values = _values_from_series(series_result.get("시계열", []))
@@ -7043,12 +7060,19 @@ async def chart_dashboard(
         })
 
     # 추세 분석
-    trend = await analyze_trend(query, region, 15, api_key)
+    trend = await analyze_trend(
+        query=query,
+        region=region,
+        years=years,
+        api_key=api_key,
+        start_year=normalized_start_year,
+        end_year=normalized_end_year,
+    )
 
     # 예측 (시계열이 충분하면)
     forecast_pts: list[tuple[str, float, float, float]] = []
-    if len(values) >= 4:
-        forecast = await forecast_stat(query, region, 15, 5, api_key)
+    if len(values) >= 4 and not normalized_start_year and not normalized_end_year:
+        forecast = await forecast_stat(query, region, years, 5, api_key)
         forecast_path = (
             ((forecast.get("computed_examples") or {}).get("linear") or {}).get("forecast_path")
             or forecast.get("예측")
@@ -7148,6 +7172,11 @@ async def chart_dashboard(
         "table_name": series_result.get("통계표") or param.tbl_nm,
         "unit": series_result.get("단위") or param.unit,
         "period_range": [times[0], times[-1]],
+        "requested_period": {
+            "start_year": normalized_start_year,
+            "end_year": normalized_end_year,
+            "years": years if not normalized_start_year and not normalized_end_year else None,
+        },
         "rows": rows,
         "row_count": len(rows),
         "source": f"통계청 KOSIS · {series_result.get('통계표') or param.tbl_nm}",
