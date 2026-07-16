@@ -112,6 +112,7 @@ from kosis_analysis.quick import (
     _extract_single_region_from_query,
     _extract_single_year_from_query,
     _quick_stat_unsupported_dimensions,
+    _quick_trend_unsupported_dimensions,
     _unsupported_quick_stat_response,
 )
 
@@ -4047,8 +4048,8 @@ class NaturalLanguageAnswerEngine:
         # silently execute a generic total when the original question asks for
         # an age/sex/industry subgroup that the mapping does not encode.
         if direct_key:
-            unsupported_dimensions = _quick_stat_unsupported_dimensions(query)
             param = TIER_A_STATS.get(direct_key)
+            unsupported_dimensions = _quick_trend_unsupported_dimensions(query, param)
             if unsupported_dimensions and param:
                 return _unsupported_quick_stat_response(
                     query,
@@ -4562,7 +4563,7 @@ async def _quick_stat_core(
 
     # === Tier A 히트: 즉시 호출 ===
     if param:
-        unsupported_dimensions = _quick_stat_unsupported_dimensions(query)
+        unsupported_dimensions = _quick_stat_unsupported_dimensions(query, param)
         if unsupported_dimensions:
             return _unsupported_quick_stat_response(
                 query,
@@ -4985,7 +4986,7 @@ async def _quick_trend_core(
         raise
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
-    unsupported_dimensions = _quick_stat_unsupported_dimensions(query)
+    unsupported_dimensions = _quick_trend_unsupported_dimensions(query, param)
     if unsupported_dimensions:
         return _unsupported_quick_stat_response(
             query,

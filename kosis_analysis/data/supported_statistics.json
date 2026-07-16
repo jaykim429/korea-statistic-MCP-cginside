@@ -63,6 +63,14 @@
       "examples": ["전국 실업률 최신값 알려줘", "서울과 경기 실업률을 비교해줘"]
     },
     {
+      "id": "youth_unemployment_rate",
+      "stat_key": "청년 실업률",
+      "category": "labor",
+      "name": "청년(15~29세) 실업률",
+      "aliases": ["15~29세 실업률", "청년층 실업률"],
+      "examples": ["청년 실업률 최신값 알려줘", "청년(15~29세) 실업률 최근 5년 데이터 보여줘"]
+    },
+    {
       "id": "employment_rate",
       "stat_key": "고용률",
       "category": "labor",

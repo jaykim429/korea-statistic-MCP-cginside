@@ -276,6 +276,8 @@ class QuickStatParam:
     latest_policy: str = "latest_available"
     replacement_status: ReplacementStatus = "current"
     verified_at: Optional[str] = None
+    encoded_dimensions: tuple[str, ...] = ()
+    provisional_periods: tuple[str, ...] = ()
 
     @property
     def table_identity(self) -> tuple[str, str]:
@@ -384,6 +386,17 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         supported_periods=("Y", "Q", "M"),
         verification_status="verified",
         note="검증 OK (2025년 2.7%)",
+    ),
+    "청년 실업률": QuickStatParam(
+        org_id="101", tbl_id="DT_1DA7102S",
+        tbl_nm="성/연령별 실업률",
+        description="청년(15~29세) 실업률",
+        obj_l1="0", obj_l2="75", item_id="T80", unit="%",
+        supported_periods=("Y", "Q", "M"),
+        verification_status="verified",
+        verified_at="2026-07-16",
+        encoded_dimensions=("age",),
+        note="KOSIS 실제 조회 검증: 성별=계, 연령=15~29세, 2025년 6.1%.",
     ),
     "고용률": QuickStatParam(
         org_id="101", tbl_id="DT_1DA7004S",
@@ -2533,6 +2546,16 @@ class NaturalLanguageRouter:
         """자연어 → Tier A key. 오답 위험이 있는 상위어는 직접조회하지 않는다."""
         q = query.strip()
         q_norm = self.normalize(q)
+
+        if (
+            "실업률" in q_norm
+            and "청년 실업률" in self.tier_a_stats
+            and (
+                "청년" in q_norm
+                or re.search(r"15\s*[-~]\s*29\s*세", q) is not None
+            )
+        ):
+            return "청년 실업률"
 
         # 동의어 정확 일치
         if q in self.synonyms:

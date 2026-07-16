@@ -54,7 +54,10 @@ def _extract_single_year_from_query(query: str) -> Optional[str]:
     return years[0] if len(years) == 1 else None
 
 
-def _quick_stat_unsupported_dimensions(query: str) -> list[str]:
+def _quick_stat_unsupported_dimensions(
+    query: str,
+    param: Optional[QuickStatParam] = None,
+) -> list[str]:
     q = str(query or "")
     compact = _compact_text(q)
     dimensions: list[str] = []
@@ -75,7 +78,24 @@ def _quick_stat_unsupported_dimensions(query: str) -> list[str]:
         dimensions.append("comparison")
     if any(region in compact for region in (_compact_text(name) for name in REGION_COMPOSITES)):
         dimensions.append("region_group")
-    return list(dict.fromkeys(dimensions))
+    encoded_dimensions = set(getattr(param, "encoded_dimensions", ()) or ())
+    return [
+        dimension
+        for dimension in dict.fromkeys(dimensions)
+        if dimension not in encoded_dimensions
+    ]
+
+
+def _quick_trend_unsupported_dimensions(
+    query: str,
+    param: Optional[QuickStatParam] = None,
+) -> list[str]:
+    """Trend lookup supports a time-series request but not extra slicing dimensions."""
+    return [
+        dimension
+        for dimension in _quick_stat_unsupported_dimensions(query, param)
+        if dimension != "time_series"
+    ]
 
 
 def _unsupported_quick_stat_response(
@@ -90,6 +110,8 @@ def _unsupported_quick_stat_response(
         "코드": STATUS_UNVERIFIED_FORMULA,
         "status": "unsupported",
         "이행_상태": "unsupported",
+        "actual_query_supported": False,
+        "actual_value_retrieved": False,
         "질문": query,
         "answer": (
             "quick_stat은 단일 통계값 도구라 질문에 포함된 추가 필터를 안전하게 반영하지 못합니다. "
