@@ -95,6 +95,14 @@
       "examples": ["경제성장률 최신값 알려줘", "최근 5년 경제성장률을 표로 보여줘"]
     },
     {
+      "id": "nominal_gdp",
+      "stat_key": "GDP",
+      "category": "economy_trade",
+      "name": "국내총생산(시장가격, 명목 GDP)",
+      "aliases": ["GDP", "국내총생산", "명목 GDP"],
+      "examples": ["최신 GDP 알려줘", "최근 5년 GDP 추이를 보여줘"]
+    },
+    {
       "id": "exports",
       "stat_key": "수출액",
       "category": "economy_trade",

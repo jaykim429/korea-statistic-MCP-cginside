@@ -4752,6 +4752,11 @@ async def _quick_stat_core(
             "org_id": param.org_id, "tbl_id": param.tbl_id,
             "출처": "통계청 KOSIS",
         }
+        provisional_periods = list(getattr(param, "provisional_periods", ()) or ())
+        if used_period in provisional_periods:
+            result["data_status"] = "provisional"
+            result["provisional_periods"] = provisional_periods
+            result["⚠️ 잠정치"] = f"{used_period}년 값은 잠정치이며 추후 변경될 수 있습니다."
         if latest_policy:
             result.update({
                 "최신값_선택정책": latest_policy,
@@ -5072,6 +5077,15 @@ async def _quick_trend_core(
         "요청_기간_년": years,
         "요청_시점수": latest_count if not start_period else None,
     }
+    provisional_periods = [
+        period
+        for period in (getattr(param, "provisional_periods", ()) or ())
+        if period in times
+    ]
+    if provisional_periods:
+        result["data_status"] = "includes_provisional"
+        result["provisional_periods"] = provisional_periods
+        result["⚠️ 잠정치"] = "잠정치가 포함되어 있으며 추후 변경될 수 있습니다."
     if start_period:
         result.update(_explicit_period_metadata(
             start_year=normalized_start_year,
