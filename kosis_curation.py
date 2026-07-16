@@ -183,7 +183,13 @@ def extract_region_candidate(query: str) -> Optional[str]:
         ):
             return municipality
 
+    non_region_gyeonggi = re.search(
+        r"경기(?:동행|선행|전망|동향|실사|체감|회복|변동|순환|지수)",
+        compact,
+    )
     for region in sorted(REGION_DEMOGRAPHIC.keys(), key=len, reverse=True):
+        if region == "경기" and non_region_gyeonggi:
+            continue
         if region != "전국" and re.sub(r"\s+", "", region) in compact:
             return region
     if "전국" in compact:
@@ -451,6 +457,17 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         replacement_status="deprecated",
         verified_at="2026-07-14",
         note="구 표는 2022 종료. 2024 수록 현행 후보를 지역축·단위까지 재검증 후 교체 필요.",
+    ),
+    "중소기업 경기동행종합지수": QuickStatParam(
+        org_id="303", tbl_id="DT_303005_CI001",
+        tbl_nm="중소기업 경기동행종합지수",
+        description="중소기업 경기동행종합지수 (2015=100)",
+        obj_l1="00", item_id="T001", unit="2015=100",
+        supported_periods=("M",),
+        verification_status="verified",
+        verified_at="2026-07-15",
+        value_kind="provider_index",
+        note="KOSIS 실제 조회 검증: SMECI=00, ITEM=T001, 2026.05 104.55.",
     ),
     "경제성장률": QuickStatParam(
         org_id="301", tbl_id="DT_200Y101",
@@ -1268,6 +1285,9 @@ SYNONYMS: dict[str, str] = {
     "국내총생산": "GDP", "총생산": "GDP",
     "지역내총생산": "GRDP",
     "성장률": "경제성장률", "GDP성장률": "경제성장률",
+    "경기동행지수": "중소기업 경기동행종합지수",
+    "경기동행종합지수": "중소기업 경기동행종합지수",
+    "중소기업 경기동행지수": "중소기업 경기동행종합지수",
 
     # 물가
     "물가": "소비자물가지수", "소비자물가": "소비자물가지수", "CPI": "소비자물가지수",
