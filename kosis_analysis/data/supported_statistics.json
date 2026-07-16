@@ -1,0 +1,178 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "id": "population",
+      "name": "인구·가구",
+      "aliases": ["인구", "가구", "출산", "고령"]
+    },
+    {
+      "id": "labor",
+      "name": "고용·노동",
+      "aliases": ["고용", "노동", "취업", "실업"]
+    },
+    {
+      "id": "prices",
+      "name": "물가·소비",
+      "aliases": ["물가", "소비", "소비자물가"]
+    },
+    {
+      "id": "economy_trade",
+      "name": "경제·무역",
+      "aliases": ["경제", "성장", "무역", "수출", "수입"]
+    },
+    {
+      "id": "sme_small_business",
+      "name": "중소기업·소상공인",
+      "aliases": ["중소기업", "소상공인", "자영업"]
+    },
+    {
+      "id": "finance",
+      "name": "금융·자금",
+      "aliases": ["금융", "자금", "대출", "가계대출"]
+    },
+    {
+      "id": "housing",
+      "name": "주거·부동산",
+      "aliases": ["주거", "부동산", "주택", "아파트"]
+    }
+  ],
+  "statistics": [
+    {
+      "id": "population_total",
+      "stat_key": "인구",
+      "category": "population",
+      "name": "주민등록 총인구",
+      "aliases": ["총인구", "주민등록 인구"],
+      "examples": ["서울 인구 최신값 알려줘", "최근 5년 인구 추이를 그래프로 보여줘"]
+    },
+    {
+      "id": "total_fertility_rate",
+      "stat_key": "합계출산율",
+      "category": "population",
+      "name": "합계출산율",
+      "aliases": ["출산율"],
+      "examples": ["합계출산율 최신값 알려줘", "합계출산율 추이를 표로 보여줘"]
+    },
+    {
+      "id": "unemployment_rate",
+      "stat_key": "실업률",
+      "category": "labor",
+      "name": "실업률",
+      "aliases": ["실업률 통계"],
+      "examples": ["전국 실업률 최신값 알려줘", "서울과 경기 실업률을 비교해줘"]
+    },
+    {
+      "id": "employment_rate",
+      "stat_key": "고용률",
+      "category": "labor",
+      "name": "고용률",
+      "aliases": ["고용률 통계"],
+      "examples": ["고용률 최신값 알려줘", "최근 5년 고용률 추이를 보여줘"]
+    },
+    {
+      "id": "consumer_price_index",
+      "stat_key": "소비자물가지수",
+      "category": "prices",
+      "name": "소비자물가지수",
+      "aliases": ["소비자 물가 지수", "CPI"],
+      "examples": ["소비자물가지수 최신값 알려줘", "최근 12개월 소비자물가지수 그래프 보여줘"]
+    },
+    {
+      "id": "economic_growth_rate",
+      "stat_key": "경제성장률",
+      "category": "economy_trade",
+      "name": "경제성장률",
+      "aliases": ["GDP 성장률"],
+      "examples": ["경제성장률 최신값 알려줘", "최근 5년 경제성장률을 표로 보여줘"]
+    },
+    {
+      "id": "exports",
+      "stat_key": "수출액",
+      "category": "economy_trade",
+      "name": "수출액",
+      "aliases": ["수출 금액"],
+      "examples": ["수출액 최신값 알려줘", "최근 12개월 수출액 추이를 보여줘"]
+    },
+    {
+      "id": "trade_balance",
+      "stat_key": "무역수지",
+      "category": "economy_trade",
+      "name": "무역수지",
+      "aliases": ["수출입 차액"],
+      "examples": ["무역수지 최신값 알려줘", "최근 5년 무역수지를 비교해줘"]
+    },
+    {
+      "id": "sme_coincident_index",
+      "stat_key": "중소기업 경기동행종합지수",
+      "category": "sme_small_business",
+      "name": "중소기업 경기동행종합지수",
+      "aliases": ["중소기업 경기동행지수", "중소기업 경기 지수"],
+      "examples": ["중소기업 경기동행종합지수 최신값 알려줘", "최근 12개월 중소기업 경기동행종합지수 그래프 보여줘"]
+    },
+    {
+      "id": "sme_business_count",
+      "stat_key": "중소기업_사업체수",
+      "category": "sme_small_business",
+      "name": "중소기업 사업체 수",
+      "aliases": ["중소기업 사업체수", "중소기업 수"],
+      "examples": ["중소기업 사업체 수 최신값 알려줘", "지역별 중소기업 사업체 수를 비교해줘"]
+    },
+    {
+      "id": "sme_worker_count",
+      "stat_key": "중소기업_종사자수",
+      "category": "sme_small_business",
+      "name": "중소기업 종사자 수",
+      "aliases": ["중소기업 종사자수"],
+      "examples": ["중소기업 종사자 수 최신값 알려줘", "지역별 중소기업 종사자 수를 표로 보여줘"]
+    },
+    {
+      "id": "small_business_count",
+      "stat_key": "소상공인_사업체수",
+      "category": "sme_small_business",
+      "name": "소상공인 사업체 수",
+      "aliases": ["소상공인 사업체수", "소상공인 수"],
+      "examples": ["소상공인 사업체 수 최신값 알려줘", "지역별 소상공인 사업체 수를 비교해줘"]
+    },
+    {
+      "id": "self_employed_count",
+      "stat_key": "자영업자수",
+      "category": "sme_small_business",
+      "name": "자영업자 수",
+      "aliases": ["자영업자", "자영업자수"],
+      "examples": ["자영업자 수 최신값 알려줘", "최근 5년 자영업자 수 추이를 보여줘"]
+    },
+    {
+      "id": "household_loans",
+      "stat_key": "가계대출_총잔액",
+      "category": "finance",
+      "name": "가계대출 총잔액",
+      "aliases": ["가계대출 잔액", "가계 대출"],
+      "examples": ["가계대출 총잔액 최신값 알려줘", "최근 12개월 가계대출 추이를 보여줘"]
+    },
+    {
+      "id": "mortgage_loans",
+      "stat_key": "주택담보대출",
+      "category": "finance",
+      "name": "주택담보대출 잔액",
+      "aliases": ["주담대", "주택 담보 대출"],
+      "examples": ["주택담보대출 잔액 최신값 알려줘", "최근 12개월 주택담보대출 추이를 그래프로 보여줘"]
+    },
+    {
+      "id": "other_household_loans",
+      "stat_key": "기타대출",
+      "category": "finance",
+      "name": "기타 가계대출 잔액",
+      "aliases": ["기타대출 잔액"],
+      "examples": ["기타 가계대출 잔액 최신값 알려줘", "가계대출과 기타대출을 비교해줘"]
+    },
+    {
+      "id": "housing_sales_price_index",
+      "stat_key": "주택매매가격지수",
+      "category": "housing",
+      "name": "주택매매가격지수",
+      "aliases": ["주택 가격 지수", "주택 매매 지수"],
+      "examples": ["주택매매가격지수 최신값 알려줘", "서울과 경기 주택매매가격지수를 비교해줘"]
+    }
+  ]
+}

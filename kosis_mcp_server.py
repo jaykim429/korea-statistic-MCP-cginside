@@ -25,6 +25,7 @@ import re
 import time
 from datetime import datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -931,6 +932,24 @@ from kosis_charts_extra import (
     chart_dashboard_svg,
 )
 
+SUPPORTED_STATISTICS_CATALOG_PATH = (
+    Path(__file__).resolve().parent
+    / "kosis_analysis"
+    / "data"
+    / "supported_statistics.json"
+)
+
+
+def _load_supported_statistics_catalog() -> dict[str, Any]:
+    with SUPPORTED_STATISTICS_CATALOG_PATH.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload.get("categories"), list) or not isinstance(payload.get("statistics"), list):
+        raise ValueError("supported statistics catalog must contain categories and statistics arrays")
+    return payload
+
+
+SUPPORTED_STATISTICS_CATALOG = _load_supported_statistics_catalog()
+
 
 
 
@@ -1136,7 +1155,230 @@ def _topic_stat_status(name: str) -> str:
     param = _curation_lookup(name)
     if not param:
         return "미검증"
-    return "교체필요" if param.replacement_status == "deprecated" else "확정"
+    if param.replacement_status == "deprecated":
+        return "교체필요"
+    if param.verification_status != "verified":
+        return "매핑미검증"
+    return "매핑확정(실조회미확인)"
+
+
+def _normalize_supported_catalog_text(value: Any) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", str(value or "").lower()).replace("통게", "통계")
+
+
+def _supported_catalog_entries() -> list[tuple[dict[str, Any], QuickStatParam]]:
+    entries: list[tuple[dict[str, Any], QuickStatParam]] = []
+    for configured in SUPPORTED_STATISTICS_CATALOG["statistics"]:
+        if not isinstance(configured, dict):
+            continue
+        param = TIER_A_STATS.get(str(configured.get("stat_key") or ""))
+        if not param:
+            continue
+        if param.verification_status != "verified" or param.replacement_status == "deprecated":
+            continue
+        entries.append((configured, param))
+    return entries
+
+
+def _supported_catalog_item(configured: dict[str, Any], param: QuickStatParam) -> dict[str, Any]:
+    period_labels = {"Y": "연간", "Q": "분기", "M": "월간"}
+    regions = list(param.region_scheme.keys()) if param.region_scheme else ["전국"]
+    return {
+        "id": configured["id"],
+        "stat_key": configured["stat_key"],
+        "name": configured.get("name") or param.description,
+        "category_id": configured["category"],
+        "description": param.description,
+        "unit": param.unit,
+        "periods": list(param.supported_periods),
+        "period_labels": [
+            period_labels.get(period, period)
+            for period in param.supported_periods
+        ],
+        "regions": regions,
+        "examples": list(configured.get("examples") or []),
+        "support": {
+            "state": "available",
+            "label": "조회 가능",
+        },
+        "org_id": param.org_id,
+        "tbl_id": param.tbl_id,
+        "next_call": {
+            "tool": "quick_stat",
+            "args": {
+                "query": configured["stat_key"],
+                "region": regions[0],
+                "period": "latest",
+            },
+        },
+    }
+
+
+def _supported_catalog_category(query: str) -> Optional[dict[str, Any]]:
+    normalized = _normalize_supported_catalog_text(query)
+    if not normalized:
+        return None
+    for category in SUPPORTED_STATISTICS_CATALOG["categories"]:
+        candidates = [category.get("id"), category.get("name"), *(category.get("aliases") or [])]
+        if any(
+            _normalize_supported_catalog_text(candidate)
+            and _normalize_supported_catalog_text(candidate) in normalized
+            for candidate in candidates
+        ):
+            return category
+    return None
+
+
+def _supported_catalog_statistic(query: str) -> Optional[tuple[dict[str, Any], QuickStatParam]]:
+    normalized = _normalize_supported_catalog_text(query)
+    if not normalized:
+        return None
+    matches: list[tuple[int, dict[str, Any], QuickStatParam]] = []
+    for configured, param in _supported_catalog_entries():
+        candidates = [
+            configured.get("id"),
+            configured.get("stat_key"),
+            configured.get("name"),
+            *(configured.get("aliases") or []),
+        ]
+        for candidate in candidates:
+            candidate_normalized = _normalize_supported_catalog_text(candidate)
+            if candidate_normalized and candidate_normalized in normalized:
+                matches.append((len(candidate_normalized), configured, param))
+                break
+    if not matches:
+        return None
+    _, configured, param = max(matches, key=lambda match: match[0])
+    return configured, param
+
+
+def _is_generic_supported_catalog_query(query: str) -> bool:
+    normalized = _normalize_supported_catalog_text(query)
+    for token in (
+        "통계", "정보", "조회", "사용", "가능", "알려줘", "보여줘", "추천해줘",
+        "뭐가", "뭐", "무엇", "있어", "목록", "종류", "관련", "어떤", "무슨",
+        "에는", "에서", "은", "는", "이", "가", "을", "를", "의",
+    ):
+        normalized = normalized.replace(token, "")
+    return not normalized
+
+
+def _unsupported_supported_catalog_response(query: str) -> dict[str, Any]:
+    return {
+        "status": "unsupported",
+        "capability_state": "unsupported",
+        "actual_query_supported": False,
+        "query": query,
+        "message": "현재 챗봇의 1차 통계 조회 범위에서는 지원하지 않는 통계입니다.",
+    }
+
+
+async def list_supported_statistics(
+    category: Optional[str] = None,
+    query: Optional[str] = None,
+    stat_id: Optional[str] = None,
+) -> dict:
+    """챗봇에서 1차로 조회할 수 있는 통계 분야·목록·상세를 반환.
+
+    이 도구는 공식 KOSIS 검색 후보 전체가 아니라, 검증된 현재 매핑 중
+    챗봇에 노출하기로 승인한 통계만 반환한다. 목록과 상세는 조회 가능 범위를
+    설명할 뿐 실제 값 조회 성공을 뜻하지 않는다. 실제 값·표·차트는 반환된
+    ``next_call`` 또는 다른 조회·시각화 도구를 실행한 결과로 확정한다.
+    """
+    entries = _supported_catalog_entries()
+    categories = SUPPORTED_STATISTICS_CATALOG["categories"]
+
+    if stat_id:
+        selected = next(
+            (
+                (configured, param)
+                for configured, param in entries
+                if configured.get("id") == stat_id
+            ),
+            None,
+        )
+        if not selected:
+            return _unsupported_supported_catalog_response(stat_id)
+        configured, param = selected
+        return {
+            "status": "stat_detail",
+            "capability_state": "catalog_supported",
+            "actual_query_supported": False,
+            "statistic": _supported_catalog_item(configured, param),
+        }
+
+    normalized_query = str(query or "").strip()
+    category_match = _supported_catalog_category(category or normalized_query)
+    asks_for_list = bool(category) or "통계" in _normalize_supported_catalog_text(normalized_query)
+
+    if category_match and asks_for_list:
+        items = [
+            _supported_catalog_item(configured, param)
+            for configured, param in entries
+            if configured.get("category") == category_match.get("id")
+        ]
+        return {
+            "status": "catalog_statistics",
+            "capability_state": "catalog_supported",
+            "actual_query_supported": False,
+            "category": {
+                "id": category_match["id"],
+                "name": category_match["name"],
+            },
+            "statistics": items,
+        }
+
+    statistic_match = _supported_catalog_statistic(normalized_query)
+    if statistic_match:
+        configured, param = statistic_match
+        return {
+            "status": "stat_detail",
+            "capability_state": "catalog_supported",
+            "actual_query_supported": False,
+            "statistic": _supported_catalog_item(configured, param),
+        }
+
+    if category_match:
+        items = [
+            _supported_catalog_item(configured, param)
+            for configured, param in entries
+            if configured.get("category") == category_match.get("id")
+        ]
+        return {
+            "status": "catalog_statistics",
+            "capability_state": "catalog_supported",
+            "actual_query_supported": False,
+            "category": {
+                "id": category_match["id"],
+                "name": category_match["name"],
+            },
+            "statistics": items,
+        }
+
+    if normalized_query and not _is_generic_supported_catalog_query(normalized_query):
+        return _unsupported_supported_catalog_response(normalized_query)
+
+    category_counts = {
+        category_item["id"]: sum(
+            configured.get("category") == category_item["id"]
+            for configured, _ in entries
+        )
+        for category_item in categories
+    }
+    return {
+        "status": "catalog_categories",
+        "capability_state": "catalog_supported",
+        "actual_query_supported": False,
+        "categories": [
+            {
+                "id": category_item["id"],
+                "name": category_item["name"],
+                "count": category_counts[category_item["id"]],
+            }
+            for category_item in categories
+            if category_counts[category_item["id"]] > 0
+        ],
+    }
 
 
 def _catalog_candidate_with_query_status(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -4159,6 +4401,7 @@ class NaturalLanguageAnswerEngine:
 # ============================================================================
 
 mcp = FastMCP("kosis-analysis")
+mcp.tool()(list_supported_statistics)
 
 
 # ---- L1: Quick Layer ----

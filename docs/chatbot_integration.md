@@ -9,6 +9,14 @@ manifest와 운영 규칙을 정리합니다. 목표는 LLM의 선택 자유도�
 
 정밀 검증을 중시하는 manifest에는 아래 도구를 중심으로 노출하는 것을 권장합니다.
 
+- `list_supported_statistics`: 챗봇이 1차로 조회할 수 있는 분야·통계·상세를 탐색합니다.
+  상세 응답에는 최근 검증일을 노출하지 않으며, 실제 조회 성공은 별도 도구 결과로 판단합니다.
+- `browse_kosis_catalog`, `browse_topic`: KOSIS 전체 후보나 큐레이션 주제를 탐색합니다. 이 단계의
+  표와 지표는 후보이며 실제값 조회 성공을 뜻하지 않습니다.
+- `stat_detail`: 매핑 상세, 지원 지역·기간, 다음 호출 예시를 확인합니다.
+  `매핑확정(실조회미확인)`은 실제값 조회 전 상태입니다.
+- `quick_stat`: `stat_detail`의 검증된 매핑을 실제 호출합니다. 값, 단위, 시점,
+  출처가 모두 반환된 경우에만 조회 성공으로 취급합니다.
 - `plan_query`: 모든 통계 질문의 첫 호출입니다. 의도, 지표, 차원, 시간,
   다음 단계만 만들고 실제 값을 조회하지 않습니다.
 - `select_table_for_query`: 필요한 분류축을 만족하는 통계표 후보를 KOSIS
@@ -44,7 +52,9 @@ manifest와 운영 규칙을 정리합니다. 목표는 LLM의 선택 자유도�
 ## 운영 흐름
 
 1. 챗봇 라우터가 사용자 질문이 통계 질문인지 먼저 판단합니다.
-2. 단순 질문이면 `answer_query(query)` 또는 `quick_*`로 빠르게 처리할 수 있습니다.
+2. 단순 질문이면 `answer_query(query)`로 빠르게 처리할 수 있습니다. 탐색에서 시작한
+   경우 `browse_kosis_catalog`/`browse_topic` → `stat_detail` → `quick_stat` 순서로
+   진행하며, `quick_stat`에 실제 값이 없으면 즉시 실패 또는 KOSIS 직접 확인을 안내합니다.
    복합 질문, 다중 지표, 산식, 표 선택 근거가 중요한 질문이면 `plan_query(query)`를 먼저 호출합니다.
 3. `plan_query.next_call`, `suggested_workflow`, `evidence_workflow` 중 가장
    구체적인 레일을 따릅니다.

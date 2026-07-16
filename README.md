@@ -722,6 +722,10 @@ chart_line("고령인구", region="전국", years=5)
 - 복수 지표·복수 task·다지역 비교는 `analysis_mode: "composite_analysis"`와 `evidence_bundle: true`
 - `월별`, `분기별`, `연도별` 같은 표현은 KOSIS 축이 아니라 시간 granularity로 보존됩니다.
 
+챗봇의 일반 통계 탐색은 `list_supported_statistics`를 사용합니다. 이 도구는
+`kosis_analysis/data/supported_statistics.json`의 1차 지원 allowlist만 반환하며,
+실제 값·표·SVG 차트의 형태는 `answer_query`, 조회 및 시각화 도구의 원형 결과를 유지합니다.
+
 `answer_query` 응답 상태:
 
 - `EXECUTED`: 실제 KOSIS API 조회 또는 계산 완료

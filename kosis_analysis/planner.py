@@ -45,6 +45,12 @@ class QueryWorkflowPlanner:
     """
 
     GEMMA_DEFAULT_TOOLS = [
+        "answer_query",
+        "list_supported_statistics",
+        "browse_kosis_catalog",
+        "browse_topic",
+        "stat_detail",
+        "quick_stat",
         "plan_query",
         "select_table_for_query",
         "resolve_concepts",
@@ -59,11 +65,12 @@ class QueryWorkflowPlanner:
         "chart_line",
         "chart_compare_regions",
         "chart_correlation",
+        "chart_heatmap",
+        "chart_distribution",
+        "chart_dual_axis",
         "chart_dashboard",
     ]
     GEMMA_HIDDEN_TOOLS = [
-        "answer_query",
-        "quick_stat",
         "quick_trend",
         "quick_region_compare",
         "verify_stat_claims",
