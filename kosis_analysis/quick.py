@@ -30,7 +30,13 @@ def _extract_single_region_from_query(query: str) -> Optional[str]:
     if candidate and (candidate not in _DIRECT_REGION_NAMES or " " in candidate):
         return candidate
     matches: list[str] = []
+    non_region_gyeonggi = re.search(
+        r"경기(?:동행|선행|전망|동향|실사|체감|회복|변동|순환|지수)",
+        re.sub(r"\s+", "", q),
+    )
     for name in sorted(_DIRECT_REGION_NAMES, key=len, reverse=True):
+        if name in {"경기", "경기도"} and non_region_gyeonggi:
+            continue
         if name in q:
             canonical = _canonical_region(name) or name
             if canonical not in matches:
