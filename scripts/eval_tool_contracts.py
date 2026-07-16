@@ -1246,6 +1246,38 @@ def test_answer_query_compact_response_hides_control_contract() -> None:
     assert "llm_guardrails" not in compact, compact
 
 
+def test_answer_query_compact_response_preserves_partial_and_provenance() -> None:
+    compact = kosis_mcp_server._compact_answer_query_response({
+        "상태": "executed",
+        "status": "partial",
+        "capability_state": "partial_fulfillment",
+        "actual_query_supported": False,
+        "verification_level": "query_partial",
+        "이행_상태": "partial",
+        "누락_차원": ["age"],
+        "기관ID": "101",
+        "통계표ID": "DT_TEST",
+        "통계표": "성/연령별 실업률",
+        "표": [{
+            "지역": "서울",
+            "값": "100",
+            "단위": "명",
+            "시점": "2026.06",
+            "기관ID": "101",
+            "통계표ID": "DT_TEST",
+        }],
+        "계산": {"합계": "100", "산식": "서울"},
+        "출처": "통계청 KOSIS",
+    }, query="청년 실업률", region="전국")
+    assert compact["status"] == "partial", compact
+    assert compact["actual_query_supported"] is False, compact
+    assert compact["diagnostics"]["dropped_dimensions"] == ["age"], compact
+    assert compact["metadata"]["org_id"] == "101", compact
+    assert compact["metadata"]["table_id"] == "DT_TEST", compact
+    assert compact["data"][0]["통계표ID"] == "DT_TEST", compact
+    assert compact["calculation"]["산식"] == "서울", compact
+
+
 async def test_answer_query_explicit_period_uses_trend_not_latest_value() -> None:
     original_quick_trend_core = kosis_mcp_server._quick_trend_core
     original_resolve_key = kosis_mcp_server._resolve_key
@@ -1291,6 +1323,20 @@ async def test_answer_query_explicit_period_uses_trend_not_latest_value() -> Non
     assert result["requested_period"]["start_year"] == "2010", result
     assert result["period_selection_mode"] == "explicit_range", result
     assert result["data"][0]["시점"] == "2010", result
+
+
+async def test_answer_query_does_not_label_total_unemployment_as_youth() -> None:
+    result = await kosis_mcp_server.answer_query(
+        "청년(15~29세) 실업률 최근 5년 데이터 보여줘",
+        start_year="2021",
+        end_year="2025",
+        api_key="dummy",
+    )
+    assert result["status"] in {"unsupported", "failed"}, result
+    assert result.get("actual_query_supported") is False, result
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "age" in serialized or "연령" in serialized, result
+    assert "3.7" not in serialized, result
 
 
 def test_marker_guidance_in_contract() -> None:
@@ -3034,7 +3080,9 @@ async def main() -> None:
         ("resolve_empty_contract", lambda: test_resolve_concepts_empty_list_has_contract()),
         ("answer_query_convenience_contract", lambda: test_answer_query_convenience_contract()),
         ("answer_query_compact_response", lambda: test_answer_query_compact_response_hides_control_contract()),
+        ("answer_query_compact_partial_provenance", lambda: test_answer_query_compact_response_preserves_partial_and_provenance()),
         ("answer_query_explicit_period_trend", lambda: test_answer_query_explicit_period_uses_trend_not_latest_value()),
+        ("answer_query_youth_not_total", lambda: test_answer_query_does_not_label_total_unemployment_as_youth()),
         ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
         ("output_contract_compact_default", lambda: test_output_contract_compact_by_default()),
         ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),

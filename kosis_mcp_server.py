@@ -348,6 +348,8 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "period": payload.get("period") or payload.get("시점") or payload.get("used_period") or _first_payload_row_field("시점"),
         "source": payload.get("source") or payload.get("출처"),
         "table_id": payload.get("table_id") or payload.get("tbl_id") or payload.get("통계표ID"),
+        "org_id": payload.get("org_id") or payload.get("기관ID"),
+        "table_name": payload.get("table_name") or payload.get("통계표"),
         "period_age_years": payload.get("period_age_years"),
         "requested_period": payload.get("requested_period"),
         "available_period": payload.get("available_period"),
@@ -2895,6 +2897,8 @@ class NaturalLanguageAnswerEngine:
                 "단위": stat.get("단위", unit),
                 "시점": stat.get("시점", ""),
                 "통계표": stat.get("통계표"),
+                "기관ID": stat.get("org_id"),
+                "통계표ID": stat.get("tbl_id"),
             })
 
         if not rows:
@@ -2913,12 +2917,14 @@ class NaturalLanguageAnswerEngine:
             "질문": query,
             "표": rows,
             "구성_지역": components,
+            "기관ID": param.org_id if (param := TIER_A_STATS.get(direct_key)) else None,
+            "통계표ID": param.tbl_id if param else None,
+            "통계표": param.tbl_nm if param else table,
             "추천_시각화": ["bar_chart"],
             "route": route_payload["route"],
             "출처": "통계청 KOSIS",
         }
 
-        param = TIER_A_STATS.get(direct_key)
         stat_label = param.description if param else direct_key.replace("_", " ")
         if operation == "share":
             whole = await quick_stat(direct_key, "전국", period, self.api_key)
@@ -3682,6 +3688,8 @@ class NaturalLanguageAnswerEngine:
                 "단위": stat.get("단위", unit),
                 "시점": stat.get("시점", ""),
                 "통계표": stat.get("통계표"),
+                "기관ID": stat.get("org_id"),
+                "통계표ID": stat.get("tbl_id"),
             })
 
         if not rows:
@@ -3707,6 +3715,9 @@ class NaturalLanguageAnswerEngine:
             "질문": query,
             "answer": answer,
             "표": rows,
+            "기관ID": param.org_id if (param := TIER_A_STATS.get(direct_key)) else None,
+            "통계표ID": param.tbl_id if param else None,
+            "통계표": param.tbl_nm if param else table,
             "계산": {
                 "합계": _format_number(total),
                 "포함_지역": [r["지역"] for r in rows],
@@ -4031,6 +4042,21 @@ class NaturalLanguageAnswerEngine:
     ) -> dict[str, Any]:
         params = plan.params
         direct_key = plan.direct_key
+
+        # A verified shortcut is only valid for its mapped dimensions. Do not
+        # silently execute a generic total when the original question asks for
+        # an age/sex/industry subgroup that the mapping does not encode.
+        if direct_key:
+            unsupported_dimensions = _quick_stat_unsupported_dimensions(query)
+            param = TIER_A_STATS.get(direct_key)
+            if unsupported_dimensions and param:
+                return _unsupported_quick_stat_response(
+                    query,
+                    param,
+                    unsupported_dimensions,
+                    plan.region,
+                    self._period_argument(query, route_payload),
+                )
 
         if plan.action == "mixed_population":
             return await self._answer_self_employed_sme_population_warning(query, plan.region)
@@ -4412,6 +4438,9 @@ class NaturalLanguageAnswerEngine:
             gap = cls._fulfillment_gap(result, query, route_payload)
             if gap:
                 result.update(gap)
+                result["capability_state"] = "partial_fulfillment"
+                result["actual_query_supported"] = False
+                result["verification_level"] = "query_partial"
 
         if notes:
             result["검증_주의"] = notes
@@ -4719,6 +4748,7 @@ async def _quick_stat_core(
             "used_period": used_period,
             "period_age_years": age,
             "지역": region, "통계표": param.tbl_nm,
+            "org_id": param.org_id, "tbl_id": param.tbl_id,
             "출처": "통계청 KOSIS",
         }
         if latest_policy:
@@ -4955,6 +4985,15 @@ async def _quick_trend_core(
         raise
     if not param:
         return {"오류": f'"{query}" 사전 매핑 없음'}
+    unsupported_dimensions = _quick_stat_unsupported_dimensions(query)
+    if unsupported_dimensions:
+        return _unsupported_quick_stat_response(
+            query,
+            param,
+            unsupported_dimensions,
+            _canonical_region(region) or region,
+            f"{normalized_start_year or 'latest'}~{normalized_end_year or 'latest'}",
+        )
     query_region = _extract_single_region_from_query(query)
     if region == "전국" and query_region:
         region = query_region
