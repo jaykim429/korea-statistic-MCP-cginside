@@ -6059,12 +6059,22 @@ async def detect_outliers(
         scale_method_used = "std"
         if scale_method == "mad":
             robust_center = float(np.median(score_values))
-            mad = float(np.median(np.abs(score_values - robust_center)))
+            robust_deviations = np.abs(score_values - robust_center)
+            mad = float(np.median(robust_deviations))
             robust_scale = 1.4826 * mad
             if robust_scale > 0:
                 center = robust_center
                 scale = robust_scale
                 scale_method_used = "mad"
+            else:
+                tolerance = max(
+                    np.finfo(float).eps * max(1.0, float(np.max(np.abs(score_values)))) * 10,
+                    1e-12,
+                )
+                if np.any(robust_deviations > tolerance):
+                    center = robust_center
+                    scale = tolerance
+                    scale_method_used = "mad_zero_tolerance"
         if scale == 0:
             return {
                 "status": "executed",
