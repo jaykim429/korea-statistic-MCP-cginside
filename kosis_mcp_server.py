@@ -6302,6 +6302,11 @@ def _chart_json_response(payload: dict[str, Any]) -> list:
     """Return one parseable text payload so the chatbot can verify rows before rendering SVG."""
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 
+
+_UNSUPPORTED_CHART_REGION_SCOPE = re.compile(
+    r"(?:북한|해외|외국|미국|중국|일본|러시아|유럽|아시아|아프리카)"
+)
+
 @mcp.tool()
 async def chart_line(
     query: str, region: str = "전국", years: int = 10,
@@ -6314,6 +6319,17 @@ async def chart_line(
     """[🎨] 시계열 라인 차트 SVG (챗봇에 인라인 렌더링)."""
     query_region = _extract_single_region_from_query(query)
     requested_region = query_region or region
+    unsupported_scope = _UNSUPPORTED_CHART_REGION_SCOPE.search(query)
+    if not query_region and region == "전국" and unsupported_scope:
+        requested_region = unsupported_scope.group(0)
+        return _chart_json_response(_chart_query_failure_payload(
+            query,
+            requested_region,
+            {
+                "코드": "REGION_UNSUPPORTED",
+                "오류": f'지역 범위 "{requested_region}"은 현재 검증된 지역별 차트 조회에서 지원하지 않습니다.',
+            },
+        ))
     if region == "전국" and query_region:
         region = query_region
     _, _, period_error = _normalize_explicit_year_range(start_year, end_year)
