@@ -29,8 +29,34 @@ class OptionalBearerAuthMiddleware:
             return
 
         path = str(scope.get("path") or "")
+
+        # Liveness — the process is up. Always 200, no dependency checks.
+        # Kept byte-compatible with the previous behavior so existing monitors and
+        # scripts/eval_tool_contracts.py keep passing.
         if path in {"/health", "/healthz"}:
             await self._json(send, 200, {"status": "ok", "service": "kosis-analysis-mcp"})
+            return
+
+        # Readiness — the process can actually serve KOSIS queries.
+        #
+        # Liveness alone is not enough to catch the failure that actually happens in
+        # deployment: the container starts fine but KOSIS_API_KEY was never passed, so
+        # every query fails at kosis_analysis/client.py ("KOSIS_API_KEY 설정 필요").
+        # From the caller's side that is indistinguishable from the MCP being down, and
+        # the chatbot ends up replacing every statistics answer with a connection notice.
+        # Returning 503 here makes that state visible to `docker compose ps` and to any
+        # caller that wants to gate on it, instead of failing one query at a time.
+        if path in {"/readyz", "/readiness"}:
+            has_api_key = bool(os.environ.get("KOSIS_API_KEY", "").strip())
+            await self._json(
+                send,
+                200 if has_api_key else 503,
+                {
+                    "status": "ready" if has_api_key else "not_ready",
+                    "service": "kosis-analysis-mcp",
+                    "checks": {"kosis_api_key": "ok" if has_api_key else "missing"},
+                },
+            )
             return
 
         if self.token and not self._authorized(scope):

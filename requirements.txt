@@ -1,4 +1,9 @@
-mcp[cli]>=1.0.0
+# 상한 필수. mcp 2.x는 FastMCP를 MCPServer로 개명하고 mcp.server.fastmcp를 제거했으므로
+# 이 코드베이스(v1 API 사용)는 import 단계에서 죽는다. 상한이 없으면 재빌드하는 시점에
+# 따라 컨테이너가 크래시 루프에 빠지고, 호출하는 쪽에서는 MCP 연결 오류로만 보인다.
+# v2로 올릴 때는 마이그레이션 가이드 참고:
+# https://py.sdk.modelcontextprotocol.io/v2/migration/#fastmcp-renamed-to-mcpserver
+mcp[cli]>=1.0.0,<2
 httpx>=0.27.0
 numpy>=1.24.0
 scipy>=1.10.0
