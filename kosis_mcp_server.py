@@ -4250,6 +4250,33 @@ class NaturalLanguageAnswerEngine:
             )
         return warnings
 
+    # (표시명, 질문·지표 텍스트에서 찾을 패턴)
+    _ENTITY_QUALIFIERS: tuple[tuple[str, str], ...] = (
+        ("중소기업", r"중소기업|중소제조업|중견기업"),
+        ("소상공인", r"소상공인|소기업|자영업"),
+        ("벤처", r"벤처|스타트업|창업기업"),
+        ("여성기업", r"여성기업|여성\s*기업인|여성CEO"),
+        # "청년"은 위 age 판정이 담당한다 — 여기 넣으면 같은 누락을 두 번 센다.
+        ("외국인", r"외국인|외국계"),
+    )
+
+    @staticmethod
+    def _executed_label_text(result: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("지표", "통계표", "통계명", "answer", "답변"):
+            value = result.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+        rows = result.get("data") or result.get("데이터") or []
+        if isinstance(rows, list):
+            for row in rows[:5]:
+                if isinstance(row, dict):
+                    for key in ("지표", "통계표"):
+                        value = row.get(key)
+                        if isinstance(value, str):
+                            parts.append(value)
+        return " ".join(parts)
+
     @classmethod
     def _fulfillment_gap(
         cls,
@@ -4278,13 +4305,26 @@ class NaturalLanguageAnswerEngine:
             dropped.append("comparison")
             reasons.append(f"비교 대상 {comparison_targets} 이(가) 단일 응답으로 축소됨")
 
+        # 실행된 지표/표/답변 문구. 매핑이 이미 조건을 담고 있으면(예: 큐레이션 "청년 실업률" → 성/연령별 실업률
+        # 15~29세) 그 차원을 누락으로 세지 않는다. 이전에는 "청년"이 질문에 있기만 하면 partial 로 떨어져
+        # 정답(5.4%)이 클라이언트 계약 검증에서 버려졌다.
+        executed_text = cls._executed_label_text(result)
         age_requested = (
             bool(re.search(r"\d+\s*[-~]\s*\d+\s*세", query))
             or any(term in q_compact for term in ("청년", "연령별", "연령", "나이"))
         )
-        if age_requested and answer_type not in {"search_and_plan"}:
+        age_executed = bool(re.search(r"청년|연령|\d+\s*[-~]\s*\d+\s*세|\d+세", executed_text))
+        if age_requested and not age_executed and answer_type not in {"search_and_plan"}:
             dropped.append("age")
             reasons.append("연령/청년 조건을 만족하는 분류축 호출이 실행되지 않음")
+
+        # 모집단 한정어("중소기업 수출액")가 매핑된 지표에 없으면 전체 값이 조용히 대답된다(실측: 전국 총수출액).
+        # 한정어가 질문에는 있고 실행된 지표·표명에는 없으면 부분충족으로 표시해 클라이언트가 그대로 내지 않게 한다.
+        for qualifier, pattern in cls._ENTITY_QUALIFIERS:
+            if re.search(pattern, q_compact) and not re.search(pattern, re.sub(r"\s+", "", executed_text)):
+                dropped.append("entity")
+                reasons.append(f"'{qualifier}' 한정 조건이 실행된 지표에 반영되지 않음 (전체 모집단 값)")
+                break
 
         if cls._is_aggregation_question(query) and answer_type not in {
             "tier_a_region_sum", "tier_a_composite_share_ratio", "tier_a_top_n_share_ratio",
