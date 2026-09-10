@@ -939,6 +939,7 @@ from kosis_curation import (
     routing_hints as _routing_hints,
     topic_hints as _topic_hints,
     stats_summary as _curation_stats_summary,
+    _AMBIGUOUS_TOKENS as _BARE_INDICATOR_TOKENS,
 )
 
 # Phase 2 추가 차트 4종 (별도 모듈)
@@ -3998,6 +3999,14 @@ class NaturalLanguageAnswerEngine:
             )
         return hints
 
+    @staticmethod
+    def _bare_indicator(query: str) -> Optional[str]:
+        """질문이 '매출액 알려줘'처럼 지표 한 단어(+명령형)만이면 그 지표를 돌려준다."""
+        core = re.sub(r"(?:을|를|은|는|이|가)?\s*(?:좀\s*)?(?:알려|보여|조회|말해|찾아)?\s*(?:해\s*)?(?:줘|주세요|해|볼래|봐)?\s*[.!?]?$", "", query.strip())
+        core = re.sub(r"\s+", "", core)
+        bare_extra = {"종사자수", "사업체수", "기업수", "수출액", "수입액", "영업이익", "생산액", "부가가치", "창업기업수", "창업수"}
+        return core if (core in _BARE_INDICATOR_TOKENS or core in bare_extra) and len(core) >= 2 else None
+
     async def answer(
         self,
         query: str,
@@ -4005,6 +4014,23 @@ class NaturalLanguageAnswerEngine:
         start_year: Optional[str] = None,
         end_year: Optional[str] = None,
     ) -> dict[str, Any]:
+        # "매출액", "종사자 수" 처럼 대상이 빠진 지표 한 단어는 어느 표든 걸리는 대로 답하면 오답이다
+        # (실측: "매출액 알려줘" → 블록체인 부문 예상 매출액). 값을 만들지 않고 대상을 되묻는 후보 선택 응답을 낸다.
+        bare = self._bare_indicator(query)
+        if bare:
+            return {
+                "상태": "needs_table_selection",
+                "status": "needs_table_selection",
+                "코드": STATUS_NEEDS_TABLE_SELECTION,
+                "code": STATUS_NEEDS_TABLE_SELECTION,
+                "actual_query_supported": False,
+                "answer_type": "ambiguous_indicator",
+                "answer": f"'{bare}'만으로는 어느 대상(중소기업·소상공인·벤처기업·전체 산업 등)의 통계인지 정할 수 없습니다. 대상을 함께 말씀해 주세요.",
+                "질문": query,
+                "지표": bare,
+                "대상_예시": [f"중소기업 {bare}", f"소상공인 {bare}", f"벤처기업 {bare}", f"전체 산업 {bare}"],
+                "diagnostics": {"tool_mode": "convenience", "markers_present": ["ambiguous_indicator"], "fulfillment_status": "needs_table_selection"},
+            }
         route_payload = self._route_payload(query)
         result = await self._dispatch(
             query,
