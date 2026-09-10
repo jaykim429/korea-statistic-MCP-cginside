@@ -4921,12 +4921,12 @@ def _normalize_explicit_year_range(
     if error:
         return None, None, error
     if end and not start:
-        return None, None, {
-            "status": "invalid_input",
-            "오류": "end_year만 단독으로 지정할 수 없습니다. start_year를 함께 지정하세요.",
-            "field": "end_year",
-            "value": end_year,
-        }
+        # end_year 단독은 "그 해 하나"를 뜻하는 것으로 해석한다.
+        # 챗봇(LLM)이 "2024년 GDP 성장률" 같은 단일 연도 질문에 end_year="2024"만 넘기는 일이
+        # 실측에서 반복됐고, 그때 여기서 invalid_input 으로 거부되어 "기간 형식을 해석할 수 없습니다"가
+        # 사용자에게 나갔다. 같은 질문을 end_year 없이 보내면 2024년 2.2%가 정상 반환된다 —
+        # 즉 데이터는 있는데 인자 형식 때문에 실패한 것이다. 단일 연도로 정규화해 살린다.
+        start = end
     if start and end and int(start) > int(end):
         return None, None, {
             "status": "invalid_input",
