@@ -7903,7 +7903,7 @@ async def _search_kosis_keywords(
             try:
                 r = await _kosis_call(client, "statisticsSearch.do", {
                     "method": "getList", "apiKey": key,
-                    "searchNm": kw, "format": "json", "jsonVD": "Y", "resultCount": limit,
+                    "searchNm": kw, "format": "json", "jsonVD": "Y", "resultCount": max(limit, 20),
                 })
                 for item in r:
                     item["_검색어"] = kw
@@ -7987,7 +7987,7 @@ async def _search_kosis_keywords(
     # limit 은 관련도 필터·정렬 뒤에 적용한다 — 앞에서 자르면 첫 검색어(원문)에 느슨하게 걸린 잡음이 자리를 차지해
     # 뒤 검색어로 찾은 정답 표가 밀려난다(실측: "벤처기업 수" 결과 0건, "벤처기업" 5건).
     result_rows: list[dict[str, Any]] = []
-    for row in unique[: max(limit * 5, 40)]:
+    for row in unique:
         record = {
             "통계표명": row.get("TBL_NM"),
             "통계표ID": row.get("TBL_ID"),
@@ -8106,8 +8106,13 @@ def _query_match_quality(query: Any, candidate_text: Any) -> dict[str, Any]:
     matched = [token for token in tokens if _query_token_matches_text(token, candidate_text)]
     missing = [token for token in tokens if token not in matched]
     ratio = round(len(matched) / len(tokens), 4) if tokens else 1.0
-    total_weight = sum(_query_token_weight(token) for token in tokens)
-    matched_weight = sum(_query_token_weight(token) for token in matched)
+    # 한국어 질의는 마지막 내용어가 머리 명사다("청년 창업" → 창업 통계, "부산 소상공인 사업체" → 사업체). 머리 명사만 걸린 표가
+    # 수식어만 걸린 표보다 앞에 오도록 가중한다. 순위에만 쓰이고 근거(matched_terms)는 그대로 노출된다.
+    head = tokens[-1] if len(tokens) >= 2 else None
+    def _w(token: str) -> float:
+        return _query_token_weight(token) * (1.5 if token == head else 1.0)
+    total_weight = sum(_w(token) for token in tokens)
+    matched_weight = sum(_w(token) for token in matched)
     weighted_ratio = round(matched_weight / total_weight, 4) if total_weight else 1.0
     return {
         "query_terms": tokens,
@@ -8136,7 +8141,7 @@ def _search_candidate_text(row: dict[str, Any]) -> str:
 
 
 def _search_candidate_title(row: dict[str, Any]) -> str:
-    return str(row.get("table_name") or row.get("?듦퀎?쒕챸") or row.get("TBL_NM") or row.get("STATBL_NM") or "")
+    return str(row.get("table_name") or row.get("통계표명") or row.get("?듦퀎?쒕챸") or row.get("TBL_NM") or row.get("STATBL_NM") or "")
 
 
 def _query_title_focus_ratio(query: Any, title: Any) -> float:
@@ -9376,6 +9381,15 @@ async def search_kosis(
         if hints:
             keywords = [query, *hints[:3]]
             used_routing = True
+    # 두 단어 이상의 내용어("청년 창업")는 KOSIS 검색이 구절 전체로만 느슨하게 걸려 정답 표("업종별·연령별 창업기업수")를
+    # 놓친다(실측 A3: 결과 1건, 잡음). 내용어 구절과 내용어 하나씩도 함께 검색해 합치고, 뒤의 관련도 정렬·필터가 잡음을 걷어 낸다.
+    content_query = _content_search_query(query)
+    if content_query and content_query != query:
+        keywords.append(content_query)
+    content_tokens = [t for t in _query_tokens_for_matching(content_query or query) if not re.search(r"\d", t)]
+    if len(content_tokens) >= 2:
+        keywords.extend(content_tokens[:3])
+    keywords = list(dict.fromkeys(keywords))
 
     return await _search_kosis_keywords(
         query,
