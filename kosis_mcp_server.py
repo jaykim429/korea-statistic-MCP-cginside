@@ -2674,7 +2674,7 @@ class NaturalLanguageAnswerEngine:
         if "STAT_GROWTH_RATE" in route_payload.get("intents", []):
             return True
         q = self._norm(query)
-        return any(term in q for term in ("전년대비", "전월대비", "증가율", "감소율", "변화율", "얼마나늘", "얼마나줄"))
+        return any(term in q for term in ("전년대비", "전월대비", "증가율", "감소율", "변화율", "얼마나늘", "얼마나줄", "상승률", "하락률", "올랐", "떨어졌"))
 
     @staticmethod
     def _growth_period_count(query: str) -> int:

@@ -2668,7 +2668,8 @@ class NaturalLanguageRouter:
             add("METADATA_LOOKUP")
         if any(term in q_norm for term in ("최근", "추이", "연도별", "시계열", "코로나이후", "2020년이후")):
             add("STAT_TIME_SERIES")
-        if any(term in q_norm for term in ("늘", "증가", "감소", "변화율", "증가율", "전년대비", "전월대비", "회복")):
+        # "물가 상승률"처럼 상승률·하락률을 물으면 지수 수준이 아니라 변화율을 계산해야 한다 (실측: 소비자물가 상승률 → 120.05 지수)
+        if any(term in q_norm for term in ("늘", "증가", "감소", "변화율", "증가율", "전년대비", "전월대비", "회복", "상승률", "하락률", "올랐", "떨어졌", "내렸")):
             add("STAT_GROWTH_RATE")
         if any(term in q_norm for term in ("비중", "비율", "차지", "구성비")):
             add("STAT_SHARE_RATIO")
