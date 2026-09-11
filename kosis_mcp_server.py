@@ -3813,10 +3813,12 @@ class NaturalLanguageAnswerEngine:
             for term in (route.get("search_terms") or [])
             if str(term).strip()
         ]
-        # 라우팅 확장어가 있어도 사용자의 원문을 첫 검색어로 보존한다.
-        search_keywords: list[str] = [query]
+        # 검색어는 내용어만(명령형·'관련'·'통계' 같은 일반어 제외). 원문 그대로 넣으면 KOSIS가 일반어로 걸린 무관한 표를
+        # 돌려준다(실측). 내용어가 없을 때만 원문을 쓴다.
+        content_query = _content_search_query(query) or query
+        search_keywords: list[str] = [content_query]
         if enriched_query != query:
-            search_keywords.append(enriched_query)
+            search_keywords.append(_content_search_query(enriched_query) or enriched_query)
         for term in route_terms:
             missing_slot_terms = [slot_term for slot_term in slot_terms if slot_term not in term]
             if missing_slot_terms:
@@ -7998,6 +8000,22 @@ async def _search_kosis_keywords(
         )
         result_rows.append(_catalog_candidate_with_query_status(record))
     result_rows = _sort_search_candidates(query, result_rows)
+    # 내용어가 하나라도 걸린 표가 있으면, 하나도 안 걸린 표는 잡음이므로 뺀다. 같은 표명(연도별 변종)도 하나만 남긴다.
+    content_terms = _query_tokens_for_matching(query)
+    if content_terms:
+        matched_rows = [row for row in result_rows if (row.get("match_quality") or {}).get("matched_terms")]
+        # 내용어가 하나도 안 걸린 표만 남았으면 KOSIS 검색이 느슨하게 맞춘 잡음이다 → 빈 결과로 돌려 "없다"고 말하게 한다
+        result_rows = matched_rows
+    seen_names: set[str] = set()
+    deduped_rows: list[dict[str, Any]] = []
+    for row in result_rows:
+        name = re.sub(r"\s+", "", str(row.get("통계표명") or ""))
+        if name and name in seen_names:
+            continue
+        if name:
+            seen_names.add(name)
+        deduped_rows.append(row)
+    result_rows = deduped_rows
     quality_summary = _search_quality_summary(query, result_rows)
     if result_rows and quality_summary["full_query_match_count"] == 0:
         search_markers.append("no_full_query_match")
@@ -8038,8 +8056,17 @@ async def _search_kosis_keywords(
 
 _QUERY_STOP_TERMS = {
     "알려줘", "알려", "보여줘", "찾아줘", "최근", "추이", "기준", "통계", "자료",
+    # 일반어 — 실측: "아동복지 관련 중소기업 통계"에서 '관련'만 걸린 공무원범죄자(직무관련)·통계 관련인력 표가 후보로 나갔다
+    "관련", "관해", "관하여", "연관", "현황", "정보", "대한", "대해", "대해서", "조회", "확인", "전체",
+    "알려주세요", "보여주세요", "찾아", "얼마", "얼마나", "얼마야", "얼마나요", "있어", "있나요", "있는지",
     "the", "and", "for", "with", "show", "find", "data", "stat", "stats",
 }
+
+
+def _content_search_query(query: Any) -> str:
+    """검색어용 질의: 명령형·일반어를 뺀 내용어만 남긴다("아동복지 관련 중소기업 통계" → "아동복지 중소기업")."""
+    tokens = _query_tokens_for_matching(query)
+    return " ".join(tokens)
 
 
 def _query_tokens_for_matching(query: Any) -> list[str]:
