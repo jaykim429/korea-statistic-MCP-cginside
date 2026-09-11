@@ -7984,8 +7984,10 @@ async def _search_kosis_keywords(
         if tier_a_hint is not None else
         "Search returned candidate tables; verify each candidate via select_table_for_query before use."
     )
+    # limit 은 관련도 필터·정렬 뒤에 적용한다 — 앞에서 자르면 첫 검색어(원문)에 느슨하게 걸린 잡음이 자리를 차지해
+    # 뒤 검색어로 찾은 정답 표가 밀려난다(실측: "벤처기업 수" 결과 0건, "벤처기업" 5건).
     result_rows: list[dict[str, Any]] = []
-    for row in unique[:limit]:
+    for row in unique[: max(limit * 5, 40)]:
         record = {
             "통계표명": row.get("TBL_NM"),
             "통계표ID": row.get("TBL_ID"),
@@ -8015,7 +8017,7 @@ async def _search_kosis_keywords(
         if name:
             seen_names.add(name)
         deduped_rows.append(row)
-    result_rows = deduped_rows
+    result_rows = deduped_rows[:limit]
     quality_summary = _search_quality_summary(query, result_rows)
     if result_rows and quality_summary["full_query_match_count"] == 0:
         search_markers.append("no_full_query_match")
@@ -8066,6 +8068,8 @@ _QUERY_STOP_TERMS = {
 def _content_search_query(query: Any) -> str:
     """검색어용 질의: 명령형·일반어를 뺀 내용어만 남긴다("아동복지 관련 중소기업 통계" → "아동복지 중소기업")."""
     tokens = _query_tokens_for_matching(query)
+    # 연도·기간 표현("2020년부터", "2023년까지", "최근5년")은 검색어가 아니다 — 넣으면 KOSIS 검색이 엉뚱한 표를 낸다(실측 V5)
+    tokens = [t for t in tokens if not re.search(r"\d", t) and t not in ("부터", "까지", "사이", "동안", "이후", "이전", "기간")]
     return " ".join(tokens)
 
 
