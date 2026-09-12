@@ -394,6 +394,15 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
     }
     diagnostics = {k: v for k, v in diagnostics.items() if v not in (None, "", [], {})}
 
+    # 증가율·상승률 질문(tier_a_growth_rate)의 대표값은 '변화율'이다. 지수·금액 수준을 value 로 내보내면
+    # 소비자에게 "소비자물가 상승률 = 114.18 지수"처럼 잘못 전달된다(실측: 비율과 절대값 혼동).
+    comparison_block = payload.get("comparison") or payload.get("비교")
+    growth_value: Optional[float] = None
+    if str(metadata.get("answer_type") or "") in {"tier_a_growth_rate", "tier_a_trend_growth"} and isinstance(comparison_block, dict):
+        rate = comparison_block.get("변화율_퍼센트")
+        if isinstance(rate, (int, float)):
+            growth_value = float(rate)
+
     compact = {
         # Machine status carries fulfillment checks (for example partial when an
         # age dimension was dropped) and must win over the legacy Korean status.
@@ -405,8 +414,11 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "answer_type": metadata.get("answer_type"),
         "answer": payload.get("answer") or payload.get("답변"),
         "error": payload.get("error") or payload.get("오류"),
-        "value": payload.get("value") or payload.get("값") or _first_payload_row_field("값"),
-        "unit": metadata.get("unit"),
+        "value": growth_value if growth_value is not None else (payload.get("value") or payload.get("값") or _first_payload_row_field("값")),
+        "unit": "%" if growth_value is not None else metadata.get("unit"),
+        # 증가율로 바꾼 경우 원래 수준값과 단위도 함께 남긴다 — 표·차트에서 그대로 쓴다
+        "level_value": payload.get("value") or payload.get("값") or _first_payload_row_field("값") if growth_value is not None else None,
+        "level_unit": metadata.get("unit") if growth_value is not None else None,
         "region": metadata.get("region"),
         "used_period": payload.get("used_period") or metadata.get("period"),
         "period_age_years": metadata.get("period_age_years"),
@@ -416,7 +428,7 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "data": data,
         "comparison": payload.get("comparison") or payload.get("비교"),
         "calculation": payload.get("calculation") or payload.get("계산"),
-        "metadata": metadata,
+        "metadata": {**metadata, "unit": "%", "level_unit": metadata.get("unit")} if growth_value is not None else metadata,
         "notes": notes,
         "diagnostics": diagnostics,
     }
@@ -8073,6 +8085,51 @@ def _content_search_query(query: Any) -> str:
     return " ".join(tokens)
 
 
+# 사용자가 붙여 쓰는 합성어를 끊어 내기 위한 측정 명사. 긴 토큰이 표명에 그대로 없을 때만 쓴다
+# (실측: "소상공인사업체수" 는 어떤 표명에도 없어 결과 0건이 됐다).
+_MEASURE_NOUNS: tuple[str, ...] = (
+    "사업체수", "사업체", "종사자수", "종사자", "근로자수", "근로자", "매출액", "수출액", "수입액",
+    "생산액", "부가가치", "영업이익", "취업자수", "취업자", "실업자수", "실업자", "기업수", "가구수",
+    "인구수", "학생수", "농가수", "어가수", "발전량", "소비량", "배출량", "처리량", "투자액", "이용률",
+    "증가율", "감소율", "상승률", "하락률", "실업률", "고용률", "출산율", "비중", "비율",
+)
+# 흔한 표기 흔들림 — 표명 어휘와 맞춰야 내용어 필터가 정상 동작한다(실측: "실업율" 결과 0건)
+_TOKEN_TYPO_FIXES: tuple[tuple[str, str], ...] = (
+    ("실업율", "실업률"), ("고용율", "고용률"), ("출산율", "출산률"), ("증가율", "증가률"),
+    ("사업채", "사업체"), ("종사자수", "종사자수"), ("물가상승율", "물가상승률"),
+)
+
+
+def _normalize_typo_token(token: str) -> str:
+    """'실업율' → '실업률' 처럼 표명 표기에 맞춘다. 바꿀 게 없으면 그대로."""
+    for wrong, right in _TOKEN_TYPO_FIXES:
+        if token == wrong:
+            return right
+    # 일반 규칙: 받침 있는 한자어 뒤의 '율'은 표명에서 '률'로 쓰인다(실업율→실업률, 고용율→고용률)
+    if len(token) >= 3 and token.endswith("율"):
+        return token[:-1] + "률"
+    return token
+
+
+def _normalize_typo_query(query: Any) -> str:
+    """질의 전체의 표기 흔들림을 표명 표기에 맞춘다 — KOSIS 검색 자체가 '실업율'로는 엉뚱한 표를 준다(실측)."""
+    text = str(query or "")
+    out = []
+    for token in re.findall(r"[0-9A-Za-z가-힣]+|[^0-9A-Za-z가-힣]+", text):
+        out.append(_normalize_typo_token(token) if re.fullmatch(r"[0-9A-Za-z가-힣]+", token) else token)
+    return "".join(out)
+
+
+def _split_compound_token(token: str) -> list[str]:
+    """'소상공인사업체수' → ['소상공인', '사업체수'] 처럼 측정 명사 앞에서 한 번 끊는다."""
+    for noun in _MEASURE_NOUNS:
+        if len(token) > len(noun) + 1 and token.endswith(noun):
+            head = token[: -len(noun)]
+            if len(head) >= 2:
+                return [head, noun]
+    return []
+
+
 def _query_tokens_for_matching(query: Any) -> list[str]:
     text = str(query or "").replace("R&D", "RD").replace("r&d", "rd")
     tokens = re.findall(r"[0-9A-Za-z가-힣]+", text)
@@ -8087,6 +8144,16 @@ def _query_tokens_for_matching(query: Any) -> list[str]:
 
 def _query_token_matches_text(token: str, text: Any) -> bool:
     norm = _compact_text(token)
+    if norm:
+        body = _compact_text(str(text or "").replace("R&D", "RD").replace("r&d", "rd"))
+        if norm not in body:
+            # 표기 흔들림(실업율/실업률)과 붙여 쓴 합성어(소상공인사업체수)를 한 번 더 본다
+            fixed = _normalize_typo_token(norm)
+            if fixed != norm and fixed in body:
+                return True
+            parts = _split_compound_token(norm)
+            if parts and all(_compact_text(p) in body for p in parts):
+                return True
     if not norm:
         return False
     if re.fullmatch(r"[0-9a-z]+", norm):
@@ -9383,7 +9450,11 @@ async def search_kosis(
             used_routing = True
     # 두 단어 이상의 내용어("청년 창업")는 KOSIS 검색이 구절 전체로만 느슨하게 걸려 정답 표("업종별·연령별 창업기업수")를
     # 놓친다(실측 A3: 결과 1건, 잡음). 내용어 구절과 내용어 하나씩도 함께 검색해 합치고, 뒤의 관련도 정렬·필터가 잡음을 걷어 낸다.
-    content_query = _content_search_query(query)
+    # 표기 흔들림 교정본도 함께 검색한다("실업율" → "실업률")
+    typo_fixed = _normalize_typo_query(query)
+    if typo_fixed and typo_fixed != query:
+        keywords.append(typo_fixed)
+    content_query = _content_search_query(typo_fixed or query)
     if content_query and content_query != query:
         keywords.append(content_query)
     content_tokens = [t for t in _query_tokens_for_matching(content_query or query) if not re.search(r"\d", t)]
