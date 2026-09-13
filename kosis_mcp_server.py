@@ -1907,6 +1907,39 @@ def _analysis_must_know(
     }
 
 
+def _growth_materials(times: list[str], values: list[float], unit: Optional[str] = None) -> dict[str, Any]:
+    """연평균증가율(CAGR)·총증감·연평균 증감액을 산식과 함께 돌려준다.
+
+    전문가는 "최근 5년 연평균 증가율"을 그대로 묻는다. 시계열만 주고 계산을 호출자에게 떠넘기면
+    모델이 제각기 계산해 값이 흔들린다(실측). 계산은 코드가 하고, 산식을 함께 실어 검증 가능하게 둔다.
+    """
+    if len(values) < 2:
+        return {}
+    start_value, end_value = float(values[0]), float(values[-1])
+    periods = max(1, len(values) - 1)
+    total_change = end_value - start_value
+    total_change_pct = (total_change / abs(start_value) * 100) if start_value else None
+    cagr = None
+    if start_value > 0 and end_value > 0:
+        cagr = ((end_value / start_value) ** (1 / periods) - 1) * 100
+    return {
+        "시작": {"시점": times[0], "값": start_value},
+        "종료": {"시점": times[-1], "값": end_value},
+        "구간수": periods,
+        "총증감": round(total_change, 4),
+        "총증감률_퍼센트": round(total_change_pct, 4) if total_change_pct is not None else None,
+        "연평균증감": round(total_change / periods, 4),
+        "연평균증가율_퍼센트": round(cagr, 4) if cagr is not None else None,
+        "단위": unit,
+        "산식": {
+            "총증감률": "(종료값 - 시작값) / |시작값| x 100",
+            "연평균증가율": "((종료값 / 시작값)^(1/구간수) - 1) x 100  (양수 구간에서만 계산)",
+            "연평균증감": "(종료값 - 시작값) / 구간수",
+        },
+        "주의": "구간수는 관측 시점 수 - 1이다. 시점이 연속하지 않으면(결측) 연평균 해석에 주의한다.",
+    }
+
+
 def _analysis_common_pitfalls(series_result: dict[str, Any], values: list[float]) -> list[dict[str, Any]]:
     unit = series_result.get("단위") or series_result.get("unit") or ""
     pitfalls: list[dict[str, Any]] = []
@@ -5791,6 +5824,8 @@ async def analyze_trend(
         "must_know": _analysis_must_know(series_result, times, values),
         "input": _analysis_input_materials(times, values),
         "data_characteristics": _series_characteristics(times, values, unit=series_result.get("단위")),
+        # 연평균증가율·총증감은 전문가 질문에 그대로 쓰인다 — 모델이 다시 계산하지 않게 코드가 값과 산식을 준다
+        "증감_계산": _growth_materials(times, values, unit=series_result.get("단위")),
         "common_pitfalls": _analysis_common_pitfalls(series_result, values),
         "analysis_materials": {
             "available_methods": valid_methods,
