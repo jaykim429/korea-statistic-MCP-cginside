@@ -46,6 +46,15 @@ class TestReachable:
     def test_가계대출(self, q):
         assert router.match_direct_stat_key(q) == "가계대출_총잔액"
 
+    @pytest.mark.parametrize(("q", "expected"), [
+        ("태양광 발전량 얼마야?", "태양광생산량"),
+        ("풍력 발전량 알려줘", "풍력생산량"),
+        ("수력 발전량", "수력생산량"),
+    ])
+    def test_발전량으로도_닿는다(self, q, expected):
+        # 전력은 실무에서 "발전량"이라 부르는데 키는 "생산량"이라 검색으로 떨어졌다(실측 S41·S42)
+        assert router.match_direct_stat_key(q) == expected
+
     def test_표_정보가_실제로_붙어_있다(self):
         # 매핑만 되고 표가 없으면 소용없다
         for key in ("초미세먼지_PM25", "미세먼지_PM10", "가계대출_총잔액"):
