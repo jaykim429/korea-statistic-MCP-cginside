@@ -1270,6 +1270,20 @@ del _industry, _industry_code, _scale_label, _scale_code, _metric, _tbl, _itm, _
 # ============================================================================
 
 SYNONYMS: dict[str, str] = {
+    # 대기오염도·가계대출은 표·항목·단위까지 확정돼 있는데 부르는 말이 없어 어휘 검색으로 떨어졌다.
+    # 실측 S40: "초미세먼지 농도 알려줘" 가 '농도' 한 단어만 걸려 '요중 납 농도'를 후보로 냈다.
+    # '초미세먼지'가 '미세먼지'를 포함하므로 구체어 우선 규칙이 둘을 옳게 가른다.
+    "초미세먼지": "초미세먼지_PM25",
+    "초미세먼지농도": "초미세먼지_PM25",
+    "PM2.5": "초미세먼지_PM25",
+    "PM25": "초미세먼지_PM25",
+    "미세먼지": "미세먼지_PM10",
+    "미세먼지농도": "미세먼지_PM10",
+    "PM10": "미세먼지_PM10",
+    "대기오염도": "미세먼지_PM10",
+    "가계대출": "가계대출_총잔액",
+    "가계부채": "가계대출_총잔액",
+    "가계대출잔액": "가계대출_총잔액",
     # 흔한 오타 (률/율 혼용) — 실측: "실업율 알려줘"가 연간 표로 빠져 월간 실업률과 다른 값이 나왔다
     "실업율": "실업률", "고용율": "고용률", "물가상승율": "물가상승률", "경제성장율": "경제성장률",
     "취업율": "취업률", "폐업율": "폐업률",
@@ -2594,21 +2608,22 @@ class NaturalLanguageRouter:
             alias_norm = self.normalize(alias)
             if (alias in q or alias_norm in q_norm) and canonical in self.tier_a_stats:
                 synonym_candidates.append((alias, canonical))
-        if synonym_candidates:
-            _, canonical = max(synonym_candidates, key=lambda pair: len(self.normalize(pair[0])))
-            return canonical
-
         # Tier A 부분 일치
-        candidates: list[str] = []
         for key in self.tier_a_stats:
             if key in _AMBIGUOUS_TOKENS:
                 continue
             if _is_blocked_business_base(key, q_norm):
                 continue
             if key in q or self.normalize(key) in q_norm:
-                candidates.append(key)
-        if candidates:
-            return max(candidates, key=lambda key: len(self.normalize(key)))
+                synonym_candidates.append((key, key))
+
+        # 동의어와 Tier A 키를 **함께** 놓고 가장 구체적인 것을 고른다.
+        # 예전에는 동의어에서 바로 반환해서, "제조업 중소기업 매출액 알려줘" 가 동의어
+        # '중소기업 매출액'에 걸려 전국 수치로 답했다 — 업종이 조용히 사라졌고, 값이
+        # 안 나오는 게 아니라 그럴듯한 틀린 값이 나갔다(실측: Tier A 191개 중 41개가 이랬다).
+        if synonym_candidates:
+            _, canonical = max(synonym_candidates, key=lambda pair: len(self.normalize(pair[0])))
+            return canonical
         return None
 
     def lookup(self, query: str) -> Optional[QuickStatParam]:
