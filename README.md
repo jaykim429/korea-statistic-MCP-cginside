@@ -864,6 +864,23 @@ NABO 원자료는 같은 `ITEM.label`이 여러 코드에서 반복될 수 있�
 
 예를 들어 “한국 GDP 증가했어?”라는 질문은 단순히 숫자 하나를 찾는 문제가 아닙니다. 어떤 GDP 표를 쓸지, 비교 기간이 전년 대비인지 전기 대비인지, 단위가 원인지 지수인지 확인해야 합니다. 이 서버는 그런 확인 지점을 marker와 contract로 드러냅니다.
 
+## 단위 검증 (네트워크 없이)
+
+순수 규칙은 서버나 KOSIS 키 없이 바로 확인합니다. 라이브 회귀는 몇 분이 걸리지만 이쪽은 0.4초입니다.
+
+```powershell
+python -m pytest tests\ -q
+```
+
+- `tests/test_text_match.py` — 질의 어휘 매칭(불용어·오타 교정·합성어 분해·매칭 품질).
+  이 규칙이 표 후보의 순위와 "이 표가 질문에 맞는가"를 정합니다.
+- `tests/test_curation_routing.py` — 자연어 → Tier A 지표 매핑. 엉뚱한 키가 나오면 값이 안 나오는 게
+  아니라 **그럴듯한 틀린 값**이 사용자에게 가므로, 라이브 검증보다 여기서 먼저 잡습니다.
+  `test_tier_a_전체가_자연어로_닿는다` 가 191개 지표를 한 번에 훑습니다.
+
+새 규칙을 넣을 때는 여기에 케이스를 먼저 추가하고, **그 테스트가 수정 이전 코드에서 실제로 실패하는지**
+확인하세요. 실패하지 않는 회귀 테스트는 있으나 마나입니다.
+
 ## 검증 스크립트
 
 라이브 KOSIS API 회귀 검증:
@@ -904,6 +921,8 @@ python scripts\eval_tool_contracts.py
 - `kosis_mcp_server.py`: MCP 서버와 도구 정의
 - `kosis_http_server.py`: Streamable HTTP MCP 서버 엔트리포인트
 - `kosis_curation.py`: 자연어 라우터, Tier A/B 큐레이션, 개념 그래프
+- `kosis_analysis/text_match.py`: 질의 어휘 매칭 규칙(순수 함수)
+- `tests/`: pytest 단위 검증 — 네트워크 없이 라우팅·매칭 규칙을 고정
 - `kosis_charts_extra.py`: 추가 SVG 차트 헬퍼
 - `docs/chatbot_integration.md`: Gemma 챗봇용 통계 MCP 도구 manifest 및 일관성 규칙
 - `scripts/regression_smoke.py`, `scripts/eval_gemma_workflow.py`, `scripts/comprehensive_api_matrix.py`, `scripts/temporal_edge_cases.py`, `scripts/natural_language_battery.py`: 라이브 API/워크플로우 회귀 검증 스크립트
