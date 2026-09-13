@@ -68,17 +68,12 @@ from kosis_analysis.metadata import (
     _validate_query_table_filters,
 )
 from kosis_analysis.text_match import (
-    _MEASURE_NOUNS,
-    _QUERY_STOP_TERMS,
     _content_search_query,
     _match_quality_rank,
     _normalize_typo_query,
-    _normalize_typo_token,
     _query_match_quality,
     _query_token_matches_text,
-    _query_token_weight,
     _query_tokens_for_matching,
-    _split_compound_token,
 )
 from kosis_analysis.periods import (
     LATEST_AVAILABLE,
