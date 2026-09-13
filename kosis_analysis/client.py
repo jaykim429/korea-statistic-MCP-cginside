@@ -31,6 +31,8 @@ def _env_int(name: str, default: int) -> int:
 META_CACHE_TTL = _env_float("KOSIS_MCP_META_CACHE_TTL", 3600.0)
 _META_CACHE: dict[tuple[Any, ...], tuple[float, list[dict]]] = {}
 
+# 분당 호출 상한(자체 보호용). 240~420 으로 올려 봤더니 연속 질문에서 KOSIS 가 빈 응답을 돌려줬다(실측) — 180을 유지한다.
+# 지연은 상한이 아니라 호출량으로 줄인다: 후보 메타는 동시 조회하고(_TABLE_META_CONCURRENCY) 평가 후보 수를 제한한다.
 RATE_LIMIT_CALLS = max(1, _env_int("KOSIS_MCP_RATE_LIMIT_CALLS", 180))
 RATE_LIMIT_WINDOW_SECONDS = max(
     0.001, _env_float("KOSIS_MCP_RATE_LIMIT_WINDOW_SECONDS", 60.0)

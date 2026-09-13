@@ -7907,23 +7907,34 @@ async def _search_kosis_keywords(
         keywords = [query]
     keywords = list(dict.fromkeys(keywords))
 
+    # 검색어별 호출은 서로 독립이다. 순차로 돌면 검색어 7개에 35초가 걸린다(실측 "재생에너지 발전 비중").
     async with httpx.AsyncClient() as client:
         all_results = []
         successful_calls = 0
         failures: list[str] = []
-        for kw in keywords:
-            try:
-                r = await _kosis_call(client, "statisticsSearch.do", {
-                    "method": "getList", "apiKey": key,
-                    "searchNm": kw, "format": "json", "jsonVD": "Y", "resultCount": max(limit, 20),
-                })
-                for item in r:
-                    item["_검색어"] = kw
-                all_results.extend(r)
-                successful_calls += 1
-            except RuntimeError as exc:
-                failures.append(type(exc).__name__)
+
+        search_semaphore = asyncio.Semaphore(_SEARCH_KEYWORD_CONCURRENCY)
+
+        async def _search_one(kw: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
+            async with search_semaphore:
+                try:
+                    rows = await _kosis_call(client, "statisticsSearch.do", {
+                        "method": "getList", "apiKey": key,
+                        "searchNm": kw, "format": "json", "jsonVD": "Y", "resultCount": max(limit, 20),
+                    })
+                except RuntimeError as exc:
+                    return kw, None, type(exc).__name__
+                return kw, rows, None
+
+        # 검색어 순서를 유지해야 첫 검색어(원문) 결과가 중복 제거에서 우선권을 갖는다
+        for kw, rows, failure in await asyncio.gather(*[_search_one(kw) for kw in keywords]):
+            if failure is not None:
+                failures.append(failure)
                 continue
+            for item in rows or []:
+                item["_검색어"] = kw
+            all_results.extend(rows or [])
+            successful_calls += 1
 
     if failures and successful_calls == 0:
         failure_types = list(dict.fromkeys(failures))
@@ -8128,6 +8139,12 @@ def _split_compound_token(token: str) -> list[str]:
             if len(head) >= 2:
                 return [head, noun]
     return []
+
+
+# 후보 표 메타데이터 동시 조회 수. 너무 키우면 KOSIS 쪽에서 막히고, 1이면 순차 조회와 같다.
+_TABLE_META_CONCURRENCY = max(1, int(os.getenv("KOSIS_MCP_TABLE_META_CONCURRENCY", "6")))
+# 검색어 동시 호출 수. KOSIS 검색은 검색어마다 왕복이 있어 순차로 돌면 그대로 누적된다.
+_SEARCH_KEYWORD_CONCURRENCY = max(1, int(os.getenv("KOSIS_MCP_SEARCH_CONCURRENCY", "4")))
 
 
 def _query_tokens_for_matching(query: Any) -> list[str]:
@@ -10838,21 +10855,47 @@ async def select_table_for_query(
         indicator=effective_indicator,
         reject_if_missing_dimensions=reject_if_missing_dimensions,
     )
-    async with httpx.AsyncClient() as client:
-        for row in raw_candidates:
-            org_id = str(row.get("기관ID") or "")
-            tbl_id = str(row.get("통계표ID") or "")
-            if not org_id or not tbl_id or (org_id, tbl_id) in seen:
-                continue
-            seen.add((org_id, tbl_id))
+    # 후보 메타데이터는 후보별로 순차 조회하면 KOSIS 왕복이 그대로 쌓인다(실측: 콜드 캐시에서 한 질문 40~56초).
+    # 후보끼리는 서로 독립이므로 동시에 받아 온다. 동시 실행 수는 KOSIS 쪽 부담을 고려해 제한한다.
+    unique_rows: list[dict[str, Any]] = []
+    for row in raw_candidates:
+        org_id = str(row.get("기관ID") or "")
+        tbl_id = str(row.get("통계표ID") or "")
+        if not org_id or not tbl_id or (org_id, tbl_id) in seen:
+            continue
+        seen.add((org_id, tbl_id))
+        unique_rows.append(row)
+
+    # 메타 조회는 KOSIS 호출량(분당 한도)을 그대로 먹는다. 후보 27개를 다 조회해도 결국 limit 개만 쓴다 —
+    # 표명이 지표 어휘와 겹치는 것부터 보고 상한을 둔다(실측: 한도에 걸려 한 질문이 50초씩 멈춤).
+    if effective_indicator:
+        indicator_terms = [t for t in _query_tokens_for_matching(effective_indicator)]
+
+        def _name_hits(row: dict[str, Any]) -> int:
+            name = str(row.get("통계표명") or "")
+            return sum(1 for t in indicator_terms if _query_token_matches_text(t, name))
+
+        unique_rows.sort(key=lambda row: -_name_hits(row))
+    # 반환은 limit 개다. 그보다 크게 잡아도 순위만 흔들릴 뿐 호출량(분당 한도)만 먹는다.
+    # limit 개만 반환하지만 상위 몇 개는 메타 검증에서 탈락하므로 여유를 둔다. 8로 줄였더니 후보 회수율이 떨어졌다(실측 "원자력 발전량").
+    meta_budget = max(limit + 4, 12)
+    if len(unique_rows) > meta_budget:
+        unique_rows = unique_rows[:meta_budget]
+
+    semaphore = asyncio.Semaphore(_TABLE_META_CONCURRENCY)
+
+    async def _evaluate(client: httpx.AsyncClient, row: dict[str, Any]) -> dict[str, Any]:
+        org_id = str(row.get("기관ID") or "")
+        tbl_id = str(row.get("통계표ID") or "")
+        async with semaphore:
             try:
                 name_rows, item_rows, period_rows = await asyncio.gather(
                     _fetch_meta(client, key, org_id, tbl_id, "TBL"),
                     _fetch_meta(client, key, org_id, tbl_id, "ITM"),
                     _fetch_meta(client, key, org_id, tbl_id, "PRD"),
                 )
-            except Exception as exc:
-                candidates.append({
+            except Exception as exc:  # 개별 표의 메타 실패는 다른 후보 평가를 막지 않는다
+                return {
                     "org_id": org_id,
                     "tbl_id": tbl_id,
                     "table_name": row.get("통계표명"),
@@ -10860,17 +10903,20 @@ async def select_table_for_query(
                     "error": str(exc),
                     "source": row.get("source"),
                     "search_term": row.get("search_term"),
-                })
-                continue
-            profile = TableMetadataProfile.from_rows(
-                org_id=org_id,
-                tbl_id=tbl_id,
-                candidate_row=row,
-                name_rows=name_rows,
-                item_rows=item_rows,
-                period_rows=period_rows,
-            )
-            candidates.append(scorer.evaluate(profile).to_response())
+                }
+        profile = TableMetadataProfile.from_rows(
+            org_id=org_id,
+            tbl_id=tbl_id,
+            candidate_row=row,
+            name_rows=name_rows,
+            item_rows=item_rows,
+            period_rows=period_rows,
+        )
+        return scorer.evaluate(profile).to_response()
+
+    async with httpx.AsyncClient() as client:
+        # 입력 순서를 유지해야 동점 후보의 순위가 흔들리지 않는다(gather 는 순서를 보존한다)
+        candidates.extend(await asyncio.gather(*[_evaluate(client, row) for row in unique_rows]))
     _annotate_table_candidate_ranking(candidates, query=query, indicator=effective_indicator)
     candidates.sort(key=_table_candidate_sort_key)
     selected = [c for c in candidates if c.get("status") == "selected"]
