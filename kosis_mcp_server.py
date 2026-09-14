@@ -2652,6 +2652,14 @@ def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
         return "C3", "C3_NM"
     return "C1", "C1_NM"
 
+def _tier_a_table_identity(direct_key: Optional[str]) -> dict[str, Any]:
+    """Tier A 지표가 쓰는 표 식별자. 호출자가 같은 표를 다른 축으로 다시 조회할 수 있게 밝힌다."""
+    param = TIER_A_STATS.get(str(direct_key or ""))
+    if param is None:
+        return {}
+    return {"org_id": param.org_id, "tbl_id": param.tbl_id, "통계표": param.tbl_nm}
+
+
 class NaturalLanguageAnswerEngine:
     """자연어 질문을 실제 실행 가능한 답변 또는 안전한 후보 답변으로 변환."""
 
@@ -3517,6 +3525,10 @@ class NaturalLanguageAnswerEngine:
             "추천_시각화": ["bar_chart"],
             "검증_주의": route_payload["validation"].get("warnings", []),
             "route": route_payload["route"],
+            # 어느 표에서 나온 값인지 밝힌다. 호출자가 같은 표를 다른 축으로 다시 볼 수 있어야 한다 —
+            # "지역별 업종별로" 처럼 축을 둘 요구한 질문에 지역만 편 답이 나갔을 때,
+            # 챗봇이 다시 검색하지 않고 이 표를 그대로 써서 교차표를 만든다(실측).
+            **_tier_a_table_identity(direct_key),
             "출처": "통계청 KOSIS",
         }
 
