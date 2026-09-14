@@ -73,7 +73,7 @@ def call(tool: str, args: dict) -> dict:
 
 
 def rows_of(payload: dict) -> list:
-    for key in ('results', 'tables', 'data', '검색결과', 'candidates'):
+    for key in ('결과', 'results', 'tables', 'data', '검색결과', 'candidates'):
         value = payload.get(key)
         if isinstance(value, list):
             return value

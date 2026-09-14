@@ -4913,6 +4913,23 @@ async def _quick_stat_core(
             "org_id": param.org_id, "tbl_id": param.tbl_id,
             "출처": "통계청 KOSIS",
         }
+        # 같은 지표라도 모집단·작성 기준이 다르면 값이 다르다. 최신 표를 주값으로 주되
+        # 다른 기준이 있으면 함께 알린다 — 하나만 보여 주면 실무자는 다른 기준이 있다는 사실조차
+        # 모른 채 인용한다. 폐지된 옛 표도 여기에 과거 계열로 들어 있다.
+        alternatives = list(getattr(param, "alternatives", ()) or ())
+        if alternatives:
+            result["다른_기준"] = [
+                {
+                    "이름": alt.label,
+                    "기준_차이": alt.basis,
+                    "수록기간": alt.period,
+                    "상태": "종료" if alt.status == "discontinued" else "현행",
+                    "통계표ID": alt.tbl_id,
+                    "기관ID": alt.org_id,
+                }
+                for alt in alternatives
+            ]
+
         provisional_periods = list(getattr(param, "provisional_periods", ()) or ())
         if used_period in provisional_periods:
             result["data_status"] = "provisional"

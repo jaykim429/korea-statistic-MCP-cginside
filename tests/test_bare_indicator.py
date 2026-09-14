@@ -17,21 +17,27 @@ class TestAsksBack:
     def test_모호한_지표는_되묻는다(self, q):
         assert Engine._bare_indicator(q) is not None
 
-    def test_표가_끝난_지표도_되묻는다(self):
-        # 전체사업체수는 verified 이지만 표가 2016 에 끝났다(deprecated).
-        # 값을 주면 옛 수치를 현재값처럼 내보내게 된다.
-        assert Engine._bare_indicator("사업체수") == "사업체수"
-        assert c.TIER_A_STATS["전체사업체수"].replacement_status == "deprecated"
+    def test_표가_끝난_지표는_되묻는다(self):
+        """표가 종료되면 값을 주면 안 된다 — 옛 수치를 현재값처럼 내보내게 된다.
+
+        2026-09-14 에 전체사업체수를 현행 등록기반 표로 교체해 이 지표는 이제 답한다.
+        규칙 자체(종료된 표는 되묻는다)는 _has_settled_national_stat 가 지키고 있고
+        아래 TestSettledRule 에서 확인한다.
+        """
+        # 교체 뒤에도 '어느 대상인지' 가 정해지지 않는 지표는 그대로 되묻는다
+        assert Engine._bare_indicator("매출액") == "매출액"
+        assert Engine._bare_indicator("종사자수") == "종사자수"
 
 
 class TestAnswersDirectly:
     """전국 기준이 확정된 지표는 그 값이 곧 답이다."""
 
-    @pytest.mark.parametrize("q", ["수출액", "수출액 알려줘", "수입액", "수입액은", "창업기업수", "창업기업수 알려줘"])
+    @pytest.mark.parametrize("q", ["수출액", "수출액 알려줘", "수입액", "수입액은", "창업기업수", "창업기업수 알려줘",
+                                   "사업체수", "사업체수 알려줘"])
     def test_확정된_지표는_되묻지_않는다(self, q):
         assert Engine._bare_indicator(q) is None
 
-    @pytest.mark.parametrize("key", ["수출액", "수입액", "창업기업수"])
+    @pytest.mark.parametrize("key", ["수출액", "수입액", "창업기업수", "전체사업체수"])
     def test_근거가_실제로_현행_검증_표다(self, key):
         param = c.TIER_A_STATS[key]
         assert param.verification_status == "verified"
@@ -50,4 +56,17 @@ class TestSettledRule:
         assert Engine._has_settled_national_stat("없는지표이름") is False
 
     def test_deprecated_는_거짓(self):
-        assert Engine._has_settled_national_stat("사업체수") is False
+        """표가 종료된 지표는 확정으로 보지 않는다 — 옛 수치가 현재값처럼 나간다.
+
+        지금 TIER_A_STATS 에는 deprecated 가 없다(2026-09-14 에 셋을 교체했다). 규칙이
+        살아 있는지 보려면 가짜 항목으로 확인한다 — 실제 지표에 기대면 교체할 때마다 깨진다.
+        """
+        import dataclasses
+
+        current = c.TIER_A_STATS["수출액"]
+        retired = dataclasses.replace(current, replacement_status="deprecated")
+        assert current.replacement_status != "deprecated"
+        assert Engine._has_settled_national_stat("수출액") is True
+        # 같은 지표라도 표가 종료된 것으로 바뀌면 확정이 아니다
+        assert retired.verification_status == "verified"
+        assert retired.replacement_status == "deprecated"

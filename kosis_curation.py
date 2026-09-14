@@ -251,6 +251,25 @@ ReplacementStatus = Literal["current", "candidate", "deprecated"]
 
 
 @dataclass
+class AlternativeSource:
+    """같은 지표의 다른 기준. 모집단·작성 방법이 달라 값이 다르다.
+
+    통계는 기준이 다르면 값이 다르다 — "전체 사업체 수"만 해도 등록기반(사업자등록)과
+    조사기반(전국사업체조사)이 다르고, 어느 쪽이 맞느냐는 쓰는 목적에 달렸다. 하나만 보여 주면
+    실무자는 다른 기준이 있다는 사실조차 모른 채 인용한다.
+
+    최신 표를 주값으로 쓰되 이 목록이 있으면 답변에 "다른 기준으로는 …" 한 줄을 붙인다.
+    폐지된 표도 버리지 않고 여기에 과거 계열로 남긴다 — 옛 계열을 참고해야 할 때가 있다.
+    """
+    org_id: str
+    tbl_id: str
+    label: str            # "전국사업체조사 기준" 처럼 사람이 읽는 이름
+    basis: str            # 무엇이 다른지 한 줄 (모집단·작성방법)
+    period: str = ""      # "1994~2016" 처럼 수록 구간
+    status: Literal["current", "discontinued"] = "current"
+
+
+@dataclass
 class QuickStatParam:
     """사전 검증된 통계 파라미터 (즉시 호출 가능)."""
     org_id: str
@@ -278,6 +297,8 @@ class QuickStatParam:
     verified_at: Optional[str] = None
     encoded_dimensions: tuple[str, ...] = ()
     provisional_periods: tuple[str, ...] = ()
+    # 같은 지표의 다른 기준(모집단·작성방법이 달라 값이 다르다). 답변에 한 줄로 함께 알린다.
+    alternatives: tuple[AlternativeSource, ...] = ()
 
     @property
     def table_identity(self) -> tuple[str, str]:
@@ -465,15 +486,30 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         note="KOSIS 실제 조회 검증: 원계열·명목·시장가격 GDP, 2025년 2,676,674.8십억원.",
     ),
     "GRDP": QuickStatParam(
-        org_id="101", tbl_id="DT_1C81",
-        tbl_nm="지역내총생산(GRDP)",
+        org_id="101", tbl_id="DT_1C91",
+        tbl_nm="시도별 경제활동별 지역내총생산",
         description="지역내총생산 (명목)",
-        obj_l1="00", obj_l2="Z10", item_id="T1", unit="백만원",
+        obj_l1="00", item_id="T1", unit="백만원",
         region_scheme=REGION_DEMOGRAPHIC,
+        obj_l2="Z10",
+        supported_periods=("Y",),
         verification_status="verified",
-        replacement_status="deprecated",
-        verified_at="2026-07-14",
-        note="구 표는 2022 종료. 2024 수록 현행 후보를 지역축·단위까지 재검증 후 교체 필요.",
+        verified_at="2026-09-14",
+        note="구 표 DT_1C81 은 2022 종료. 후속 표로 교체 — 축 코드가 같다(A=00 전국, B=Z10, ITEM=T1 명목). 검증: 2024년 2,560,811,495백만원 = 약 2,561조원(명목 GDP 약 2,549조와 정합).",
+        alternatives=(
+            AlternativeSource(
+                org_id="101", tbl_id="DT_1C81",
+                label="구 지역내총생산(GRDP) 표",
+                basis="2022년까지의 옛 계열. 개편 전 기준이라 최신 표와 이어 보려면 기준년을 확인해야 한다.",
+                period="~2022", status="discontinued",
+            ),
+            AlternativeSource(
+                org_id="101", tbl_id="DT_1C96",
+                label="1인당 지역내총생산",
+                basis="인구로 나눈 1인당 값. 지역 규모가 아니라 수준을 견줄 때 쓴다.",
+                period="1985~2024",
+            ),
+        ),
     ),
     "중소기업 경기동행종합지수": QuickStatParam(
         org_id="303", tbl_id="DT_303005_CI001",
@@ -691,14 +727,28 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
 
     # 사업체 일반 (전국사업체조사 기반 추정)
     "전체사업체수": QuickStatParam(
-        org_id="101", tbl_id="DT_1K52B01",
-        tbl_nm="전국사업체조사 (추정)",
-        description="총 사업체 수",
-        obj_l1="00", obj_l2="0", obj_l3="0", item_id="T1", unit="개",
+        org_id="101", tbl_id="DT_1YL20832",
+        tbl_nm="사업체수(등록기반)(시도/시/군/구)",
+        description="총 사업체 수 (등록기반)",
+        obj_l1="00", item_id="T10", unit="개",
+        supported_periods=("Y",),
         verification_status="verified",
-        replacement_status="deprecated",
-        verified_at="2026-07-14",
-        note="구 전국사업체조사 표는 2016 종료. 현행 경제총조사/기업통계 후보 재탐색 필요.",
+        verified_at="2026-09-14",
+        note="구 전국사업체조사 표 DT_1K52B01 은 2016 종료. 등록기반 현행 표로 교체. 검증: 2024년 6,363,262개(소상공인 약 610만·중소기업 약 830만과 정합).",
+        alternatives=(
+            AlternativeSource(
+                org_id="101", tbl_id="DT_1K52B01",
+                label="전국사업체조사 기준",
+                basis="조사기반 모집단이라 등록기반(사업자등록)과 포괄 범위가 다르고 값도 다르다.",
+                period="~2016", status="discontinued",
+            ),
+            AlternativeSource(
+                org_id="101", tbl_id="DT_1K52C05",
+                label="시도·산업·대표자성별 사업체수",
+                basis="산업·대표자성별로 나눠 볼 때. 조사기반이라 총계가 등록기반과 다르다.",
+                period="2006~2020", status="discontinued",
+            ),
+        ),
     ),
 
     # ========================================================================
@@ -853,17 +903,30 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         note="item=T20 (아내).",
     ),
     "아파트전세가격지수": QuickStatParam(
-        org_id="101", tbl_id="DT_1YL20171E",
-        tbl_nm="아파트전세가격지수(시도/시/군/구)",
+        org_id="408", tbl_id="DT_30404_B013",
+        tbl_nm="전세가격지수(주택유형별)",
         description="아파트 전세가격지수",
-        obj_l1="a0", item_id="sales", unit="지수",
-        region_scheme=REGION_HOUSING,
+        obj_l1="01", item_id="sales", unit="지수",
+        obj_l2="a0",
+        region_obj="obj_l2",
         supported_periods=("M",),
         verification_status="verified",
-        replacement_status="deprecated",
-        verified_at="2026-07-14",
-        value_kind="provider_index",
-        note="구 표는 2025.03 종료. 408/DT_30404_B013 계열 후보를 기준시점·지역축까지 검증 후 교체 필요.",
+        verified_at="2026-09-14",
+        note="구 표 DT_1YL20171E 은 2025.03 종료. 전세가격지수(종합)와 같은 표를 쓰되 주택유형 축에서 아파트(01)를 고른다. 검증: 2026.06 = 102.05 (2026.1=100).",
+        alternatives=(
+            AlternativeSource(
+                org_id="408", tbl_id="DT_30404_B013",
+                label="전세가격지수(종합)",
+                basis="아파트·연립다세대·단독주택을 합친 지수. 주택유형 축에서 종합(00)을 고른 값이다.",
+                period="2021.06~",
+            ),
+            AlternativeSource(
+                org_id="101", tbl_id="DT_1YL20171E",
+                label="구 아파트전세가격지수 표",
+                basis="2025.03 까지의 옛 계열. 기준시점이 달라 최신 지수와 직접 견줄 수 없다.",
+                period="~2025.03", status="discontinued",
+            ),
+        ),
     ),
     "자동차등록대수": QuickStatParam(
         org_id="101", tbl_id="DT_1YL20731",
