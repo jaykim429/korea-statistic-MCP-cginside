@@ -598,6 +598,27 @@ def _query_table_params(
     return params
 
 
+def _resolved_item_unit(axis_items: dict[str, Any], code: str) -> Optional[str]:
+    """항목의 단위. 비어 있으면 상위 항목에서 물려받는다.
+
+    KOSIS 분류축은 계층이라 단위가 묶음 단계에만 적힌 표가 흔하다(실측 127/TX_10506_A080:
+    '총매출액'=백만원, 그 하위 '원자력발전사업자'=빈칸). 빈칸을 그대로 내보내면 단위 없는
+    숫자가 나가고, 그 빈칸을 읽는 쪽이 단위를 지어낸다(실측: 챗봇이 '단위: 백만원'을 만들어 냈다).
+
+    있는 단위는 덮어쓰지 않는다 — 채우기만 한다.
+    """
+    seen: set[str] = set()
+    current = str(code or '')
+    while current and current not in seen and len(seen) < 10:
+        seen.add(current)
+        meta = (axis_items or {}).get(current) or {}
+        unit = meta.get('unit')
+        if unit not in (None, ''):
+            return str(unit)
+        current = str(meta.get('parent') or '')
+    return None
+
+
 def _normalize_query_table_rows(
     rows: list[dict],
     filters: dict[str, list[str]],
@@ -622,22 +643,23 @@ def _normalize_query_table_rows(
             if item_code in axes["ITEM"]["items"]:
                 meta = axes["ITEM"]["items"][item_code]
                 item_label = item_label or meta.get("label")
-                dimensions["ITEM"] = {"code": item_code, "label": item_label, "unit": meta.get("unit")}
+                dimensions["ITEM"] = {"code": item_code, "label": item_label, "unit": _resolved_item_unit(axes["ITEM"]["items"], item_code)}
             elif len(filters.get("ITEM", [])) == 1:
                 code = filters["ITEM"][0]
                 meta = axes["ITEM"]["items"].get(code, {})
-                dimensions["ITEM"] = {"code": code, "label": meta.get("label"), "unit": meta.get("unit")}
+                dimensions["ITEM"] = {"code": code, "label": meta.get("label"), "unit": _resolved_item_unit(axes["ITEM"]["items"], code)}
 
         for idx, axis in data_axis_map.items():
             code = str(row.get(f"C{idx}") or "")
             label = row.get(f"C{idx}_NM")
             if not code and len(filters.get(axis, [])) == 1:
                 code = filters[axis][0]
-            meta = (axes.get(axis, {}).get("items") or {}).get(code, {})
+            axis_items = axes.get(axis, {}).get("items") or {}
+            meta = axis_items.get(code, {})
             dimensions[axis] = {
                 "code": code,
                 "label": label or meta.get("label"),
-                "unit": meta.get("unit"),
+                "unit": _resolved_item_unit(axis_items, code),
             }
 
         value_info = _normalize_stat_value(row.get("DT"))
@@ -646,9 +668,17 @@ def _normalize_query_table_rows(
             for field in ("STAT_ID", "STAT_CD", "STAT_CODE", "STATISTIC_CODE")
             if row.get(field) not in (None, "")
         ), None)
+        # 행 단위: KOSIS 가 준 값 → 항목축 → (단위를 가진 축이 딱 하나일 때만) 그 축.
+        # 축이 여럿 단위를 갖고 있으면 고르지 않는다 — 틀린 단위보다 없는 편이 낫다.
+        axis_units = [
+            str(dim.get("unit"))
+            for key, dim in dimensions.items()
+            if key != "ITEM" and isinstance(dim, dict) and dim.get("unit") not in (None, "")
+        ]
+        sole_axis_unit = axis_units[0] if len(set(axis_units)) == 1 and axis_units else None
         normalized_rows.append({
             "period": row.get("PRD_DE"),
-            "unit": row.get("UNIT_NM") or (dimensions.get("ITEM") or {}).get("unit"),
+            "unit": row.get("UNIT_NM") or (dimensions.get("ITEM") or {}).get("unit") or sole_axis_unit,
             "dimensions": dimensions,
             "statistic_code": statistic_code,
             "raw": row,
