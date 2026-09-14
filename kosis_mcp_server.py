@@ -4055,12 +4055,33 @@ class NaturalLanguageAnswerEngine:
         return hints
 
     @staticmethod
+    def _has_settled_national_stat(indicator: str) -> bool:
+        """이 지표 한 단어로 전국 기준이 확정되는가 — 검증된 현행 Tier A 표가 있는가.
+
+        verification_status 만 보면 안 된다. 전체사업체수는 verified 이지만 표가 2016 에 끝난
+        deprecated 라, 값을 주면 옛 수치를 현재값처럼 내보내게 된다.
+        """
+        param = _curation_lookup(indicator)
+        if param is None:
+            return False
+        return param.verification_status == "verified" and param.replacement_status != "deprecated"
+
+    @staticmethod
     def _bare_indicator(query: str) -> Optional[str]:
-        """질문이 '매출액 알려줘'처럼 지표 한 단어(+명령형)만이면 그 지표를 돌려준다."""
+        """질문이 '매출액 알려줘'처럼 지표 한 단어(+명령형)만이면 그 지표를 돌려준다.
+
+        단, 전국 기준이 확정된 지표(수출액·수입액·창업기업수 등)는 되묻지 않는다 — 검증된
+        현행 표가 있으면 그 값이 곧 답이고, 되묻는 예시('중소기업 수출액')는 대체로 존재하지
+        않는 통계라 사용자를 한 턴 더 돌게 만든다(실측 S18·S19·S27).
+        """
         core = re.sub(r"(?:을|를|은|는|이|가)?\s*(?:좀\s*)?(?:알려|보여|조회|말해|찾아)?\s*(?:해\s*)?(?:줘|주세요|해|볼래|봐)?\s*[.!?]?$", "", query.strip())
         core = re.sub(r"\s+", "", core)
         bare_extra = {"종사자수", "사업체수", "기업수", "수출액", "수입액", "영업이익", "생산액", "부가가치", "창업기업수", "창업수"}
-        return core if (core in _BARE_INDICATOR_TOKENS or core in bare_extra) and len(core) >= 2 else None
+        if not ((core in _BARE_INDICATOR_TOKENS or core in bare_extra) and len(core) >= 2):
+            return None
+        if NaturalLanguageAnswerEngine._has_settled_national_stat(core):
+            return None
+        return core
 
     async def answer(
         self,
@@ -4859,13 +4880,32 @@ async def _quick_stat_core(
         period_label = _format_period_label(row.get("PRD_DE"), period_type)
         used_period = str(row.get("PRD_DE") or "")
         age = NaturalLanguageAnswerEngine._period_age_years(used_period)
+        # KOSIS 원행이 단위를 싣고 온다. 손으로 적은 param.unit 보다 그것이 정답이다.
+        # 실측: 수출액이 커레이션에 "천달러"로 적혀 있었지만 표는 "100만달러"였고, 사용자에게
+        # 1000배 작은 값이 나갔다(2024년 6,836억 달러를 6.8억 달러로). 값·단위·출처가 모두
+        # 붙어 있어 라이브 검증 375케이스가 전부 통과했다 — 크기를 보는 검증이 없었기 때문이다.
+        # 표가 말하지 않을 때만 커레이션 값을 쓴다.
+        row_unit = str(row.get("UNIT_NM") or "").strip()
+        # 표 단위가 여러 항목을 뭉뚱그려 적혀 있으면(실측: 인구동향 DT_1B8000G 의 "명 건" —
+        # 출생아수는 명, 혼인건수는 건, 조출생률은 ‰ 다) 항목별 단위가 아니므로 쓰면 안 된다.
+        # 공백으로 갈라지는 복합 표기는 버리고 커레이션을 쓴다.
+        # 지수 기준(2020＝100)은 단위가 아니라 기준 시점이라 단위 자리에 넣지 않고 따로 싣는다.
+        index_base = row_unit if "=" in row_unit.replace("＝", "=") else ""
+        clean_row_unit = "" if (index_base or " " in row_unit) else row_unit
+        # 커레이션이 더 구체적이면 그쪽을 쓴다. 표는 범죄율 단위를 그냥 "건" 이라고 적는데
+        # (천명당은 표 이름에만 있다) 커레이션의 "천명당 건" 이 사용자에게 정확하다.
+        # 서로 충돌할 때만(천달러 vs 100만달러) 데이터가 이긴다.
+        curated = str(param.unit or "").strip()
+        more_specific = bool(clean_row_unit) and clean_row_unit in curated and len(curated) > len(clean_row_unit)
+        effective_unit = curated if (more_specific or not clean_row_unit) else clean_row_unit
         answer_text = NaturalLanguageAnswerEngine._polish_answer_text(
             f"{period_label} {region}의 {param.description}은(는) "
-            f"{_format_display_number(row.get('DT'), param.display_decimals)} {param.unit}입니다."
+            f"{_format_display_number(row.get('DT'), param.display_decimals)} {effective_unit}입니다."
         )
         result = {
             "answer": answer_text,
-            "값": row.get("DT"), "단위": param.unit,
+            "값": row.get("DT"), "단위": effective_unit,
+            **({"기준시점": index_base} if index_base else {}),
             "시점": row.get("PRD_DE"),
             "used_period": used_period,
             "period_age_years": age,
