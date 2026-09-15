@@ -624,12 +624,21 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
     "중소기업_사업체수": QuickStatParam(
         org_id="142", tbl_id="DT_BR_A001",
         tbl_nm="시도별·산업중분류별·기업규모별 기업수",
-        description="중소기업 사업체수",
+        description="중소기업 기업수",
         obj_l1="IM", obj_l2="15142C501", obj_l3="T002", item_id="T001", unit="개",
         region_scheme=REGION_BUSINESS,
         region_obj="obj_l2",
         verification_status="verified",
-        note="Verified via KOSIS API: all industries, SME, nationwide and 17 regions (2023 nationwide 8,298,915)",
+        note=(
+            "Verified via KOSIS API: all industries, SME, nationwide and 17 regions "
+            "(2023 nationwide 8,298,915). "
+            "이 표의 항목은 T001 '기업수' 하나뿐이다 — 사업체를 세지 않는다. "
+            "description 을 '사업체수'로 두었더니 답이 '중소기업 사업체수 8,298,915개'로 나갔는데, "
+            "같은 해 전국 **사업체** 수는 636만이다. 부분이 전체보다 큰 답이 나간 셈이다. "
+            "중소기업 기준은 업종별 매출액·자산이라 종사자규모로 환산할 수 없어 "
+            "'중소기업 사업체수' 공식 통계는 없다. 그래서 세는 대로 '기업수'라 적는다. "
+            "'중소기업 사업체 수'로 물어도 여기로 오게 두되(동의어 유지) 답은 기업 기준임을 밝힌다."
+        ),
     ),
     "중소기업_종사자수": QuickStatParam(
         org_id="142", tbl_id="DT_BR_B001",
