@@ -17,6 +17,9 @@ DIMENSION_AXIS_KEYWORDS = {
     "industry": ("산업", "업종", "산업분류", "industry", "ksic"),
     "age": ("연령", "나이", "연령계층", "age"),
     "sex": ("성별", "성", "남녀", "sex", "gender"),
+    # 국가뿐 아니라 경제권·대륙 등 **교역 상대 지역** 축을 포괄하는 내부 명칭이다.
+    # "중국으로 수출액" 이 전국 값으로 나가던 것(실측)을 표 선택 단계에서 거르려면 이 축이 필요하다.
+    "country": ("국가", "상대국", "교역상대", "수출국", "수입국", "대상국", "국적", "country", "nation"),
     "time": ("시점", "기간", "연도", "월", "분기", "period", "time"),
     "scale": ("규모", "기업규모", "종사자규모", "매출액규모", "scale", "size"),
     "size": ("규모", "기업규모", "종사자규모", "매출액규모", "scale", "size"),
@@ -51,6 +54,8 @@ def _infer_required_dimensions_from_query(query: str) -> list[str]:
         inferred.append("time")
     if any(term in q for term in ("규모별", "기업규모", "종사자규모", "매출액규모", "소상공인", "소기업", "중기업", "대기업")):
         inferred.append("scale")
+    if any(term in q for term in ("국가별", "상대국", "교역상대", "수출국", "수입국", "대상국", "대중국", "대미", "대일")):
+        inferred.append("country")
     return list(dict.fromkeys(inferred))
 
 
@@ -81,6 +86,13 @@ def _normalize_required_dimensions(dimensions: list[str]) -> list[str]:
         "종사자규모별": "employee_size",
         "매출액규모": "sales_size",
         "매출규모": "sales_size",
+        # Nuxt 는 성별 축을 'gender' 로 보내는데 정규 이름은 'sex' 다. 별칭이 없어
+        # _axis_matches_dimension 이 ("gender",) 로 떨어져 **한글 축명에 절대 맞지 않았다.**
+        "gender": "sex",
+        "국가": "country",
+        "국가별": "country",
+        "상대국": "country",
+        "교역상대국": "country",
     }
     normalized: list[str] = []
     for dim in dimensions:
