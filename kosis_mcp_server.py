@@ -122,6 +122,7 @@ from kosis_analysis.quick import (
     _quick_stat_unsupported_dimensions,
     _quick_trend_unsupported_dimensions,
     _unsupported_quick_stat_response,
+    leftover_gate_terms,
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -4725,6 +4726,19 @@ async def _quick_stat_core(
                 unsupported_dimensions,
                 canonical,
                 period,
+            )
+
+        # 잔여 한정어 관문 — 감지기 어휘 목록이 놓친 한정어를 "남는 내용어"로 잡는다.
+        # 실측: "중국으로 수출액" 이 전국 수출액 98,959 로, "고령자 고용률" 이 전체 고용률로 나갔다.
+        leftover_terms = leftover_gate_terms(query, param)
+        if leftover_terms:
+            return _unsupported_quick_stat_response(
+                query,
+                param,
+                unsupported_dimensions,
+                canonical,
+                period,
+                terms=leftover_terms,
             )
 
         # broken 상태는 호출 시도조차 안 함 — 사용자에게 명확히 알리고 폴백

@@ -296,6 +296,9 @@ class QuickStatParam:
     replacement_status: ReplacementStatus = "current"
     verified_at: Optional[str] = None
     encoded_dimensions: tuple[str, ...] = ()
+    # 이 값에 이미 녹아 있어서 질문에 나와도 한정어가 아닌 말. 대부분 비워 둔다 —
+    # 키·description·tbl_nm 이 이미 덮는다. 그것들로 안 덮이는 예외만 적는다.
+    encoded_terms: tuple[str, ...] = ()
     provisional_periods: tuple[str, ...] = ()
     # 같은 지표의 다른 기준(모집단·작성방법이 달라 값이 다르다). 답변에 한 줄로 함께 알린다.
     alternatives: tuple[AlternativeSource, ...] = ()
@@ -1410,7 +1413,7 @@ SYNONYMS: dict[str, str] = {
     "물가": "소비자물가지수", "소비자물가": "소비자물가지수", "CPI": "소비자물가지수",
 
     # 무역
-    "수출": "수출액", "수입": "수입액",
+    "수출": "수출액", "수입": "수입액", "총수출액": "수출액", "총수입액": "수입액",
 
     # 부동산
     "집값": "주택매매가격지수", "집 값": "주택매매가격지수",
