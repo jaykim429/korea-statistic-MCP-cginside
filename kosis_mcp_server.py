@@ -2654,11 +2654,24 @@ def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
     return "C1", "C1_NM"
 
 def _tier_a_table_identity(direct_key: Optional[str]) -> dict[str, Any]:
-    """Tier A 지표가 쓰는 표 식별자. 호출자가 같은 표를 다른 축으로 다시 조회할 수 있게 밝힌다."""
+    """Tier A 지표가 쓰는 표 식별자. 호출자가 같은 표를 다른 축으로 다시 조회할 수 있게 밝힌다.
+
+    **키를 한글로도 낸다.** 이 저장소의 응답 키는 한글이 관례이고(`질문`·`통계표`·`답변유형`),
+    챗봇은 `기관ID`·`통계표ID`·`ORG_ID`·`TBL_ID` 만 찾는다. 영문 소문자 `org_id`·`tbl_id` 만
+    내보내던 동안 **이 기능은 챗봇에 한 번도 닿지 않았다**(실측 C075, 회귀22).
+    영문 키는 다른 소비자를 위해 남긴다.
+    """
     param = TIER_A_STATS.get(str(direct_key or ""))
     if param is None:
         return {}
-    return {"org_id": param.org_id, "tbl_id": param.tbl_id, "통계표": param.tbl_nm}
+    return {
+        "기관ID": param.org_id,
+        "통계표ID": param.tbl_id,
+        "통계표명": param.tbl_nm,
+        "org_id": param.org_id,
+        "tbl_id": param.tbl_id,
+        "통계표": param.tbl_nm,
+    }
 
 
 class NaturalLanguageAnswerEngine:
@@ -3300,6 +3313,8 @@ class NaturalLanguageAnswerEngine:
                 "상태": "executed",
                 "코드": STATUS_EXECUTED,
                 "답변유형": "tier_a_growth_rate",
+                # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+                **_tier_a_table_identity(direct_key),
                 "질문": query,
                 "answer": comparison.get("answer"),
                 "표": comparison.get("표", []),
@@ -3356,6 +3371,8 @@ class NaturalLanguageAnswerEngine:
                 "상태": "executed",
                 "코드": STATUS_EXECUTED,
                 "답변유형": "tier_a_trend",
+                # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+                **_tier_a_table_identity(direct_key),
                 "질문": query,
                 "answer": (
                     f"{region}의 {trend.get('통계명', direct_key)} "
@@ -3415,6 +3432,8 @@ class NaturalLanguageAnswerEngine:
                 "상태": "executed",
                 "코드": STATUS_EXECUTED,
                 "답변유형": "tier_a_trend",
+                # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+                **_tier_a_table_identity(direct_key),
                 "질문": query,
                 "answer": answer,
                 "표": trend.get("시계열", []),
@@ -3445,6 +3464,8 @@ class NaturalLanguageAnswerEngine:
                     "상태": "executed",
                     "코드": STATUS_EXECUTED,
                     "답변유형": "tier_a_trend",
+                    # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+                    **_tier_a_table_identity(direct_key),
                     "질문": query,
                     "answer": (
                         f"{region}의 {trend.get('통계명', direct_key)} {open_start_year}년부터 최신까지 "
@@ -3488,6 +3509,8 @@ class NaturalLanguageAnswerEngine:
             "상태": "executed",
             "코드": STATUS_EXECUTED,
             "답변유형": "tier_a_value",
+            # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+            **_tier_a_table_identity(direct_key),
             "질문": query,
             "answer": stat.get("answer"),
             "표": [{
@@ -3582,6 +3605,8 @@ class NaturalLanguageAnswerEngine:
             "상태": "executed",
             "코드": STATUS_EXECUTED,
             "답변유형": "tier_a_top_n",
+            # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+            **_tier_a_table_identity(direct_key),
             "질문": query,
             "answer": answer,
             "표": selected,
@@ -3682,6 +3707,8 @@ class NaturalLanguageAnswerEngine:
             "상태": "executed",
             "코드": STATUS_EXECUTED,
             "답변유형": "tier_a_share_ratio",
+            # 어느 표에서 나온 값인지 밝힌다 — 후속 턴이 다시 검색하지 않고 같은 표를 다른 축으로 본다(실측 C075).
+            **_tier_a_table_identity(direct_key),
             "질문": query,
             "answer": answer,
             "표": [
