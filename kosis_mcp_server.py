@@ -3254,6 +3254,19 @@ class NaturalLanguageAnswerEngine:
         route_payload = route_payload or self._route_payload(query)
         direct_key = direct_key or self._infer_direct_stat_key(query, route_payload) or query
         route_payload["route"]["direct_stat_key"] = direct_key
+
+        # 잔여 한정어 관문 — **원문으로** 본다.
+        # 아래 경로들은 전부 `quick_stat(direct_key, …)` 로 부르는데, 그 순간 질문의 한정어가
+        # 사라진다("중소기업 수출액" → 키 "수출액"). 그래서 quick_stat 안의 관문은 이 경로를
+        # 지키지 못한다 — 실측으로 "중소기업 수출액" 에 전국 98,282 가 나갔다.
+        gate_param = TIER_A_STATS.get(str(direct_key or ""))
+        if gate_param is not None:
+            leftover_terms = leftover_gate_terms(query, gate_param)
+            if leftover_terms:
+                return _unsupported_quick_stat_response(
+                    query, gate_param, [], region, "latest", terms=leftover_terms,
+                )
+
         q = self._norm(query)
         explicit_start_year = start_year
         explicit_end_year = end_year
