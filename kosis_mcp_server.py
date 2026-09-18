@@ -8457,7 +8457,11 @@ def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]], *, query
     for candidate in candidates:
         indicator_score = _candidate_indicator_score(candidate)
         context = _selection_context_adjustments(candidate, query, indicator)
+        # 항목 증거는 축 이름·지표 점수보다 **위**다. 물은 항목을 나눠 볼 수 있는 표가
+        # 먼저 와야 재검색이 뜻을 갖는다. score 에만 반영하면 정렬 키의 9번째라 묻힌다.
+        matched_items = candidate.get("matched_items") or []
         features = {
+            "matched_item_count": len(matched_items) if isinstance(matched_items, list) else 0,
             "indicator_score": indicator_score,
             "indicator_score_band": indicator_score // 3,
             "latest_period_year": _candidate_latest_period_year(candidate),
@@ -8477,6 +8481,7 @@ def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
     return (
         candidate.get("status") != "selected",
         int(features.get("ranking_penalty") or 0),
+        -int(features.get("matched_item_count") or 0),
         -int(features.get("indicator_score_band") or 0),
         -int(float(features.get("query_term_coverage") or 0.0) * 1000),
         -int(features.get("latest_period_year") or 0),
@@ -8540,6 +8545,10 @@ def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "search_term": candidate.get("search_term"),
         "matched_dimensions": candidate.get("matched_dimensions"),
         "missing_dimensions": candidate.get("missing_dimensions"),
+        # Nuxt 가 재검색 뒤 축을 다시 고를 때 이 증거로 첫 후보를 정한다. 자르면 안 된다.
+        "matched_items": candidate.get("matched_items"),
+        "missing_items": candidate.get("missing_items"),
+        "item_evidence": candidate.get("item_evidence"),
         "indicator_evidence": candidate.get("indicator_evidence"),
         "query_match_quality": candidate.get("query_match_quality"),
         "ranking_penalties": candidate.get("ranking_penalties"),
@@ -10782,6 +10791,7 @@ async def select_table_for_query(
     search_terms: Optional[list[str]] = None,
     infer_dimensions: bool = False,
     reject_if_missing_dimensions: bool = True,
+    required_items: Optional[list[str]] = None,
     limit: int = 8,
     verbose: bool = False,
     api_key: Optional[str] = None,
@@ -10793,6 +10803,13 @@ async def select_table_for_query(
     확인해 필요한 분류축(region, industry, age, sex, time 등)을 만족하는지
     점수화한다. 실제 코드 매핑과 값 조회는 resolve_concepts/query_table
     단계의 책임이다. infer_dimensions는 legacy 보조 옵션이며 기본값은 False다.
+
+    required_items는 **항목 라벨**로 거는 조건이다(예: ["중소기업"]). 어느 축이든 항목
+    라벨이 등가인 표만 남긴다. required_dimensions가 축 **이름** 키워드로 판정해
+    정상적으로 새는 것과 달리(KOSIS 축 이름은 표준화돼 있지 않다), 항목 라벨은 그 표가
+    실제로 나눠 볼 수 있는 것을 그대로 말한다. 그래서 **항목 증거가 축 이름 증거보다
+    위**다 — required_items가 통과시킨 표는 required_dimensions가 놓쳐도 버리지 않는다.
+    추가 KOSIS 조회는 없다(후보 메타에 이미 항목 라벨이 실려 있다).
     """
     inferred_dimensions = _infer_required_dimensions_from_query(query) if infer_dimensions else []
     required = _normalize_required_dimensions([
@@ -10866,6 +10883,7 @@ async def select_table_for_query(
         required_dimensions=required,
         indicator=effective_indicator,
         reject_if_missing_dimensions=reject_if_missing_dimensions,
+        required_items=required_items,
     )
     # 후보 메타데이터는 후보별로 순차 조회하면 KOSIS 왕복이 그대로 쌓인다(실측: 콜드 캐시에서 한 질문 40~56초).
     # 후보끼리는 서로 독립이므로 동시에 받아 온다. 동시 실행 수는 KOSIS 쪽 부담을 고려해 제한한다.

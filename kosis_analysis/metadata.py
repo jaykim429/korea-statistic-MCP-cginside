@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 from typing import Any, Optional
 
@@ -101,6 +101,70 @@ def _normalize_required_dimensions(dimensions: list[str]) -> list[str]:
             continue
         normalized.append(aliases.get(key, key))
     return list(dict.fromkeys(normalized))
+
+
+#: 총계 항목 — 좁히는 것이 아니므로 한정어 증거로 세지 않는다.
+#: Nuxt ``stat-table-selection.TOTAL_LABEL`` 과 같은 뜻이다. 두 저장소가 나뉘어 있어
+#: 상수를 공유할 수 없으므로 **같은 목록을 양쪽에 두고 시험으로 고정한다.**
+_TOTAL_ITEM_LABEL = re.compile(
+    r"^(?:계|소계|합계|총계|전체|전국|전산업|전규모|전업종|전연령|전체산업|전체기업)$"
+)
+
+
+def _normalize_item_label(label: Any) -> str:
+    """항목 라벨을 비교용으로 정규화한다 — 괄호 꼬리를 떼고 공백을 지운다.
+
+    ``중소기업(300인 미만)`` 과 ``중소기업`` 은 같은 집단이다. KOSIS 는 같은 집단을
+    표마다 다르게 적는다. Nuxt ``normalizeItemLabel`` 과 같은 규칙이다.
+    """
+    text = str(label or "").strip()
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
+    return re.sub(r"\s+", "", text)
+
+
+def _item_coverage(
+    axes: dict[str, dict[str, Any]],
+    required_items: list[str],
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """요청한 항목을 이 표가 **실제로 나눠 볼 수 있는가** — 축 이름은 보지 않는다.
+
+    왜 축 이름이 아니라 항목인가.
+    KOSIS 축 이름은 통계조사마다 다르고 표준화돼 있지 않다(``size`` 하나에 규모·기업규모·
+    종사자규모·매출액규모). 그래서 ``_dimension_coverage`` 는 축 이름 키워드로 판정하며
+    정상적으로 샌다. 정확성은 **항목 라벨**이 맡는다 — "중소기업" 을 나눠 볼 수 있는 표란
+    어느 축이든 항목에 '중소기업' 이 있는 표다. 축이 뭐라 불리든 상관없다.
+
+    등가로만 본다. 부분 문자열을 쓰면 '여성' 이 '여성기업' 에 걸려 다른 집단의 값이 나간다.
+    총계 항목(전체·계)은 좁히는 것이 아니므로 증거로 세지 않는다.
+
+    추가 조회가 없다 — ``axes`` 는 이미 항목 라벨을 싣고 있다.
+    """
+    matched: list[str] = []
+    missing: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    for term in required_items:
+        want = _normalize_item_label(term)
+        if not want:
+            continue
+        hits = [
+            {
+                "OBJ_ID": obj_id,
+                "OBJ_NM": axis.get("OBJ_NM"),
+                "ITM_ID": itm_id,
+                "ITM_NM": meta.get("label"),
+                "required_item": term,
+            }
+            for obj_id, axis in axes.items()
+            for itm_id, meta in (axis.get("items") or {}).items()
+            if not _TOTAL_ITEM_LABEL.match(_normalize_item_label(meta.get("label")))
+            and _normalize_item_label(meta.get("label")) == want
+        ]
+        if hits:
+            matched.append(term)
+            evidence.extend(hits)
+        else:
+            missing.append(term)
+    return matched, missing, evidence
 
 
 def _dimension_coverage(
@@ -268,6 +332,12 @@ class TableMetadataProfile:
     ) -> tuple[list[str], list[str], dict[str, list[dict[str, Any]]]]:
         return _dimension_coverage(self.axes, self.period_rows, required_dimensions)
 
+    def item_coverage(
+        self,
+        required_items: list[str],
+    ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+        return _item_coverage(self.axes, required_items)
+
     def embedded_dimension_evidence(self, dimension: str, indicator: Optional[str]) -> list[dict[str, Any]]:
         """Detect dimensions fixed inside table/item names instead of exposed as axes."""
         evidence: list[dict[str, Any]] = []
@@ -351,6 +421,12 @@ class MetadataCompatibilityResult:
     indicator_evidence: list[str]
     indicator_score: int
     required_dimensions: list[str]
+    #: 항목 라벨 조건(선택). 기본값을 둬서 기존 호출자를 깨뜨리지 않는다.
+    required_items: list[str] = field(default_factory=list)
+    matched_items: list[str] = field(default_factory=list)
+    missing_items: list[str] = field(default_factory=list)
+    #: 어느 축·어느 항목이 맞았나. Nuxt 가 5.2 를 다시 돌릴 때 그 축을 첫 후보로 쓴다.
+    item_evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def to_response(self) -> dict[str, Any]:
         return {
@@ -365,6 +441,9 @@ class MetadataCompatibilityResult:
             "missing_dimensions": self.missing_dimensions,
             "axis_evidence": self.axis_evidence,
             "indicator_evidence": self.indicator_evidence,
+            "matched_items": self.matched_items,
+            "missing_items": self.missing_items,
+            "item_evidence": self.item_evidence,
             "axis_summary": self.profile.axis_summary(),
             "periods": self.profile.periods_summary(),
             "metadata_profile": self.profile.metadata_profile(),
@@ -372,6 +451,9 @@ class MetadataCompatibilityResult:
                 "required_dimensions": self.required_dimensions,
                 "matched_dimensions": self.matched_dimensions,
                 "missing_dimensions": self.missing_dimensions,
+                "required_items": self.required_items,
+                "matched_items": self.matched_items,
+                "missing_items": self.missing_items,
                 "indicator_score": self.indicator_score,
                 "verification_level": (
                     "not_matched"
@@ -395,10 +477,13 @@ class MetadataCompatibilityScorer:
         required_dimensions: list[str],
         indicator: Optional[str] = None,
         reject_if_missing_dimensions: bool = True,
+        required_items: Optional[list[str]] = None,
     ) -> None:
         self.required_dimensions = _normalize_required_dimensions(required_dimensions)
         self.indicator = indicator
         self.reject_if_missing_dimensions = reject_if_missing_dimensions
+        #: 항목 라벨로 거는 조건. 축 이름과 달리 표준화돼 있지 않아도 정확하다(_item_coverage).
+        self.required_items = [str(t).strip() for t in (required_items or []) if str(t).strip()]
 
     def evaluate(self, profile: TableMetadataProfile) -> MetadataCompatibilityResult:
         matched, missing, axis_evidence = profile.dimension_coverage(self.required_dimensions)
@@ -411,10 +496,25 @@ class MetadataCompatibilityScorer:
             if dim not in matched:
                 matched.append(dim)
             axis_evidence[dim] = embedded
-        score = indicator_score + len(matched) * 5 - len(missing) * 6
+        matched_items, missing_items, item_evidence = profile.item_coverage(self.required_items)
+        # 항목 증거는 축 이름 증거보다 **위**다. 축 이름은 표준화돼 있지 않아 정상적으로 새고,
+        # 항목 라벨은 그 표가 실제로 나눠 볼 수 있는 것을 그대로 말한다.
+        score = (
+            indicator_score
+            + len(matched) * 5
+            - len(missing) * 6
+            + len(matched_items) * 12
+            - len(missing_items) * 15
+        )
         if self.indicator and indicator_score <= 0:
             status = "not_matched_indicator"
-        elif missing and self.reject_if_missing_dimensions:
+        elif missing_items:
+            # 물은 항목을 나눠 볼 수 없는 표다. 축 이름이 맞아도 값을 낼 수 없다.
+            status = "rejected_missing_items"
+        elif missing and self.reject_if_missing_dimensions and not matched_items:
+            # **항목 증거가 있으면 축 이름 미매칭으로 버리지 않는다.**
+            # 탈락은 점수가 아니라 status 가 정하므로 여기서 함께 봐야 한다 —
+            # 점수식만 고치면 이 한 줄이 그대로 떨어뜨린다(스펙 12.5).
             status = "rejected_missing_dimensions"
         else:
             status = "selected"
@@ -428,6 +528,10 @@ class MetadataCompatibilityScorer:
             indicator_evidence=indicator_hits,
             indicator_score=indicator_score,
             required_dimensions=self.required_dimensions,
+            required_items=self.required_items,
+            matched_items=matched_items,
+            missing_items=missing_items,
+            item_evidence=item_evidence,
         )
 
 
