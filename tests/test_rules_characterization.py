@@ -11,7 +11,14 @@ from __future__ import annotations
 
 import pytest
 
-from kosis_analysis.metadata import _TOTAL_ITEM_LABEL, _normalize_item_label
+from kosis_analysis.rules import is_total_label as _is_total
+from kosis_analysis.rules import normalize_item_label as _normalize_item_label
+
+
+class _TOTAL_ITEM_LABEL:  # noqa: N801 - 옛 정규식 자리. 호출 모양만 유지하고 기대값은 그대로 둔다.
+    @staticmethod
+    def match(label):
+        return True if _is_total(label) else None
 
 
 class TestNormalizeNow:
@@ -52,7 +59,18 @@ class TestTotalNow:
     def test_총계가_아닌_낱말(self, label):
         assert _TOTAL_ITEM_LABEL.match(label) is None
 
-    def test_정규화를_지난_뒤에만_맞는다(self):
-        # '전체 산업' 은 공백이 있어 그대로는 안 걸리고, 정규화하면 걸린다
-        assert _TOTAL_ITEM_LABEL.match("전체 산업") is None
+    def test_정본은_정규화를_품는다(self):
+        """Phase 1c 에서 바뀐 **유일한** 동작이다.
+
+        옛 ``_TOTAL_ITEM_LABEL`` 은 정규식이라 '전체 산업'(공백)이 그대로는 안 걸렸고,
+        호출자가 먼저 ``_normalize_item_label`` 을 통과시켜야 했다. 정본
+        ``is_total_label`` 은 정규화를 품으므로 바로 걸린다.
+
+        Nuxt 도 같은 자리 한 곳만 바뀌었다(' 전체 ' → true). 그 손질이 호출부마다
+        조금씩 달랐던 것이 세 목록이 갈린 원인 중 하나다.
+
+        이 파일에서 Phase 1 동안 기대값이 바뀐 것은 여기뿐이다 — 옮긴 직후 26건 중
+        이 1건만 실패했다(실측 2026-09-21). 다른 줄이 바뀌면 리팩터링이 동작을 건드린 것이다.
+        """
+        assert _TOTAL_ITEM_LABEL.match("전체 산업") is not None
         assert _TOTAL_ITEM_LABEL.match(_normalize_item_label("전체 산업")) is not None

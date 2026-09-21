@@ -6,6 +6,7 @@ from itertools import product
 from typing import Any, Optional
 
 from kosis_analysis.periods import _api_period_de
+from kosis_analysis.rules import is_total_label, normalize_item_label
 
 STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
@@ -103,23 +104,10 @@ def _normalize_required_dimensions(dimensions: list[str]) -> list[str]:
     return list(dict.fromkeys(normalized))
 
 
-#: 총계 항목 — 좁히는 것이 아니므로 한정어 증거로 세지 않는다.
-#: Nuxt ``stat-table-selection.TOTAL_LABEL`` 과 같은 뜻이다. 두 저장소가 나뉘어 있어
-#: 상수를 공유할 수 없으므로 **같은 목록을 양쪽에 두고 시험으로 고정한다.**
-_TOTAL_ITEM_LABEL = re.compile(
-    r"^(?:계|소계|합계|총계|전체|전국|전산업|전규모|전업종|전연령|전체산업|전체기업)$"
-)
-
-
-def _normalize_item_label(label: Any) -> str:
-    """항목 라벨을 비교용으로 정규화한다 — 괄호 꼬리를 떼고 공백을 지운다.
-
-    ``중소기업(300인 미만)`` 과 ``중소기업`` 은 같은 집단이다. KOSIS 는 같은 집단을
-    표마다 다르게 적는다. Nuxt ``normalizeItemLabel`` 과 같은 규칙이다.
-    """
-    text = str(label or "").strip()
-    text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
-    return re.sub(r"\s+", "", text)
+#: 총계 판정과 항목 라벨 정규화는 :mod:`kosis_analysis.rules` 가 소유한다.
+#: 같은 규칙이 세 곳에 서로 다른 내용으로 있었고, 그중 한 곳에만 검사가 있어서
+#: 좁히지도 않은 것을 좁혔다고 밝히는 사고가 났다(실측 2026-09-18).
+#: 정본은 Nuxt ``server/utils/stat/rules/total-label.json`` 이고 여기 ``rules/`` 는 사본이다.
 
 
 def _item_coverage(
@@ -143,7 +131,7 @@ def _item_coverage(
     missing: list[str] = []
     evidence: list[dict[str, Any]] = []
     for term in required_items:
-        want = _normalize_item_label(term)
+        want = normalize_item_label(term)
         if not want:
             continue
         hits = [
@@ -156,8 +144,8 @@ def _item_coverage(
             }
             for obj_id, axis in axes.items()
             for itm_id, meta in (axis.get("items") or {}).items()
-            if not _TOTAL_ITEM_LABEL.match(_normalize_item_label(meta.get("label")))
-            and _normalize_item_label(meta.get("label")) == want
+            if not is_total_label(meta.get("label"))
+            and normalize_item_label(meta.get("label")) == want
         ]
         if hits:
             matched.append(term)

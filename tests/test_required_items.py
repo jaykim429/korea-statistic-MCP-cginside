@@ -21,7 +21,6 @@ from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
     TableMetadataProfile,
     _item_coverage,
-    _normalize_item_label,
 )
 
 
@@ -30,6 +29,7 @@ def _profile(axes: dict, table_name: str = "표") -> TableMetadataProfile:
         org_id="101", tbl_id="T1", table_name=table_name,
         axes=axes, axis_order=list(axes), period_rows=[{"PRD_SE": "Y", "END_PRD_DE": "2024"}],
     )
+from kosis_analysis.rules import normalize_item_label
 
 
 def _axis(obj_nm: str, labels: list[str]) -> dict:
@@ -44,7 +44,7 @@ class TestNormalizeItemLabel:
         (None, ""),
     ])
     def test_정규화(self, raw, expect):
-        assert _normalize_item_label(raw) == expect
+        assert normalize_item_label(raw) == expect
 
 
 class TestItemCoverage:
