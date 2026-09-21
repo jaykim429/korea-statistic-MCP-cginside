@@ -1,0 +1,14 @@
+{
+  "_doc": "항목 라벨 정규화·총계 판정의 동작 정본. Nuxt 와 MCP 시험이 이 파일을 그대로 읽어 같은 답을 내는지 대조한다. 낱말 목록만 공유하면 정규화 알고리즘은 여전히 두 구현이라 갈릴 수 있다. **문자열 입력만 담는다** — 비문자열 falsy(0·false)에서 두 런타임이 이미 갈려 있고(실측 2026-09-21: 0 이 MCP 는 빈 문자열, Nuxt 는 \"0\"), 어느 쪽에 맞춰도 한쪽 동작이 바뀐다. 그 통일은 별도 결정으로 미룬다.",
+  "cases": [
+    { "input": "중소기업(300인 미만)", "normalized": "중소기업", "isTotalBroad": false },
+    { "input": "중소 기업", "normalized": "중소기업", "isTotalBroad": false },
+    { "input": "  대기업  ", "normalized": "대기업", "isTotalBroad": false },
+    { "input": "전체", "normalized": "전체", "isTotalBroad": true },
+    { "input": "전체 산업", "normalized": "전체산업", "isTotalBroad": true },
+    { "input": "합계", "normalized": "합계", "isTotalBroad": true },
+    { "input": "전산업", "normalized": "전산업", "isTotalBroad": true },
+    { "input": "여성기업", "normalized": "여성기업", "isTotalBroad": false },
+    { "input": "", "normalized": "", "isTotalBroad": false }
+  ]
+}

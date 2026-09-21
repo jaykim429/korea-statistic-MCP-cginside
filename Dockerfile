@@ -8,6 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 빌드 전에 `python scripts/sync_rules.py` 를 돌려 정본 규칙을 내려받아야 한다.
+# rules/ 는 Nuxt server/utils/stat/rules 의 사본이고, tests/test_rules_contract.py 가 어긋남을 잡는다.
 COPY . .
 
 EXPOSE 8000
