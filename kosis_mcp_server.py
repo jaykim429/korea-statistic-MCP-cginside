@@ -12190,7 +12190,7 @@ async def explore_table(
                 markers=["metadata_failed", "not_matched"],
                 explanation="No metadata was returned for the requested table; caller must re-search or verify IDs.",
                 extra_signals={
-                    "metadata_errors": [],
+                    "metadata_errors": [f"{meta_type}: {error}" for meta_type, error in meta_errors.items()],
                     "metadata_counts": meta_counts,
                 },
             ),
