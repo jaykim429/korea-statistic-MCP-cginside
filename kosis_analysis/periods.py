@@ -457,6 +457,12 @@ def _api_period_de(value: Any) -> str:
     monthly = re.fullmatch(r"(\d{4})\.(\d{2})", text)
     if monthly:
         return f"{monthly.group(1)}{monthly.group(2)}"
+    # 분기 표시 "2026 2/4" → KOSIS 형식 "202602"(YYYY0Q). 수록주기 메타의 END_PRD_DE 가 표시 문자열로 와서
+    # 그대로 보내면 KOSIS 가 "[KOSIS 21] 잘못된 변수" 로 거절했다(챗봇 followups 20, 2026-10-01 실측).
+    # 반기 표시는 실물 형식을 재지 않았으므로 바꾸지 않는다.
+    quarterly = re.fullmatch(r"(\d{4})\s*([1-4])/4", text)
+    if quarterly:
+        return f"{quarterly.group(1)}0{quarterly.group(2)}"
     return text
 
 
