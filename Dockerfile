@@ -12,6 +12,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # rules/ 는 Nuxt server/utils/stat/rules 의 사본이고, tests/test_rules_contract.py 가 어긋남을 잡는다.
 COPY . .
 
+# 이 이미지가 어느 커밋에서 만들어졌나. 챗봇 저장소의 Gate 0 이 돌고 있는 컨테이너의 이 파일을 MCP HEAD 와
+# 대조한다(챗봇 followups 18 — 로컬 컨테이너가 열흘 동안 저장소보다 늦어 있었고 아무도 몰랐다).
+#   docker build --build-arg GIT_COMMIT="$(git rev-parse --short HEAD)$(git diff --quiet || echo -dirty)" -t korea-statistic-mcp:local .
+# 각인 없이 만들면 'unknown' 이 들어가고 Gate 0 이 어긋남으로 잡는다.
+ARG GIT_COMMIT=unknown
+RUN echo "$GIT_COMMIT" > /app/.build-commit
+
 EXPOSE 8000
 
 # Readiness gate for the container.
