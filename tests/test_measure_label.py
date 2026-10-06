@@ -57,3 +57,5 @@ def test_중소기업_지표는_기업을_센다고_밝힌다():
     assert "기업수" in param.description
     assert "사업체" not in param.description
     assert "기업수" in param.tbl_nm
+    assert "기업 단위" in param.measure_basis
+    assert "매출액·자산 기준" in param.measure_basis

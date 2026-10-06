@@ -50,6 +50,7 @@ from kosis_analysis.client import (
     _kosis_call,
     _resolve_key,
 )
+from kosis_analysis.evidence import attach_stat_evidence
 from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
     TableMetadataProfile,
@@ -440,8 +441,35 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "metadata": {**metadata, "unit": "%", "level_unit": metadata.get("unit")} if growth_value is not None else metadata,
         "notes": notes,
         "diagnostics": diagnostics,
+        "stat_evidence": payload.get("stat_evidence"),
     }
     return {k: v for k, v in compact.items() if v not in (None, "", [], {})}
+
+
+def _finalize_answer_query_response(
+    payload: dict[str, Any],
+    *,
+    query: str,
+    region: str,
+    verbose: bool,
+) -> dict[str, Any]:
+    """Apply the common evidence contract before verbose/compact projection."""
+    result = dict(payload)
+    route = result.get("route") if isinstance(result.get("route"), dict) else {}
+    direct_key = str(route.get("direct_stat_key") or "")
+    param = TIER_A_STATS.get(direct_key)
+    if param is not None:
+        result.setdefault("actual_measure", param.description)
+        result.setdefault("actual_measure_evidence", "verified_curation_description")
+        if param.measure_basis:
+            result.setdefault("measure_basis", param.measure_basis)
+    requested = [{"dimension": item} for item in _infer_required_dimensions_from_query(query)]
+    enriched = attach_stat_evidence(
+        result,
+        tool="answer_query",
+        requested_concepts=requested,
+    )
+    return enriched if verbose else _compact_answer_query_response(enriched, query=query, region=region)
 
 
 def _mcp_tool_output_contract(
@@ -4710,11 +4738,18 @@ async def quick_stat(
     """
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
-        return _unsupported_source_response("quick_stat", query, resolved_source)
+        return attach_stat_evidence(
+            _unsupported_source_response("quick_stat", query, resolved_source),
+            tool="quick_stat",
+        )
     ignored_params = sorted((extra_params or {}).keys())
     result = await _quick_stat_core(query, region, period, api_key)
     result = _attach_ignored_params(result, ignored_params, "quick_stat")
-    return _attach_shortcut_contract(result, tool="quick_stat", ignored_params=ignored_params)
+    result = _attach_shortcut_contract(result, tool="quick_stat", ignored_params=ignored_params)
+    if isinstance(result, dict):
+        result.setdefault("requested_period", period)
+    requested = [{"dimension": item} for item in _infer_required_dimensions_from_query(query)]
+    return attach_stat_evidence(result, tool="quick_stat", requested_concepts=requested)
 
 
 async def _quick_stat_core(
@@ -4978,6 +5013,13 @@ async def _quick_stat_core(
             "지역": region, "통계표": param.tbl_nm,
             "org_id": param.org_id, "tbl_id": param.tbl_id,
             "출처": "통계청 KOSIS",
+            # The caller may use everyday wording (for example 기업 수) while
+            # the selected statistic counts a more specific population.  Expose
+            # what was actually measured; service policy decides whether a
+            # short terminology note is sufficient or a clarification is needed.
+            "actual_measure": param.description,
+            "actual_measure_evidence": "verified_curation_description",
+            **({"measure_basis": param.measure_basis} if param.measure_basis else {}),
         }
         # 같은 지표라도 모집단·작성 기준이 다르면 값이 다르다. 최신 표를 주값으로 주되
         # 다른 기준이 있으면 함께 알린다 — 하나만 보여 주면 실무자는 다른 기준이 있다는 사실조차
@@ -7586,7 +7628,7 @@ async def answer_query(
             result = _attach_gemma_deprecation_warning(
                 _missing_api_key_response("answer_query", query=query, region=region)
             )
-            return result if verbose else _compact_answer_query_response(result, query=query, region=region)
+            return _finalize_answer_query_response(result, query=query, region=region, verbose=verbose)
         raise
     engine = NaturalLanguageAnswerEngine(key)
     try:
@@ -7595,7 +7637,7 @@ async def answer_query(
             timeout=ANSWER_QUERY_TIMEOUT_SECONDS,
         )
         result = _attach_gemma_deprecation_warning(result)
-        return result if verbose else _compact_answer_query_response(result, query=query, region=region)
+        return _finalize_answer_query_response(result, query=query, region=region, verbose=verbose)
     except asyncio.TimeoutError:
         result = _attach_gemma_deprecation_warning({
             "?곹깭": "failed",
@@ -7611,7 +7653,7 @@ async def answer_query(
                 "availability_check": "check_stat_availability",
             },
         })
-        return result if verbose else _compact_answer_query_response(result, query=query, region=region)
+        return _finalize_answer_query_response(result, query=query, region=region, verbose=verbose)
     except RuntimeError as e:
         result = _attach_gemma_deprecation_warning({
             "상태": "failed",
@@ -7621,7 +7663,7 @@ async def answer_query(
             "오류": str(e),
             "질문": query,
         })
-        return result if verbose else _compact_answer_query_response(result, query=query, region=region)
+        return _finalize_answer_query_response(result, query=query, region=region, verbose=verbose)
 
 
 @mcp.tool()
@@ -11401,8 +11443,7 @@ async def check_variable_compatibility(
 
 
 
-@mcp.tool()
-async def query_table(
+async def _query_table_core(
     org_id: str,
     tbl_id: str,
     filters: dict[str, Any],
@@ -11925,6 +11966,45 @@ async def query_table(
     }
     result.update({key: value for key, value in nature.items() if value is not None})
     return result
+
+
+@mcp.tool()
+async def query_table(
+    org_id: str,
+    tbl_id: str,
+    filters: dict[str, Any],
+    period_range: Optional[list[str]] = None,
+    period_type: Optional[str] = None,
+    latest_count: Optional[int] = None,
+    aggregation: str = "none",
+    group_by: Optional[list[str]] = None,
+    include_raw: bool = False,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[🧪] 검증된 메타 코드로 KOSIS 표를 raw 조회한다.
+
+    filters는 explore_table/resolve_concepts가 반환한 OBJ_ID/ITM_ID를 받는다.
+    REST 어댑터 호환을 위해 objL1~objL3와 itmId 별칭도 메타 축 순서에 따라
+    검증한 뒤 실제 OBJ_ID/ITEM 축으로 변환한다. period_type은 표의 수록주기를
+    선택하고, period_range가 없을 때 latest_count는 KOSIS newEstPrdCnt로 전달된다.
+    여러 코드는 서버 내부 fan-out으로 조회한다. 기본 aggregation="none"은
+    개별 rows만 반환한다. aggregation="sum_by_group"은 호출자가 가법성을
+    명시적으로 책임지는 경우에만 합산한다. 모든 응답에는 기존 필드와 함께
+    StatEvidenceEnvelope v1인 stat_evidence가 추가된다.
+    """
+    result = await _query_table_core(
+        org_id=org_id,
+        tbl_id=tbl_id,
+        filters=filters,
+        period_range=period_range,
+        period_type=period_type,
+        latest_count=latest_count,
+        aggregation=aggregation,
+        group_by=group_by,
+        include_raw=include_raw,
+        api_key=api_key,
+    )
+    return attach_stat_evidence(result, tool="query_table")
 
 
 @mcp.tool()

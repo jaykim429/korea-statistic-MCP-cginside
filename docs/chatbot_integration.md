@@ -93,6 +93,59 @@ manifest와 운영 규칙을 정리합니다. 목표는 LLM의 선택 자유도�
 
 ## 응답 계약
 
+### StatEvidenceEnvelope v1
+
+`quick_stat`, `answer_query`, `query_table`은 기존 응답 필드를 유지하면서
+`stat_evidence`를 추가로 반환합니다. 챗봇은 도구별 필드명이나 답변 문구를 다시
+추론하지 말고 이 공통 계약을 우선 읽습니다.
+
+- `contract_version`: 현재 `stat-evidence/v1`
+- `build_commit`: 실행 중인 MCP 이미지의 빌드 커밋. 로컬 소스 실행처럼 알 수 없는
+  경우 `unknown`
+- `execution.status`: `executed`, `no_data`, `failed`, `unknown`. KOSIS 호출이
+  실행됐는지에 관한 상태이며 질문 충족 여부와 다릅니다.
+- `execution.failure_class`: `infrastructure`, `invalid_request`,
+  `period_unavailable`, `no_rows`, `partial_coverage`, `unknown`
+- `execution.retryable`: 같은 요청을 재시도할 가치가 있는 장애인지 여부
+- `fulfillment.status`: `exact`, `partial`, `unavailable`, `unknown`. 질문의 조건을
+  실제 결과가 충족했는지에 관한 상태
+- `fulfillment.missing_fields`: 실행은 됐지만 값·단위·기간·출처·표 식별자 중 빠진 필드
+- `fulfillment.requested_concepts`, `resolved_concepts`, `missing_concepts`: 요청한
+  분류와 실제 행에서 확인된 분류의 대응. 무시된 shortcut 파라미터도
+  `parameter:<name>` 형태로 `missing_concepts`에 들어갑니다.
+- `evidence.observations`: 행마다 `value`, `unit`, `period`, `dimensions`를 같은
+  형태로 반환합니다. 여러 행을 임의의 대표값 하나로 축약하지 않습니다.
+- `evidence.actual_measure`, `actual_measure_evidence`, `measure_basis`: 표가 실제로
+  센 항목과 그 근거. `measure_basis`는 근거가 있는 응답에서만 채우며 모르면 비워 둡니다.
+- `evidence.period`: `requested`, `used`, `available`, `selection_mode`, `cadence`를
+  분리합니다.
+- `evidence.source`, `evidence.table`: 출처와 기관/통계표 식별자
+
+`execution.status="executed"`만 보고 답하지 않습니다. 일반 단일값 답변은
+`fulfillment.status="exact"`이고 `completeness="complete"`일 때 바로 사용할 수
+있습니다. `partial`이면 반환된 값 자체가 유효할 수 있으므로 `missing_concepts`를
+확인해 질문의 핵심 조건인지 판단합니다. `failed`이면서
+`failure_class="infrastructure"`이면 통계 부재로 말하지 않고 재시도 가능한 서비스
+장애로 처리합니다.
+
+#### 일상어와 통계 용어가 다를 때
+
+`기업 수`와 `사업체 수`처럼 일상 대화에서는 비슷하게 쓰이지만 통계 작성 단위가
+다를 수 있는 표현은 **경고만으로 답변을 차단하지 않습니다**. 값·기간·단위·표가
+완전하면 `evidence.actual_measure`의 정확한 명칭으로 답하고, “통계상 기업체/사업체
+기준이라 일상적 기업 수와 다를 수 있다”는 짧은 설명을 붙입니다.
+
+다만 다음 경우에는 정의 차이가 결론을 바꾸므로 확인 질문 또는 대안 표 선택이
+필요합니다.
+
+- 기업 수와 사업체 수를 서로 비교하거나 비율·증감률의 분자/분모로 쓰는 질문
+- 지원 자격, 법적 정의, 정책 대상 수처럼 행정상 단위가 중요한 질문
+- 같은 표현으로 둘 이상의 현행 통계표가 가능하고 값 차이가 큰 질문
+- 사용자가 법인 단위, 사업장 단위 등 모집단을 명시한 질문
+
+즉, MCP는 실제 측정항목과 근거를 제공하고, 챗봇은 질문의 위험도와 목적에 따라
+“설명 후 답변”과 “먼저 확인”을 구분합니다.
+
 차트 도구는 SVG만 반환하지 않습니다. 성공 응답에는
 `capability_state: "query_executed"`, `actual_query_supported: true`, 실제
 `rows`, `row_count`, 요청·사용 지역, `svg`가 함께 들어갑니다. 일부 지역이나

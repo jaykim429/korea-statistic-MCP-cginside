@@ -279,6 +279,9 @@ class QuickStatParam:
     obj_l1: str                          # 기본 분류값 (전국 등)
     item_id: str
     unit: str
+    # 모집단·관측 단위처럼 값의 의미를 바꾸는 작성 기준. 근거가 확인된
+    # 지표만 채우며, 표 이름이나 note에서 추측해 자동 생성하지 않는다.
+    measure_basis: str = ""
     region_scheme: Optional[dict] = None  # 지역명 → 코드
     region_obj: Literal["obj_l1", "obj_l2", "obj_l3"] = "obj_l1"
     obj_l2: Optional[str] = None
@@ -629,6 +632,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         tbl_nm="시도별·산업중분류별·기업규모별 기업수",
         description="중소기업 기업수",
         obj_l1="IM", obj_l2="15142C501", obj_l3="T002", item_id="T001", unit="개",
+        measure_basis="기업 단위(업종별 매출액·자산 기준으로 중소기업 규모 분류)",
         region_scheme=REGION_BUSINESS,
         region_obj="obj_l2",
         verification_status="verified",

@@ -2965,6 +2965,8 @@ async def test_chart_distribution_returns_raw_svg_field() -> None:
     original_quick_stat = kosis_mcp_server.quick_stat
 
     param = SimpleNamespace(
+        org_id="101",
+        tbl_id="DT_TEST",
         description="test indicator",
         unit="units",
         tbl_nm="test table",
