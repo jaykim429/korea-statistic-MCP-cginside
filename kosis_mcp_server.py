@@ -4367,6 +4367,27 @@ class NaturalLanguageAnswerEngine:
     }
 
     @classmethod
+    def _intrinsic_average_fulfilled(
+        cls, result: dict[str, Any], query: str,
+    ) -> bool:
+        """An executed, verified mean metric is not an unexecuted averaging operation."""
+        if result.get("상태") != "executed" or result.get("답변유형") not in {"tier_a_value", "tier_a_trend"}:
+            return False
+        direct_key = str((result.get("route") or {}).get("direct_stat_key") or "")
+        param = TIER_A_STATS.get(direct_key)
+        if param is None or param.verification_status != "verified":
+            return False
+        if str(result.get("org_id") or "") != param.org_id or str(result.get("tbl_id") or "") != param.tbl_id:
+            return False
+        label = re.sub(r"\s+", "", param.description)
+        intrinsic = re.search(r"(?:(?:월|연|일|분기)평균|평균)[가-힣]+", label)
+        compact_query = re.sub(r"\s+", "", query)
+        if not intrinsic or intrinsic.group(0) not in compact_query:
+            return False
+        # A second 평균 still requires an actual calculation across periods/groups.
+        return "평균" not in compact_query.replace(intrinsic.group(0), "", 1)
+
+    @classmethod
     def _intent_execution_warnings(
         cls,
         result: dict[str, Any],
@@ -4381,6 +4402,8 @@ class NaturalLanguageAnswerEngine:
         slots = route_payload.get("slots") or {}
 
         for intent_label, fulfilling_types in cls._INTENT_FULFILLMENT.items():
+            if intent_label == "STAT_AVERAGE" and cls._intrinsic_average_fulfilled(result, query):
+                continue
             if intent_label in intents and answer_type not in fulfilling_types:
                 warnings.append(
                     f"의도 {intent_label} 감지됐으나 응답 유형은 {answer_type or '미지정'} — "
@@ -4477,6 +4500,8 @@ class NaturalLanguageAnswerEngine:
         dropped: list[str] = []
         reasons: list[str] = []
         for intent_label, fulfilling_types in cls._INTENT_FULFILLMENT.items():
+            if intent_label == "STAT_AVERAGE" and cls._intrinsic_average_fulfilled(result, query):
+                continue
             if intent_label not in intents or answer_type in fulfilling_types:
                 continue
             for dim in cls._INTENT_DROPPED_DIMENSIONS.get(intent_label, ()):
