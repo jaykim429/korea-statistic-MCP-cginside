@@ -1303,10 +1303,11 @@ _KSIC_SECTIONS: list[tuple[str, str]] = [
 # 지표 라벨 → (tbl_id, KOSIS itm_id, 한국어 단위).
 # DT_BR_A001 = 기업수, B001 = 종사자수, C001 = 매출액 — explore_table
 # 통계표명으로 라이브 검증 후 매핑.
-_BR_METRICS: dict[str, tuple[str, str, str]] = {
-    "사업체수": ("DT_BR_A001", "T001", "개"),
-    "종사자수": ("DT_BR_B001", "T001", "명"),
-    "매출액":   ("DT_BR_C001", "T001", "억원"),
+_BR_METRICS: dict[str, tuple[str, str, str, str]] = {
+    # Routing aliases are not measurement names. Keep old keys, but describe the official metric.
+    "사업체수": ("DT_BR_A001", "T001", "개", "기업수"),
+    "종사자수": ("DT_BR_B001", "T001", "명", "종사자수"),
+    "매출액":   ("DT_BR_C001", "T001", "억원", "매출액"),
 }
 
 # 기업규모 → (objL3 코드, 라벨 in 키 이름). KOSIS objL3:
@@ -1318,12 +1319,13 @@ _BR_SCALES: list[tuple[str, str]] = [
 
 for _industry, _industry_code in _KSIC_SECTIONS:
     for _scale_label, _scale_code in _BR_SCALES:
-        for _metric, (_tbl, _itm, _unit) in _BR_METRICS.items():
+        for _metric, (_tbl, _itm, _unit, _official_metric) in _BR_METRICS.items():
             _key = f"{_industry}_{_scale_label}_{_metric}"
             TIER_A_STATS[_key] = QuickStatParam(
                 org_id="142", tbl_id=_tbl,
-                tbl_nm=f"시도별·산업중분류별·기업규모별 {_metric}",
-                description=f"{_industry} {_scale_label} {_metric}",
+                tbl_nm=f"시도별·산업중분류별·기업규모별 {_official_metric}",
+                description=f"{_industry} {_scale_label} {_official_metric}",
+                measure_basis="기업 단위(사업체 단위가 아님)" if _official_metric == "기업수" else "",
                 obj_l1=_industry_code,
                 obj_l2="15142C501",
                 obj_l3=_scale_code,
@@ -1341,7 +1343,7 @@ for _industry, _industry_code in _KSIC_SECTIONS:
             )
 
 # 사용된 임시 변수 정리 (모듈 최상위 namespace 오염 방지)
-del _industry, _industry_code, _scale_label, _scale_code, _metric, _tbl, _itm, _unit, _key
+del _industry, _industry_code, _scale_label, _scale_code, _metric, _tbl, _itm, _unit, _official_metric, _key
 
 
 # ============================================================================

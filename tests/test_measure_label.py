@@ -8,7 +8,8 @@
 중소기업 기준은 업종별 매출액·자산이라 종사자규모로 환산할 수 없어 '중소기업 사업체수'
 공식 통계는 없다. 그래서 세는 대로 '기업수'라 적는다.
 
-83개 전수 점검으로 이 하나뿐임을 확인했다. 다시 어긋나면 이 검사가 잡는다.
+표명과 설명을 같은 잘못된 별칭으로 생성하면 둘의 대조만으로는 잡히지 않는다.
+동적 업종 확장은 실제 표 식별자에 따른 공식 측정어도 대조한다.
 """
 
 import re
@@ -59,3 +60,27 @@ def test_중소기업_지표는_기업을_센다고_밝힌다():
     assert "기업수" in param.tbl_nm
     assert "기업 단위" in param.measure_basis
     assert "매출액·자산 기준" in param.measure_basis
+
+
+def test_all_generated_business_count_aliases_keep_the_official_enterprise_measure():
+    generated = {key: param for key, param in TIER_A_STATS.items()
+                 if param.tbl_id == "DT_BR_A001" and param.obj_l1.startswith("IM_")}
+    assert len(generated) == 36  # 18 industries × SME/small-business scales
+    for key, param in generated.items():
+        assert key.endswith("_사업체수")  # Existing natural-language routes remain compatible.
+        assert measure_of(param.description) == "기업수", key
+        assert measure_of(param.tbl_nm) == "기업수", key
+        assert "기업 단위" in param.measure_basis, key
+        assert param.item_id == "T001" and param.unit == "개", key
+
+
+def test_other_generated_measures_are_not_renamed_to_enterprise_counts():
+    expected = {"DT_BR_B001": ("종사자수", "명"), "DT_BR_C001": ("매출액", "억원")}
+    generated = {key: param for key, param in TIER_A_STATS.items()
+                 if param.tbl_id in expected and param.obj_l1.startswith("IM_")}
+    assert len(generated) == 72
+    for key, param in generated.items():
+        measure, unit = expected[param.tbl_id]
+        assert measure_of(param.description) == measure, key
+        assert measure_of(param.tbl_nm) == measure, key
+        assert param.unit == unit and not param.measure_basis, key
