@@ -8387,7 +8387,7 @@ def _demote_partial_results_when_full_match_exists(results: list[dict[str, Any]]
     return (primary or results), secondary
 
 
-def _demote_unfocused_full_matches(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _demote_unfocused_full_matches(query: Any, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if len(results) <= 1:
         return results, []
     focused: list[dict[str, Any]] = []
@@ -8400,7 +8400,15 @@ def _demote_unfocused_full_matches(results: list[dict[str, Any]]) -> tuple[list[
     best_focus = max(focus_values, default=0.0)
     if best_focus < 0.12:
         return results, []
-    cutoff = max(0.08, best_focus * 0.45)
+    # 한 단어 검색은 긴 공식 표명 안의 정확한 지표명도 정상 후보다. 최고 초점 후보와의 상대 비율만 쓰면
+    # 「퇴직급여 희망 형식」(0.50)이 「주소지별 퇴직소득 …(퇴직급여액)」(0.16)을 잡음으로 밀어낸다.
+    # 단일 실질어에서는 상대 컷을 0.12로 제한해 공식 표는 남기되, 제목에서 차지하는 비중이 매우 작은
+    # 장문 설문 문항은 계속 낮은 신뢰도로 분리한다. 여러 검색어는 기존의 엄격한 상대 초점을 유지한다.
+    tokens = _query_tokens_for_matching(query)
+    relative_cutoff = best_focus * 0.45
+    if len(tokens) == 1 and len(tokens[0]) >= 3:
+        relative_cutoff = min(relative_cutoff, 0.12)
+    cutoff = max(0.08, relative_cutoff)
     for row in results:
         focus = float((row.get("match_quality") or {}).get("title_focus_ratio") or 0.0)
         if focus < cutoff:
@@ -9638,7 +9646,7 @@ async def search_nabo_tables(
     tables = _sort_search_candidates(query, tables)
     quality_summary = _search_quality_summary(query, tables)
     primary_tables, secondary_tables = _demote_partial_results_when_full_match_exists(tables, quality_summary)
-    primary_tables, unfocused_tables = _demote_unfocused_full_matches(primary_tables)
+    primary_tables, unfocused_tables = _demote_unfocused_full_matches(query, primary_tables)
     secondary_tables.extend(unfocused_tables)
     candidate_quality = _candidate_quality_label(primary_tables, quality_summary)
     broad_query = _is_broad_query_candidate_set(query, tables)
@@ -10464,7 +10472,7 @@ async def search_stats(
     unfocused_results: list[dict[str, Any]] = []
     if not low_confidence_results:
         results, low_confidence_results = _demote_partial_results_when_full_match_exists(results, search_quality_summary)
-        results, unfocused_results = _demote_unfocused_full_matches(results)
+        results, unfocused_results = _demote_unfocused_full_matches(query, results)
         low_confidence_results.extend(unfocused_results)
     candidate_quality = candidate_quality or _candidate_quality_label(results, search_quality_summary)
     broad_query = _is_broad_query_candidate_set(query, results or low_confidence_results)

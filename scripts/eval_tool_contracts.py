@@ -2877,6 +2877,20 @@ def test_ascii_query_terms_do_not_match_inside_words() -> None:
     assert quality["coverage_ratio"] == 0.0, quality
 
 
+def test_single_indicator_keeps_focused_official_long_titles() -> None:
+    query = "퇴직급여"
+    rows = kosis_mcp_server._sort_search_candidates(query, [
+        {"table_id": "A", "table_name": "퇴직급여 희망 형식"},
+        {"table_id": "B", "table_name": "4.4.1.2 주소지별 퇴직소득 신고 현황(퇴직급여액)[2019~]"},
+        {"table_id": "C", "table_name": "4.4.5 퇴직소득자의 근속연수 현황Ⅱ(퇴직급여, 과세표준)[2013~]"},
+    ])
+
+    primary, low_confidence = kosis_mcp_server._demote_unfocused_full_matches(query, rows)
+
+    assert [row["table_id"] for row in primary] == ["A", "B", "C"], primary
+    assert low_confidence == [], low_confidence
+
+
 async def test_quick_stat_typo_returns_fuzzy_candidates_without_execution() -> None:
     original_call = kosis_mcp_server._kosis_call
 
@@ -3130,6 +3144,7 @@ async def main() -> None:
         ("search_stats_partial_candidate_demote", lambda: test_search_stats_demotes_partial_candidates_when_full_match_exists()),
         ("search_stats_unfocused_candidate_demote", lambda: test_search_stats_demotes_unfocused_full_matches()),
         ("ascii_query_terms_word_boundary", lambda: test_ascii_query_terms_do_not_match_inside_words()),
+        ("single_indicator_official_titles", lambda: test_single_indicator_keeps_focused_official_long_titles()),
         ("quick_stat_fuzzy_candidate", lambda: test_quick_stat_typo_returns_fuzzy_candidates_without_execution()),
         ("quick_stat_semantic_rewrite", lambda: test_quick_stat_unmapped_colloquial_requires_semantic_rewrite()),
         ("quick_shortcut_failure_not_final", lambda: test_quick_shortcut_failures_are_not_final_answers()),
