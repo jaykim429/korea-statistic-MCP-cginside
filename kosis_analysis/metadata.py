@@ -397,7 +397,7 @@ class TableMetadataProfile:
         return evidence
 
     def indicator_evidence(self, indicator: Optional[str]) -> tuple[int, list[str]]:
-        return _indicator_evidence(self.table_name, self.axes, indicator)
+        return _indicator_evidence(f"{self.table_name or ''} {self.survey_name or ''}", self.axes, indicator)
 
     def axis_summary(self) -> list[dict[str, Any]]:
         return [

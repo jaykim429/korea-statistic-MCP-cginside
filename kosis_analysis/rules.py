@@ -64,7 +64,7 @@ def measure_of(text: Any) -> str | None:
         at = body.rfind(noun)
         while at >= 0:
             last = at + len(noun) - 1
-            count_end = noun not in _MEASURES["countNouns"] or ends[last] or any(
+            count_end = (noun not in _MEASURES["countNouns"] and noun != "인구") or ends[last] or any(
                 rests[last].startswith(suffix) for suffix in _MEASURES["countSuffixes"])
             if count_end and (token_ids[at] == token_ids[last] or ends[last]):
                 rank = (last, len(noun))

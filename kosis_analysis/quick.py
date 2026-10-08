@@ -14,6 +14,7 @@ from kosis_curation import (
     requests_time_series,
     PERIOD_CADENCE_TERMS,
     requested_series_years,
+    requested_series_window,
 )
 from kosis_analysis.metadata import _compact_text
 from kosis_analysis.text_match import _QUERY_STOP_TERMS, _query_tokens_for_matching
@@ -137,7 +138,7 @@ _NATIONWIDE_TERMS = ("우리나라", "한국", "대한민국", "국내", "전국
 
 #: 최신 시점을 뜻하는 말. 잡말이 아니라 시간 의미다 — 따로 두어야 회귀 분석 때 근거가 남는다.
 #: quick_stat 은 최신 시점을 돌려주므로 결과적으로 덮인다.
-_LATEST_PERIOD_TERMS = ("최근", "현재", "지금", "요즘", "현재기준", "최신", "연도", "년도", "시점")
+_LATEST_PERIOD_TERMS = ("최근", "현재", "지금", "요즘", "현재기준", "최신", "최신값", "최신수치", "최근값", "최근수치", "최신연도", "연도", "년도", "시점")
 
 #: 대화 표현. `_QUERY_STOP_TERMS` 가 토큰 **등가**로만 걸려 활용형이 샌다 — 그 위에 더한다.
 _CONVERSATION_FILLERS = (
@@ -234,7 +235,7 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
     add_tokens(*_LATEST_PERIOD_TERMS)
     add_tokens(*_CONVERSATION_FILLERS)
     add_tokens(*_QUERY_STOP_TERMS)
-    if requested_series_years(query) is not None:
+    if requested_series_window(query) is not None:
         add_tokens("지난")
     # Period grouping is a temporal constraint, not an unknown population.
     # The time-series gate still prevents quick_stat from silently returning one value.
@@ -302,7 +303,7 @@ def leftover_qualifier_terms(
             continue
         # 5년 is a duration only in a parsed recent-years request. Never erase
         # population qualifiers such as 5년차 기업 or arbitrary numeric labels.
-        if requested_series_years(query) is not None and re.fullmatch(r"\d{1,2}(?:개)?년(?:간|동안)?", token):
+        if requested_series_window(query) is not None and re.fullmatch(r"\d{1,3}(?:개)?(?:년|개월|분기)(?:간|동안)?", token):
             continue
         stem = _strip_particle(token)
         # 조사를 떼면 한 글자 계량어만 남는 말("수는" → "수")은 내용어가 아니다.

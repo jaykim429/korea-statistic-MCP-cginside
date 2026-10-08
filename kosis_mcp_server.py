@@ -501,6 +501,20 @@ def _finalize_answer_query_response(
         tool="answer_query",
         requested_concepts=requested,
     )
+    # Home-country words are scope constraints. Prove them only with a verified
+    # domestic codebook and the actual region code/label of every observation.
+    if param is not None and param.verification_status == "verified" and param.region_scheme and "전국" in param.region_scheme and (
+        str(result.get("org_id") or "") == param.org_id and str(result.get("tbl_id") or "") == param.tbl_id
+    ):
+        domestic = {"전국", "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종", "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주"}
+        block = enriched["stat_evidence"]["evidence"]
+        observations = block.get("observations") or []
+        def proved_region(row):
+            selected = (row.get("dimensions") or {}).get("region") or {}
+            label, code = str(selected.get("label") or ""), str(selected.get("code") or "")
+            return (_canonical_region(label) or label) in domestic and param.region_scheme.get(label) == code
+        if observations and all(proved_region(row) for row in observations):
+            block["geography"] = {"country": "KR", "basis": "verified_curation_region_scheme"}
     return enriched if verbose else _compact_answer_query_response(enriched, query=query, region=region)
 
 
@@ -1021,6 +1035,7 @@ from kosis_curation import (
     requests_time_series,
     requested_period_cadence,
     requested_series_years,
+    requested_series_window,
     topic_hints as _topic_hints,
     stats_summary as _curation_stats_summary,
     _AMBIGUOUS_TOKENS as _BARE_INDICATOR_TOKENS,
@@ -3505,6 +3520,7 @@ class NaturalLanguageAnswerEngine:
 
         if requests_time_series(query) or "분석" in q:
             years = requested_series_years(query) or 5
+            window = requested_series_window(query)
             open_start_year = _extract_open_start_year(query)
             trend = await _quick_trend_core(
                 direct_key,
@@ -3512,6 +3528,7 @@ class NaturalLanguageAnswerEngine:
                 years,
                 self.api_key,
                 start_year=open_start_year,
+                **({"latest_count_override": window[0]} if window and window[1] in ("M", "Q") else {}),
                 **({"period_type": _requested_trend_period_type(query)} if _requested_trend_period_type(query) else {}),
             )
             if "오류" in trend:
@@ -5418,6 +5435,7 @@ async def _quick_trend_core(
     start_year: Optional[str] = None,
     end_year: Optional[str] = None,
     period_type: Optional[str] = None,
+    latest_count_override: Optional[int] = None,
 ) -> dict:
     normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(start_year, end_year)
     if period_error:
@@ -5489,7 +5507,10 @@ async def _quick_trend_core(
     period_type = period_type or _requested_trend_period_type(query) or _default_period_type(param)
     if period_type not in param.supported_periods:
         return {"오류": f"요청 주기 {period_type}를 이 통계표가 지원하지 않습니다.", "코드": "PERIOD_TYPE_UNSUPPORTED"}
-    latest_count = _latest_count_for_years(years, period_type)
+    window = requested_series_window(query)
+    if latest_count_override is None and window and window[1] == period_type:
+        latest_count_override = window[0]
+    latest_count = min(max(latest_count_override, 1), 100) if latest_count_override is not None else _latest_count_for_years(years, period_type)
     start_period = end_period = None
     if normalized_start_year:
         start_period, _ = _period_bounds(normalized_start_year, period_type)
@@ -8415,7 +8436,43 @@ async def _search_kosis_keywords(
         if name:
             seen_names.add(name)
         deduped_rows.append(row)
-    result_rows = deduped_rows[:limit]
+    # Curation supplies table candidates, not permission to execute its total.
+    # Facets must still pass the ordinary metadata/ITEM/axis validation below.
+    compact_query = re.sub(r"\s+", "", query)
+    seeds = []
+    seeded = set()
+    for stat_key, param in TIER_A_STATS.items():
+        if param.verification_status != "verified" or param.replacement_status != "current":
+            continue
+        asked_measure = measure_of(query)
+        candidate_measure = measure_of(param.description)
+        if asked_measure and candidate_measure and measure_relation(asked_measure, candidate_measure) not in ("exact", "proxy"):
+            continue
+        terms = [stat_key.replace("_", ""), param.description]
+        if not any(len(re.sub(r"\s+", "", term)) >= 4 and re.sub(r"\s+", "", term) in compact_query for term in terms):
+            continue
+        identity = (param.org_id, param.tbl_id)
+        if identity in seeded:
+            continue
+        seeded.add(identity)
+        seeds.append(_catalog_candidate_with_query_status({
+            "통계표명": param.tbl_nm, "통계표ID": param.tbl_id, "기관ID": param.org_id,
+            "검색어": query, "candidate_basis": "verified_curation_table", "metric_hint": param.description,
+            "match_quality": _query_match_quality(query, param.description),
+        }))
+        if len(seeds) >= 2:
+            break
+    seed_ids = {(row["기관ID"], row["통계표ID"]) for row in seeds}
+    result_rows = (seeds + [row for row in deduped_rows if (row.get("기관ID"), row.get("통계표ID")) not in seed_ids])[:limit]
+    search_markers = [marker for marker in search_markers if marker != "search_empty"]
+    if not result_rows:
+        search_markers.append("search_empty")
+    if seeds:
+        search_markers.append("curation_candidates_available")
+    search_explanation = (
+        "Candidate tables require actual metadata and axis validation before retrieval."
+        if result_rows else "No relevant candidate tables were found; do not invent a table."
+    )
     quality_summary = _search_quality_summary(query, result_rows)
     if result_rows and quality_summary["full_query_match_count"] == 0:
         search_markers.append("no_full_query_match")
@@ -8427,8 +8484,8 @@ async def _search_kosis_keywords(
         "사용된_검색어": keywords,
         "search_terms_used": keywords,
         "original_query_preserved": bool(keywords and keywords[0] == query),
-        "결과수": len(unique),
-        "result_count": len(unique),
+        "결과수": len(result_rows),
+        "result_count": len(result_rows),
         "partial_failure_count": len(failures),
         "partial_failure_types": list(dict.fromkeys(failures)),
         "Tier_A_직접_매핑": tier_a_hint,
@@ -8441,7 +8498,7 @@ async def _search_kosis_keywords(
             markers=search_markers,
             explanation=search_explanation,
             extra_signals={
-                "result_count": len(unique),
+                "result_count": len(result_rows),
                 "routing_used": used_routing,
                 "tier_a_match": tier_a_hint is not None,
                 "original_query_preserved": bool(keywords and keywords[0] == query),
@@ -11187,7 +11244,7 @@ async def select_table_for_query(
 
         def _name_hits(row: dict[str, Any]) -> int:
             name = str(row.get("통계표명") or "")
-            return sum(1 for t in indicator_terms if _query_token_matches_text(t, name))
+            return (len(indicator_terms) + 1 if row.get("candidate_basis") == "verified_curation_table" else 0) + sum(1 for t in indicator_terms if _query_token_matches_text(t, name))
 
         unique_rows.sort(key=lambda row: -_name_hits(row))
     # 반환은 limit 개다. 그보다 크게 잡아도 순위만 흔들릴 뿐 호출량(분당 한도)만 먹는다.

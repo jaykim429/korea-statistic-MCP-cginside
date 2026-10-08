@@ -9,6 +9,7 @@
     {"parent": "소기업", "children": ["소상공인"]}
   ],
   "scopedSurveys": [
+    {"name": "소상공인실태조사", "population": "소상공인"},
     {"name": "북한이탈주민실태조사", "population": "북한이탈주민"},
     {"name": "기업체장애인고용실태조사", "population": "기업체"}
   ],
