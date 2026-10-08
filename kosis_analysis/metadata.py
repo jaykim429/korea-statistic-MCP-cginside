@@ -6,7 +6,7 @@ from itertools import product
 from typing import Any, Optional
 
 from kosis_analysis.periods import _api_period_de
-from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation, survey_allows_question
+from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation, measure_basis_compatible, survey_allows_question
 
 STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
@@ -253,7 +253,9 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
             if measure:
                 evidence.append({"source": "table_name", "name": part, "measure": measure})
     measures = [entry["measure"] for entry in evidence]
-    relations = [measure_relation(asked, entry["measure"], (str(entry["unit"]),) if entry.get("unit") else ()) for entry in evidence]
+    relations = [measure_relation(asked, entry["measure"], (str(entry["unit"]),) if entry.get("unit") else ())
+                 if measure_basis_compatible(request or "", str(entry.get("name") or "")) else "incompatible"
+                 for entry in evidence]
     relation = "unknown"
     if "exact" in relations:
         relation = "exact"

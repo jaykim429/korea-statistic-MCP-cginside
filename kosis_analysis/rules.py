@@ -79,6 +79,16 @@ def canonical_measure(measure: str | None) -> str | None:
     return _MEASURES["equivalentMeasures"].get(measure, measure)
 
 
+def measurement_normalizer(text: str) -> str | None:
+    match = re.search(_MEASURES["perUnitNormalizerPattern"], re.sub(r"\s+", "", text))
+    return match.group(0) if match else None
+
+
+def measure_basis_compatible(question: str, actual: str) -> bool:
+    normalizer = measurement_normalizer(actual)
+    return not normalizer or normalizer == measurement_normalizer(question)
+
+
 def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ...] = ()) -> str:
     asked = _MEASURES["equivalentMeasures"].get(asked, asked)
     actual = _MEASURES["equivalentMeasures"].get(actual, actual)

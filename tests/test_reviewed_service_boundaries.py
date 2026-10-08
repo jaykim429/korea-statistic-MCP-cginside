@@ -4,6 +4,17 @@ import kosis_curation as c
 import kosis_mcp_server as s
 from kosis_analysis.quick import leftover_gate_terms
 from kosis_analysis.rules import measure_of, measure_relation
+from kosis_analysis.metadata import _measure_compatibility
+
+
+@pytest.mark.parametrize("question,actual,relation", [
+    ("소상공인 매출액", "기업체당 매출액", "incompatible"),
+    ("기업체당 매출액", "기업체당 매출액", "exact"),
+    ("1000명당 발생건수", "1명당 발생건수", "incompatible"),
+])
+def test_actual_measurement_denominator_is_not_erased(question, actual, relation):
+    axes = {"ITEM": {"items": {"T1": {"label": actual, "unit": "백만원"}}}}
+    assert _measure_compatibility("주요지표", axes, question)["relation"] == relation
 
 
 def test_search_broadens_closed_series_quality_and_measure_alias_without_changing_requested_indicator(monkeypatch):
