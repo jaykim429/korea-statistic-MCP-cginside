@@ -6,6 +6,7 @@ clients get one stable place to inspect execution, fulfillment, and evidence.
 
 import asyncio
 import pytest
+from kosis_curation import TIER_A_STATS
 
 from kosis_analysis.evidence import attach_stat_evidence, build_stat_evidence, kosis_row_dimensions
 
@@ -37,6 +38,27 @@ def test_direct_value_and_trend_keep_executed_population_labels(monkeypatch):
     for payload in [value, {**trend, "status": "executed"}]:
         contract = build_stat_evidence(payload, tool="answer_query")
         assert contract["evidence"]["observations"][0]["dimensions"]["region"]["label"] == "전국"
+
+
+@pytest.mark.parametrize("key", [key for key, param in TIER_A_STATS.items()
+                                 if param.region_scheme is None and param.verification_status == "verified"])
+def test_nonregional_curated_value_and_trend_do_not_require_a_region_scheme(monkeypatch, key):
+    import kosis_mcp_server as server
+    param = server.TIER_A_STATS[key]
+
+    async def fetch(*_args, **_kwargs):
+        return [{"DT": "83.69", "PRD_DE": "2024", "UNIT_NM": param.unit,
+                 "ITM_ID": param.item_id, "ITM_NM": param.description,
+                 "C1": "050", "C1_NM": "0세"}]
+
+    monkeypatch.setattr(server, "_fetch_series", fetch)
+    value = asyncio.run(server._quick_stat_core(key, "전국", "2024", "dummy"))
+    trend = asyncio.run(server._quick_trend_core(key, "전국", 1, "dummy", start_year="2024", end_year="2024"))
+    assert value["값"] == "83.69"
+    assert trend["시계열"][0]["값"] == "83.69"
+    assert value["dimensions"]["C1"]["label"] == "0세"
+    assert "region" not in value["dimensions"]
+    assert "region" not in trend["시계열"][0]["dimensions"]
 
 
 @pytest.mark.parametrize("unit", ["개%", "명 %", "백만원 %p", "USD/%"])

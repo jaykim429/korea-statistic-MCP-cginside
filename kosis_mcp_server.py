@@ -2684,6 +2684,11 @@ def _region_field_names(param: QuickStatParam) -> tuple[str, str]:
         return "C3", "C3_NM"
     return "C1", "C1_NM"
 
+
+def _region_labels_by_code(param: QuickStatParam) -> dict[str, str]:
+    """No region scheme means no geographic projection, not an execution failure."""
+    return {code: name for name, code in (param.region_scheme or {}).items()}
+
 def _tier_a_table_identity(direct_key: Optional[str]) -> dict[str, Any]:
     """Tier A 지표가 쓰는 표 식별자. 호출자가 같은 표를 다른 축으로 다시 조회할 수 있게 밝힌다.
 
@@ -5045,7 +5050,7 @@ async def _quick_stat_core(
             "answer": answer_text,
             "값": row.get("DT"), "단위": effective_unit,
             "dimensions": kosis_row_dimensions(row, region_field=_region_field_names(param)[0],
-                                               region_labels={code: name for name, code in param.region_scheme.items()}),
+                                               region_labels=_region_labels_by_code(param)),
             **({"기준시점": index_base} if index_base else {}),
             "시점": row.get("PRD_DE"),
             "used_period": used_period,
@@ -5390,7 +5395,7 @@ async def _quick_trend_core(
     data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
     series = [{"시점": r.get("PRD_DE"), "값": r.get("DT"),
                "dimensions": kosis_row_dimensions(r, region_field=_region_field_names(param)[0],
-                                                  region_labels={code: name for name, code in param.region_scheme.items()})} for r in data]
+                                                  region_labels=_region_labels_by_code(param))} for r in data]
     times, _ = _values_from_series(series)
     used_period = str(series[-1]["시점"]) if series else ""
     age = NaturalLanguageAnswerEngine._period_age_years(used_period)
@@ -5535,7 +5540,7 @@ async def _quick_region_compare_core(
         data = [row for row in data if str(row.get("PRD_DE") or "") == latest_period]
 
     code_field, name_field = _region_field_names(param)
-    regions_by_code = {code: name for name, code in param.region_scheme.items()}
+    regions_by_code = _region_labels_by_code(param)
     allowed_codes = set(regions_by_code)
     rows = []
     for row in data:
