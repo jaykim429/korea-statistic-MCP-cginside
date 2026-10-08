@@ -50,7 +50,7 @@ def survey_allows_question(question: str | None, survey: str | None) -> bool:
 
 def measure_of(text: Any) -> str | None:
     """Same noun and word-end contract as the TS adapter; classification is not a measure."""
-    tokens = [t for t in re.split(r"[\s·,()[\]{}_/]+", str(text or "")) if t]
+    tokens = [t for t in re.split(_MEASURES["tokenSeparators"], str(text or "")) if t]
     body, ends, token_ids, rests = "", [], [], []
     for token_id, token in enumerate(tokens):
         for i, char in enumerate(token):

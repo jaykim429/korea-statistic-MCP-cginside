@@ -1,5 +1,6 @@
 {
-  "equivalentGroups": [["여성", "여자"], ["남성", "남자"], ["기초생활보장", "국민기초생활보장"]],
+  "equivalentGroups": [["여성", "여자"], ["남성", "남자"], ["기초생활보장", "국민기초생활보장"], ["고용원없는", "고용원이없는"]],
+  "compoundLabels": ["고용원없는"],
   "hierarchies": [{"parent": "임금근로자", "children": ["상용근로자", "임시근로자", "일용근로자"]}],
   "scopedSurveys": [{"name": "북한이탈주민실태조사", "population": "북한이탈주민"}],
   "cases": [

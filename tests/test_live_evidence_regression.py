@@ -7,6 +7,7 @@ from kosis_curation import DEFAULT_ROUTER, TIER_A_STATS
 from kosis_analysis.rules import measure_relation
 from kosis_analysis.metadata import TableMetadataProfile, MetadataCompatibilityScorer
 from kosis_analysis.rules import survey_allows_question
+from kosis_analysis.rules import measure_of
 
 
 @pytest.mark.parametrize("unit", ["Wh", "kWh", "MWh", "GWh", "TWh"])
@@ -92,3 +93,13 @@ def test_survey_population_survives_value_evidence_normalization():
 def test_compact_selection_preserves_survey_name_for_the_chatbot_judge():
     survey = "「북한이탈주민실태조사」"
     assert server._compact_table_candidate({"survey_name": survey})["survey_name"] == survey
+
+
+@pytest.mark.parametrize("query", ["여성 기업 수는?", "기업수는！", "기업수는.", "기업수："])
+def test_question_punctuation_does_not_erase_count_measure(query):
+    assert measure_of(query) == "기업수"
+
+
+@pytest.mark.parametrize("query", ["기업수출?", "기업 수입?", "기업 수의계약？"])
+def test_punctuation_does_not_turn_a_different_word_into_count(query):
+    assert measure_of(query) is None
