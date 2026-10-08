@@ -8781,6 +8781,7 @@ def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "measure_compatibility": candidate.get("measure_compatibility"),
         "population_compatibility": candidate.get("population_compatibility"),
         "survey_name": candidate.get("survey_name"),
+        "axis_summary": candidate.get("axis_summary"),
         "geographic_scope": candidate.get("geographic_scope"),
         "query_match_quality": candidate.get("query_match_quality"),
         "ranking_penalties": candidate.get("ranking_penalties"),

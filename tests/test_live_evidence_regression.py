@@ -95,6 +95,12 @@ def test_compact_selection_preserves_survey_name_for_the_chatbot_judge():
     assert server._compact_table_candidate({"survey_name": survey})["survey_name"] == survey
 
 
+def test_compact_selection_preserves_actual_axes_not_only_table_title():
+    axes = [{'OBJ_ID': 'A', 'OBJ_NM': '시도별', 'item_count': 18},
+            {'OBJ_ID': 'B', 'OBJ_NM': '성별', 'item_count': 3}]
+    assert server._compact_table_candidate({'axis_summary': axes})['axis_summary'] == axes
+
+
 @pytest.mark.parametrize("query", ["여성 기업 수는?", "기업수는！", "기업수는.", "기업수："])
 def test_question_punctuation_does_not_erase_count_measure(query):
     assert measure_of(query) == "기업수"
