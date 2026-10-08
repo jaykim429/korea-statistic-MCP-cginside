@@ -50,7 +50,7 @@ from kosis_analysis.client import (
     _kosis_call,
     _resolve_key,
 )
-from kosis_analysis.evidence import attach_stat_evidence
+from kosis_analysis.evidence import attach_stat_evidence, kosis_row_dimensions
 from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
     TableMetadataProfile,
@@ -68,6 +68,7 @@ from kosis_analysis.metadata import (
     _suggest_axis_codes,
     _validate_query_table_filters,
 )
+from kosis_analysis.rules import canonical_population_label, measure_of, measure_relation
 from kosis_analysis.text_match import (
     _content_search_query,
     _match_quality_rank,
@@ -458,7 +459,9 @@ def _finalize_answer_query_response(
     route = result.get("route") if isinstance(result.get("route"), dict) else {}
     direct_key = str(route.get("direct_stat_key") or "")
     param = TIER_A_STATS.get(direct_key)
-    if param is not None:
+    if param is not None and param.verification_status == "verified" and (
+        str(result.get("org_id") or "") == param.org_id and str(result.get("tbl_id") or "") == param.tbl_id
+    ):
         result.setdefault("actual_measure", param.description)
         result.setdefault("actual_measure_evidence", "verified_curation_description")
         if param.measure_basis:
@@ -3548,6 +3551,7 @@ class NaturalLanguageAnswerEngine:
                 "시점": stat.get("시점"),
                 "지역": stat.get("지역"),
                 "통계표": stat.get("통계표"),
+                "dimensions": stat.get("dimensions", {}),
             }],
             "최신값_선택정책": stat.get("최신값_선택정책"),
             "선택_수록주기": stat.get("선택_수록주기"),
@@ -4367,25 +4371,34 @@ class NaturalLanguageAnswerEngine:
     }
 
     @classmethod
-    def _intrinsic_average_fulfilled(
+    def _operation_query(
         cls, result: dict[str, Any], query: str,
-    ) -> bool:
-        """An executed, verified mean metric is not an unexecuted averaging operation."""
+    ) -> str:
+        """Remove operation words only inside a verified, executed metric identity.
+
+        A metric name and an extra operation have separate ownership. Never infer
+        fulfillment from answer prose or table-title substring matches.
+        """
+        compact_query = re.sub(r"\s+", "", query)
         if result.get("상태") != "executed" or result.get("답변유형") not in {"tier_a_value", "tier_a_trend"}:
-            return False
+            return compact_query
         direct_key = str((result.get("route") or {}).get("direct_stat_key") or "")
         param = TIER_A_STATS.get(direct_key)
         if param is None or param.verification_status != "verified":
-            return False
+            return compact_query
         if str(result.get("org_id") or "") != param.org_id or str(result.get("tbl_id") or "") != param.tbl_id:
-            return False
-        label = re.sub(r"\s+", "", param.description)
-        intrinsic = re.search(r"(?:(?:월|연|일|분기)평균|평균)[가-힣]+", label)
-        compact_query = re.sub(r"\s+", "", query)
-        if not intrinsic or intrinsic.group(0) not in compact_query:
-            return False
-        # A second 평균 still requires an actual calculation across periods/groups.
-        return "평균" not in compact_query.replace(intrinsic.group(0), "", 1)
+            return compact_query
+        # Parenthetical definitions may themselves say 평균, but are not the metric's name.
+        label = re.sub(r"\s+", "", re.split(r"[（(]", param.description, maxsplit=1)[0])
+        intrinsic = re.search(r"(?:(?:월|연|일|분기)?평균|합계|합산|총합)[가-힣]+", label)
+        if intrinsic and intrinsic.group(0) in compact_query:
+            return compact_query.replace(intrinsic.group(0), "", 1)
+        return compact_query
+
+    @classmethod
+    def _intrinsic_average_fulfilled(cls, result: dict[str, Any], query: str) -> bool:
+        operation_query = cls._operation_query(result, query)
+        return operation_query != re.sub(r"\s+", "", query) and "평균" not in operation_query
 
     @classmethod
     def _intent_execution_warnings(
@@ -4410,7 +4423,7 @@ class NaturalLanguageAnswerEngine:
                     "단일값/요약에 그쳤을 수 있으니 시도별 비교나 비중 계산을 별도 요청 필요"
                 )
 
-        if cls._is_aggregation_question(query) and answer_type not in {
+        if cls._is_aggregation_question(cls._operation_query(result, query)) and answer_type not in {
             "tier_a_region_sum", "tier_a_composite_share_ratio", "tier_a_top_n_share_ratio",
         }:
             warnings.append(
@@ -4534,7 +4547,7 @@ class NaturalLanguageAnswerEngine:
                 reasons.append(f"'{qualifier}' 한정 조건이 실행된 지표에 반영되지 않음 (전체 모집단 값)")
                 break
 
-        if cls._is_aggregation_question(query) and answer_type not in {
+        if cls._is_aggregation_question(cls._operation_query(result, query)) and answer_type not in {
             "tier_a_region_sum", "tier_a_composite_share_ratio", "tier_a_top_n_share_ratio",
         }:
             dropped.append("aggregation")
@@ -5031,6 +5044,8 @@ async def _quick_stat_core(
         result = {
             "answer": answer_text,
             "값": row.get("DT"), "단위": effective_unit,
+            "dimensions": kosis_row_dimensions(row, region_field=_region_field_names(param)[0],
+                                               region_labels={code: name for name, code in param.region_scheme.items()}),
             **({"기준시점": index_base} if index_base else {}),
             "시점": row.get("PRD_DE"),
             "used_period": used_period,
@@ -5043,7 +5058,7 @@ async def _quick_stat_core(
             # what was actually measured; service policy decides whether a
             # short terminology note is sufficient or a clarification is needed.
             "actual_measure": param.description,
-            "actual_measure_evidence": "verified_curation_description",
+            "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
             **({"measure_basis": param.measure_basis} if param.measure_basis else {}),
         }
         # 같은 지표라도 모집단·작성 기준이 다르면 값이 다르다. 최신 표를 주값으로 주되
@@ -5373,7 +5388,9 @@ async def _quick_trend_core(
         )
 
     data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
-    series = [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data]
+    series = [{"시점": r.get("PRD_DE"), "값": r.get("DT"),
+               "dimensions": kosis_row_dimensions(r, region_field=_region_field_names(param)[0],
+                                                  region_labels={code: name for name, code in param.region_scheme.items()})} for r in data]
     times, _ = _values_from_series(series)
     used_period = str(series[-1]["시점"]) if series else ""
     age = NaturalLanguageAnswerEngine._period_age_years(used_period)
@@ -8475,6 +8492,8 @@ def _candidate_text_for_ranking(candidate: dict[str, Any]) -> str:
     parts = [
         candidate.get("table_name"),
         " ".join(candidate.get("indicator_evidence") or []),
+        " ".join(f'{row.get("ITM_NM") or ""} {row.get("required_item") or ""}' for row in
+                 (candidate.get("population_compatibility") or {}).get("evidence", [])),
     ]
     return " ".join(str(part or "") for part in parts)
 
@@ -8485,10 +8504,17 @@ def _selection_context_adjustments(candidate: dict[str, Any], query: Any, indica
     latest_year = _candidate_latest_period_year(candidate)
     current_year = datetime.now().year
     future_requested = any(_compact_text(term) in query_text for term in _FUTURE_REQUEST_TERMS)
-    domestic_requested = any(_compact_text(term) in query_text for term in _DOMESTIC_QUERY_TERMS)
     international_requested = any(_compact_text(term) in query_text for term in _INTERNATIONAL_CONTEXT_TERMS)
+    scope = candidate.get("geographic_scope") or {}
+    country_labels = [label for row in scope.get("evidence", []) for label in row.get("labels", [])]
+    explicit_foreign = any(len(canonical_population_label(label)) >= 2 and canonical_population_label(label) in query_text
+                           and canonical_population_label(label) not in {"한국", "대한민국", "korea", "southkorea"}
+                           for label in country_labels)
+    country_dimension_requested = "country" in (candidate.get("compatibility") or {}).get("required_dimensions", [])
+    international_requested = international_requested or explicit_foreign or country_dimension_requested
     projection_like = latest_year > current_year + 5 or any(_compact_text(term) in candidate_text for term in _FUTURE_REQUEST_TERMS)
-    international_like = any(_compact_text(term) in candidate_text for term in _INTERNATIONAL_CONTEXT_TERMS)
+    international_like = scope.get("kind") == "country_comparison" or (
+        scope.get("kind") != "trade_partner" and any(_compact_text(term) in candidate_text for term in _INTERNATIONAL_CONTEXT_TERMS))
     quality = _query_match_quality(query, _candidate_text_for_ranking(candidate))
     penalties: list[dict[str, Any]] = []
     if projection_like and not future_requested:
@@ -8497,11 +8523,13 @@ def _selection_context_adjustments(candidate: dict[str, Any], query: Any, indica
             "penalty": 3,
             "evidence": {"latest_period_year": latest_year},
         })
-    if domestic_requested and international_like and not international_requested:
+    # A domestic statistical service defaults to home scope. This is a ranking
+    # preference, never evidence authorizing a national value or rejecting unknowns.
+    if international_like and not international_requested:
         penalties.append({
             "type": "international_table_for_domestic_query",
             "penalty": 3,
-            "evidence": {"table_name": candidate.get("table_name")},
+            "evidence": {"table_name": candidate.get("table_name"), "geographic_scope": scope},
         })
     if quality["query_terms"] and quality["coverage_ratio"] < 0.5:
         penalties.append({
@@ -8574,14 +8602,23 @@ def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]], *, query
         }
         candidate["ranking_features"] = features
         candidate["query_match_quality"] = context["query_match_quality"]
-        if context["ranking_penalties"]:
-            candidate["ranking_penalties"] = context["ranking_penalties"]
+        candidate["ranking_penalties"] = context["ranking_penalties"]
 
 
 def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
     features = candidate.get("ranking_features") or {}
+    measure = candidate.get("measure_compatibility") or {}
+    # Population-specific requests need actual measurement evidence before population overlap.
+    # A plain metric lookup keeps the existing near-tie freshness rule (e.g. CPI ITEM='전체').
+    weak_population_measure = bool((candidate.get("population_compatibility") or {}).get("requested_terms")) and not any(
+        evidence.get("source") == "ITEM"
+        and measure_relation(measure.get("asked_measure"), evidence.get("measure")) == measure.get("relation")
+        for evidence in measure.get("evidence", []))
     return (
         candidate.get("status") != "selected",
+        {"exact": 0, "proxy": 1}.get((candidate.get("measure_compatibility") or {}).get("relation"), 2),
+        weak_population_measure,
+        -len((candidate.get("population_compatibility") or {}).get("matched_items", [])),
         int(features.get("ranking_penalty") or 0),
         -int(features.get("matched_item_count") or 0),
         -int(features.get("indicator_score_band") or 0),
@@ -8652,6 +8689,10 @@ def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "missing_items": candidate.get("missing_items"),
         "item_evidence": candidate.get("item_evidence"),
         "indicator_evidence": candidate.get("indicator_evidence"),
+        "measure_items": candidate.get("measure_items"),
+        "measure_compatibility": candidate.get("measure_compatibility"),
+        "population_compatibility": candidate.get("population_compatibility"),
+        "geographic_scope": candidate.get("geographic_scope"),
         "query_match_quality": candidate.get("query_match_quality"),
         "ranking_penalties": candidate.get("ranking_penalties"),
         "ranking_features": candidate.get("ranking_features"),
@@ -10981,11 +11022,24 @@ async def select_table_for_query(
 
     seen: set[tuple[str, str]] = set()
     candidates: list[dict[str, Any]] = []
+    # Ranking hints from the request are checked against actual metadata labels.
+    # Unknown terms remain unverified; these hints never authorize value execution.
+    population_terms = []
+    if measure_of(query_text):
+        for term in _query_tokens_for_matching(query_text):
+            if _compact_text(term) == _compact_text(explicit_indicator or effective_indicator or ""):
+                continue  # The metric's own name is not a population condition.
+            measurement = measure_of(term)
+            term = term.replace(measurement, "", 1) if measurement else term
+            if len(term) >= 2 and not re.search(r"\d", term):
+                population_terms.append(term)
     scorer = MetadataCompatibilityScorer(
         required_dimensions=required,
         indicator=effective_indicator,
         reject_if_missing_dimensions=reject_if_missing_dimensions,
         required_items=required_items,
+        measure_request=explicit_indicator or query_text,
+        population_terms=list(dict.fromkeys(population_terms)),
     )
     # 후보 메타데이터는 후보별로 순차 조회하면 KOSIS 왕복이 그대로 쌓인다(실측: 콜드 캐시에서 한 질문 40~56초).
     # 후보끼리는 서로 독립이므로 동시에 받아 온다. 동시 실행 수는 KOSIS 쪽 부담을 고려해 제한한다.
@@ -11114,14 +11168,17 @@ async def select_table_for_query(
         "diagnostics_note": "Pass verbose=true to include full axis_evidence, axis_summary, and metadata_profile for every candidate.",
         "ranking_criteria": [
             {"order": 1, "field": "status_selected", "applied": True},
-            {"order": 2, "field": "ranking_penalty", "applied": True},
-            {"order": 3, "field": "indicator_score_band", "applied": True},
-            {"order": 4, "field": "query_term_coverage", "applied": True},
-            {"order": 5, "field": "latest_period_year", "applied": True},
-            {"order": 6, "field": "indicator_score", "applied": True},
-            {"order": 7, "field": "cadence_diversity", "applied": True},
-            {"order": 8, "field": "item_count", "applied": True},
-            {"order": 9, "field": "score", "applied": True},
+            {"order": 2, "field": "measure_compatibility", "applied": True},
+            {"order": 3, "field": "measure_item_evidence", "applied": True},
+            {"order": 4, "field": "population_matched_items", "applied": True},
+            {"order": 5, "field": "ranking_penalty", "applied": True},
+            {"order": 6, "field": "indicator_score_band", "applied": True},
+            {"order": 7, "field": "query_term_coverage", "applied": True},
+            {"order": 8, "field": "latest_period_year", "applied": True},
+            {"order": 9, "field": "indicator_score", "applied": True},
+            {"order": 10, "field": "cadence_diversity", "applied": True},
+            {"order": 11, "field": "item_count", "applied": True},
+            {"order": 12, "field": "score", "applied": True},
         ],
         "warnings": warnings,
         "mcp_output_contract": _mcp_tool_output_contract(

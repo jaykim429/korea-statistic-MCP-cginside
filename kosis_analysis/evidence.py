@@ -9,12 +9,32 @@ semantic fulfillment, or citation completeness from answer prose.
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
 CONTRACT_VERSION = "stat-evidence/v1"
+
+
+def kosis_row_dimensions(
+    row: dict[str, Any], *, region_field: Optional[str] = None,
+    region_labels: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Preserve executed KOSIS axis labels; never reconstruct scope from query prose."""
+    dimensions: dict[str, Any] = {}
+    for axis, code_field, label_field in [("ITEM", "ITM_ID", "ITM_NM")] + [
+        (f"C{i}", f"C{i}", f"C{i}_NM") for i in range(1, 11)
+    ]:
+        code, label = row.get(code_field), row.get(label_field)
+        if code is not None and label:
+            dimensions[axis] = {"code": str(code), "label": label}
+    # Canonical region names come only from an actual returned code and the verified code scheme.
+    code = str(row.get(region_field) or "") if region_field else ""
+    if code and region_labels and code in region_labels:
+        dimensions["region"] = {"code": code, "label": region_labels[code]}
+    return dimensions
 
 
 def _present(value: Any) -> bool:
@@ -232,6 +252,10 @@ def _missing_evidence_fields(
         for field in ("value", "unit", "period"):
             if any(not _present(row.get(field)) for row in observations):
                 missing.append(field)
+        # A mixed table-level unit is not proof of an individual ITEM's unit.
+        # Preserve the raw string; never strip '%' according to the requested metric.
+        if any(_ambiguous_unit(row.get("unit")) for row in observations) and "unit" not in missing:
+            missing.append("unit")
     if not _present(source.get("label")):
         missing.append("source")
     if not _present(table.get("org_id")):
@@ -239,6 +263,11 @@ def _missing_evidence_fields(
     if not _present(table.get("table_id")):
         missing.append("table.table_id")
     return missing
+
+
+def _ambiguous_unit(unit: Any) -> bool:
+    text = str(unit or "")
+    return bool(re.search(r"%|퍼센트|백분율", text) and re.search(r"원|달러|USD|KRW|엔|유로|개|명|건|가구|개소", text, re.I))
 
 
 def _actual_measure(payload: dict[str, Any], rows: list[dict[str, Any]]) -> tuple[Any, Optional[str]]:

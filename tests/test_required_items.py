@@ -36,6 +36,31 @@ def _axis(obj_nm: str, labels: list[str]) -> dict:
     return {"OBJ_NM": obj_nm, "items": {f"i{n}": {"label": label} for n, label in enumerate(labels)}}
 
 
+def test_measure_items_preserve_all_actual_item_alternatives():
+    axes = {"ITEM": {"OBJ_NM": "항목", "items": {
+        "N": {"label": "기업수", "unit": "개"},
+        "V": {"label": "매출액", "unit": "억원"},
+    }}, "C1": _axis("규모", ["전체", "중소기업"])}
+    result = MetadataCompatibilityScorer([], indicator=None).evaluate(_profile(axes)).to_response()
+    assert result["measure_items"] == [
+        {"axis_id": "ITEM", "code": "N", "name": "기업수", "unit": "개"},
+        {"axis_id": "ITEM", "code": "V", "name": "매출액", "unit": "억원"},
+    ]
+
+
+def test_no_item_axis_does_not_invent_measures_from_title_or_other_axes():
+    result = MetadataCompatibilityScorer([], indicator=None).evaluate(
+        _profile({"C1": _axis("분류", ["기업수"])}, "기업수 현황")
+    ).to_response()
+    assert result["measure_items"] == []
+
+
+def test_compact_candidate_keeps_measure_items():
+    from kosis_mcp_server import _compact_table_candidate
+    measures = [{"axis_id": "ITEM", "code": "N", "name": "기업수", "unit": "개"}]
+    assert _compact_table_candidate({"measure_items": measures})["measure_items"] == measures
+
+
 class TestNormalizeItemLabel:
     @pytest.mark.parametrize("raw,expect", [
         ("중소기업(300인 미만)", "중소기업"),   # 괄호 꼬리는 같은 집단을 달리 적은 것이다

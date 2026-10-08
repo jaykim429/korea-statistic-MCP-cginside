@@ -14,6 +14,7 @@ from kosis_curation import (
 )
 from kosis_analysis.metadata import _compact_text
 from kosis_analysis.text_match import _QUERY_STOP_TERMS, _query_tokens_for_matching
+from kosis_analysis.rules import INDUSTRY_LABELS
 
 STATUS_UNVERIFIED_FORMULA = "UNVERIFIED_FORMULA"
 
@@ -206,6 +207,16 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
         add_text(param.tbl_nm)
     for alias in _synonyms_of(matched_key):
         add_text(alias)
+
+    # The router composes registered slots independently of word order. The residual
+    # gate must recognize the same *complete* official category, not its child industries.
+    # Bind the alias to the verified industry code actually encoded by this parameter.
+    if param and param.verification_status == "verified":
+        for category in INDUSTRY_LABELS:
+            if category["canonical"] in matched_key.split("_") and param.obj_l1 == f'IM_{category["section"]}':
+                for alias in category["aliases"]:
+                    if _compact_text(alias) in _compact_text(query):
+                        add_text(alias)
 
     # 2) 지역 — 질문이 지목한 단일 지역, 시도 이름, 전국 동의어
     region = _extract_single_region_from_query(query)

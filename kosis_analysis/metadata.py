@@ -6,7 +6,7 @@ from itertools import product
 from typing import Any, Optional
 
 from kosis_analysis.periods import _api_period_de
-from kosis_analysis.rules import is_total_label, normalize_item_label
+from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation
 
 STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
@@ -131,7 +131,7 @@ def _item_coverage(
     missing: list[str] = []
     evidence: list[dict[str, Any]] = []
     for term in required_items:
-        want = normalize_item_label(term)
+        want = canonical_population_label(term)
         if not want:
             continue
         hits = [
@@ -145,7 +145,7 @@ def _item_coverage(
             for obj_id, axis in axes.items()
             for itm_id, meta in (axis.get("items") or {}).items()
             if not is_total_label(meta.get("label"))
-            and normalize_item_label(meta.get("label")) == want
+            and canonical_population_label(meta.get("label")) == want
         ]
         if hits:
             matched.append(term)
@@ -210,20 +210,58 @@ def _indicator_evidence(
     if not indicator:
         return 0, []
     target = _compact_text(indicator)
+    requested_measure = measure_of(indicator)
     evidence: list[str] = []
     score = 0
-    if target and target in _compact_text(table_name or ""):
+    def matches(text: str) -> bool:
+        # Text overlap must respect the measurement role: '기업 수출' is not 기업수.
+        return bool(target and target in _compact_text(text)) and (
+            not requested_measure or measure_of(text) == requested_measure)
+
+    if matches(table_name or ""):
         score += 3
         evidence.append(f"table_name:{table_name}")
-    for axis in axes.values():
+    for axis_id, axis in axes.items():
+        if requested_measure and axis_id != "ITEM":
+            continue
         for meta in (axis.get("items") or {}).values():
             label = str(meta.get("label") or "")
-            if target and target in _compact_text(label):
+            if matches(label):
                 score += 2
                 evidence.append(f"item:{label}")
                 if len(evidence) >= 5:
                     return score, evidence
     return score, evidence
+
+
+def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, Any]], request: Optional[str]) -> dict:
+    """Keep known measure alternatives separate from unknown ITEM/classification labels.
+
+    This does not prove population coverage or authorize executing a proxy as an exact value.
+    """
+    asked = measure_of(request)
+    items = (axes.get("ITEM") or {}).get("items") or {}
+    evidence = [{"source": "ITEM", "code": code, "name": meta.get("label"),
+                 "measure": measure_of(meta.get("label"))}
+                for code, meta in items.items() if measure_of(meta.get("label"))]
+    unknown = [str(meta.get("label")) for meta in items.values()
+               if meta.get("label") and not measure_of(meta.get("label"))]
+    # Title-only evidence is explicitly weaker and never replaces contradictory complete ITEM evidence.
+    if not evidence or unknown:
+        for part in re.split(r"\s+(?:및|와|과)\s+|[·,/]", table_name or ""):
+            measure = measure_of(part)
+            if measure:
+                evidence.append({"source": "table_name", "name": part, "measure": measure})
+    measures = [entry["measure"] for entry in evidence]
+    relations = [measure_relation(asked, measure) for measure in measures]
+    relation = "unknown"
+    if "exact" in relations:
+        relation = "exact"
+    elif "proxy" in relations:
+        relation = "proxy"
+    elif asked and measures and not unknown:
+        relation = "incompatible"
+    return {"asked_measure": asked, "relation": relation, "evidence": evidence, "unknown_items": unknown}
 
 
 def _concept_match_score(concept: str, label: Any, code: str) -> int:
@@ -367,6 +405,24 @@ class TableMetadataProfile:
             for obj_id, axis in self.axes.items()
         ]
 
+    def geographic_scope(self) -> dict[str, Any]:
+        """Expose country-axis evidence, not an invented domestic population proof."""
+        evidence = []
+        for obj_id, axis in self.axes.items():
+            if obj_id == "ITEM":
+                continue
+            name = _compact_text(axis.get("OBJ_NM") or "")
+            labels = [str(meta.get("label") or "") for meta in (axis.get("items") or {}).values()]
+            has_home = any(canonical_population_label(label) in {"한국", "대한민국", "korea", "southkorea"} for label in labels)
+            named_country_axis = any(word in name for word in ("국가", "country", "nation"))
+            if not (has_home or named_country_axis) or len(labels) < 2:
+                continue
+            trade = any(word in name for word in ("교역", "상대국", "수출국", "수입국", "대상국"))
+            evidence.append({"OBJ_ID": obj_id, "OBJ_NM": axis.get("OBJ_NM"),
+                             "role": "trade_partner" if trade else "country_comparison", "labels": labels})
+        kind = "country_comparison" if any(row["role"] == "country_comparison" for row in evidence) else "trade_partner" if evidence else "unknown"
+        return {"kind": kind, "evidence": evidence}
+
     def periods_summary(self, limit: int = 5) -> list[dict[str, Any]]:
         return [
             {
@@ -415,6 +471,8 @@ class MetadataCompatibilityResult:
     missing_items: list[str] = field(default_factory=list)
     #: 어느 축·어느 항목이 맞았나. Nuxt 가 5.2 를 다시 돌릴 때 그 축을 첫 후보로 쓴다.
     item_evidence: list[dict[str, Any]] = field(default_factory=list)
+    measure_compatibility: dict[str, Any] = field(default_factory=dict)
+    population_compatibility: dict[str, Any] = field(default_factory=dict)
 
     def to_response(self) -> dict[str, Any]:
         return {
@@ -429,6 +487,17 @@ class MetadataCompatibilityResult:
             "missing_dimensions": self.missing_dimensions,
             "axis_evidence": self.axis_evidence,
             "indicator_evidence": self.indicator_evidence,
+            "measure_compatibility": self.measure_compatibility,
+            "population_compatibility": self.population_compatibility,
+            "geographic_scope": self.profile.geographic_scope(),
+            # Preserve actual measure alternatives. A multi-measure title's last noun is
+            # not the table's only measure, and a search match is not measure evidence.
+            "measure_items": [
+                {"axis_id": axis_id, "code": code, "name": meta.get("label"), "unit": meta.get("unit")}
+                for axis_id, axis in self.profile.axes.items()
+                if axis_id == "ITEM"
+                for code, meta in (axis.get("items") or {}).items()
+            ],
             "matched_items": self.matched_items,
             "missing_items": self.missing_items,
             "item_evidence": self.item_evidence,
@@ -445,13 +514,13 @@ class MetadataCompatibilityResult:
                 "indicator_score": self.indicator_score,
                 "verification_level": (
                     "not_matched"
-                    if self.status == "not_matched_indicator"
-                    else "metadata_verified" if not self.missing_dimensions else "metadata_partial"
+                    if self.status in {"not_matched_indicator", "rejected_measurement"}
+                    else "metadata_verified" if not self.missing_dimensions and not self.population_compatibility.get("unverified_terms") else "metadata_partial"
                 ),
                 "not_matched_reason": (
                     "indicator_evidence_empty"
                     if self.status == "not_matched_indicator"
-                    else None
+                    else "measurement_incompatible" if self.status == "rejected_measurement" else None
                 ),
             },
         }
@@ -466,9 +535,13 @@ class MetadataCompatibilityScorer:
         indicator: Optional[str] = None,
         reject_if_missing_dimensions: bool = True,
         required_items: Optional[list[str]] = None,
+        measure_request: Optional[str] = None,
+        population_terms: Optional[list[str]] = None,
     ) -> None:
         self.required_dimensions = _normalize_required_dimensions(required_dimensions)
         self.indicator = indicator
+        self.measure_request = measure_request or indicator
+        self.population_terms = population_terms or []
         self.reject_if_missing_dimensions = reject_if_missing_dimensions
         #: 항목 라벨로 거는 조건. 축 이름과 달리 표준화돼 있지 않아도 정확하다(_item_coverage).
         self.required_items = [str(t).strip() for t in (required_items or []) if str(t).strip()]
@@ -476,6 +549,10 @@ class MetadataCompatibilityScorer:
     def evaluate(self, profile: TableMetadataProfile) -> MetadataCompatibilityResult:
         matched, missing, axis_evidence = profile.dimension_coverage(self.required_dimensions)
         indicator_score, indicator_hits = profile.indicator_evidence(self.indicator)
+        measurement = _measure_compatibility(profile.table_name, profile.axes, self.measure_request)
+        if measurement["relation"] in {"exact", "proxy"}:
+            indicator_score = max(indicator_score, 3)
+            indicator_hits += [f'measure:{entry["source"]}:{entry["name"]}' for entry in measurement["evidence"]]
         for dim in list(missing):
             embedded = profile.embedded_dimension_evidence(dim, self.indicator)
             if not embedded or indicator_score <= 0:
@@ -485,6 +562,7 @@ class MetadataCompatibilityScorer:
                 matched.append(dim)
             axis_evidence[dim] = embedded
         matched_items, missing_items, item_evidence = profile.item_coverage(self.required_items)
+        population_matched, population_missing, population_evidence = profile.item_coverage(self.population_terms)
         # 항목 증거는 축 이름 증거보다 **위**다. 축 이름은 표준화돼 있지 않아 정상적으로 새고,
         # 항목 라벨은 그 표가 실제로 나눠 볼 수 있는 것을 그대로 말한다.
         score = (
@@ -494,7 +572,9 @@ class MetadataCompatibilityScorer:
             + len(matched_items) * 12
             - len(missing_items) * 15
         )
-        if self.indicator and indicator_score <= 0:
+        if measurement["relation"] == "incompatible":
+            status = "rejected_measurement"
+        elif self.indicator and indicator_score <= 0:
             status = "not_matched_indicator"
         elif missing_items:
             # 물은 항목을 나눠 볼 수 없는 표다. 축 이름이 맞아도 값을 낼 수 없다.
@@ -520,6 +600,9 @@ class MetadataCompatibilityScorer:
             matched_items=matched_items,
             missing_items=missing_items,
             item_evidence=item_evidence,
+            measure_compatibility=measurement,
+            population_compatibility={"requested_terms": self.population_terms, "matched_items": population_matched,
+                                      "unverified_terms": population_missing, "evidence": population_evidence},
         )
 
 

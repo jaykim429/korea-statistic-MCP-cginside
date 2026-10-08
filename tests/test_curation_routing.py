@@ -11,6 +11,59 @@ import kosis_curation as c
 router = c.DEFAULT_ROUTER
 
 
+class TestBusinessComposition:
+    """등록된 업종·규모·지표를 조합한다. 문자열 순서가 조건을 버려서는 안 된다."""
+
+    @pytest.mark.parametrize("industry", [name for name, _ in c._KSIC_SECTIONS])
+    @pytest.mark.parametrize("scale", [name for name, _ in c._BR_SCALES])
+    @pytest.mark.parametrize("metric", list(c._BR_METRICS))
+    @pytest.mark.parametrize("order", [0, 1, 2])
+    def test_registered_combinations(self, industry, scale, metric, order):
+        slots = [(industry, scale, metric), (scale, industry, metric), (metric, industry, scale)][order]
+        assert router.match_direct_stat_key("2023년 " + " ".join(slots) + " 알려줘") == f"{industry}_{scale}_{metric}"
+
+    @pytest.mark.parametrize("question", [
+        "2023년 제조업 중소기업 기업 수 알려줘",
+        "중소기업 기업수 제조업 알려줘",
+    ])
+    def test_official_measure_reaches_existing_verified_table(self, question):
+        assert router.match_direct_stat_key(question) == "제조업_중소기업_사업체수"
+        assert "기업수" in router.lookup(question).description
+
+    @pytest.mark.parametrize("question", [
+        "중소기업의 제조업 매출액은?", "2020년부터 2023년까지 제조업 중소기업 매출액 추이",
+        "최근 5년 제조업 중소기업 매출액 추이",
+    ])
+    def test_existing_period_and_particle_forms(self, question):
+        assert router.match_direct_stat_key(question) == "제조업_중소기업_매출액"
+
+    @pytest.mark.parametrize(("question", "key"), [
+        ("소상공인 숙박 및 음식점업 사업체 수", "숙박음식점업_소상공인_사업체수"),
+        ("숙박 및 음식점업 소상공인 기업 수", "숙박음식점업_소상공인_사업체수"),
+        ("중소기업 도매 및 소매업 매출액", "도소매업_중소기업_매출액"),
+    ])
+    def test_complete_official_category_names(self, question, key):
+        assert router.match_direct_stat_key(question) == key
+
+    @pytest.mark.parametrize("question", [
+        "여성 제조업 중소기업 기업 수", "제조업 청년 중소기업 매출액",
+        "제조업 중소기업 소상공인 기업 수", "제조업 건설업 중소기업 기업 수",
+        "제조업 중소기업 기업 수와 매출액", "비제조업 중소기업 기업 수",
+        "숙박업 소상공인 기업 수", "음식점업 소상공인 기업 수",
+        "숙박 및 음식점업 제외 소상공인 기업 수",
+        "숙박 및 음식점업 중소기업 이외 기업 수",
+    ])
+    def test_unresolved_or_conflicting_conditions_do_not_become_direct_total(self, question):
+        assert router.match_direct_stat_key(question) is None
+
+    def test_unverified_registered_key_is_not_used(self):
+        from dataclasses import replace
+        key = "제조업_중소기업_사업체수"
+        params = {**c.TIER_A_STATS, key: replace(c.TIER_A_STATS[key], verification_status="unverified")}
+        local = c.NaturalLanguageRouter(tier_a_stats=params, synonyms=c.SYNONYMS, tier_b_routing=c.TIER_B_ROUTING, topics=c.TOPICS)
+        assert local.match_direct_stat_key("중소기업 제조업 기업 수") is None
+
+
 class TestSpecificityWins:
     """동의어가 더 구체적인 지표를 가리면 안 된다."""
 

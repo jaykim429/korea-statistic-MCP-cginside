@@ -17,10 +17,22 @@ from pathlib import Path
 
 import pytest
 
-from kosis_analysis.rules import is_total_label, is_total_label_strict, normalize_item_label
+from kosis_analysis.rules import canonical_industry_label, canonical_population_label, is_total_label, is_total_label_strict, normalize_item_label
 
 ROOT = Path(__file__).resolve().parent.parent
 CASES = json.loads((ROOT / "rules" / "item-label-cases.json").read_text(encoding="utf-8"))["cases"]
+INDUSTRY_CASES = json.loads((ROOT / "rules" / "industry-labels.json").read_text(encoding="utf-8"))["cases"]
+POPULATION_CASES = json.loads((ROOT / "rules" / "population-labels.json").read_text(encoding="utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("case", POPULATION_CASES, ids=[case["input"] or "(empty)" for case in POPULATION_CASES])
+def test_population_label_contract(case):
+    assert canonical_population_label(case["input"]) == case["canonical"]
+
+
+@pytest.mark.parametrize("case", INDUSTRY_CASES, ids=[case["input"] for case in INDUSTRY_CASES])
+def test_industry_label_contract(case):
+    assert canonical_industry_label(case["input"]) == case["canonical"]
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c["input"] or "(빈 문자열)" for c in CASES])

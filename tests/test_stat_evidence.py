@@ -5,8 +5,56 @@ clients get one stable place to inspect execution, fulfillment, and evidence.
 """
 
 import asyncio
+import pytest
 
-from kosis_analysis.evidence import attach_stat_evidence, build_stat_evidence
+from kosis_analysis.evidence import attach_stat_evidence, build_stat_evidence, kosis_row_dimensions
+
+
+def test_raw_kosis_scope_is_retained_and_regions_are_derived_from_returned_codes():
+    dimensions = kosis_row_dimensions({"C1": "IM_I", "C1_NM": "숙박 및 음식점업", "C2": "SEOUL", "C2_NM": "서울특별시",
+                                      "C3": "SMALL", "C3_NM": "소상공인", "ITM_ID": "T1", "ITM_NM": "기업수"},
+                                     region_field="C2", region_labels={"SEOUL": "서울"})
+    assert dimensions["C1"]["label"] == "숙박 및 음식점업"
+    assert dimensions["C3"]["label"] == "소상공인"
+    assert dimensions["region"] == {"code": "SEOUL", "label": "서울"}
+    assert kosis_row_dimensions({"C2": "OTHER"}, region_field="C2", region_labels={"SEOUL": "서울"}) == {}
+
+
+def test_direct_value_and_trend_keep_executed_population_labels(monkeypatch):
+    import kosis_mcp_server as server
+
+    async def fetch(*_args, **_kwargs):
+        return [{"DT": "846531", "PRD_DE": "2023", "UNIT_NM": "개", "ITM_ID": "T001", "ITM_NM": "기업수",
+                 "C1": "IM_I", "C1_NM": "숙박 및 음식점업", "C2": "15142C501", "C2_NM": "전국",
+                 "C3": "16142T2524", "C3_NM": "소상공인"}]
+
+    monkeypatch.setattr(server, "_fetch_series", fetch)
+    key = "숙박음식점업_소상공인_사업체수"
+    value = asyncio.run(server._quick_stat_core(key, "전국", "2023", "dummy"))
+    trend = asyncio.run(server._quick_trend_core(key, "전국", 1, "dummy", start_year="2023", end_year="2023"))
+    assert value["dimensions"]["C3"]["label"] == "소상공인"
+    assert trend["시계열"][0]["dimensions"]["C1"]["label"] == "숙박 및 음식점업"
+    for payload in [value, {**trend, "status": "executed"}]:
+        contract = build_stat_evidence(payload, tool="answer_query")
+        assert contract["evidence"]["observations"][0]["dimensions"]["region"]["label"] == "전국"
+
+
+@pytest.mark.parametrize("unit", ["개%", "명 %", "백만원 %p", "USD/%"])
+def test_mixed_units_are_preserved_but_not_complete_exact_evidence(unit):
+    result = attach_stat_evidence({"status": "executed", "value": 123, "unit": unit,
+                                  "period": "2024", "org_id": "101", "tbl_id": "DT_TEST"}, tool="query_table")
+    contract = result["stat_evidence"]
+    assert contract["execution"]["status"] == "executed"
+    assert contract["fulfillment"]["status"] == "partial"
+    assert contract["fulfillment"]["missing_fields"] == ["unit"]
+    assert contract["evidence"]["observations"][0]["unit"] == unit
+
+
+@pytest.mark.parametrize("unit", ["%", "%p", "백만원", "천명", "개", "kWh"])
+def test_single_unit_family_is_still_exact(unit):
+    contract = build_stat_evidence({"status": "executed", "value": 123, "unit": unit,
+                                   "period": "2024", "org_id": "101", "tbl_id": "DT_TEST"}, tool="query_table")
+    assert contract["fulfillment"]["status"] == "exact"
 
 
 def test_single_value_response_has_complete_exact_evidence():
@@ -321,7 +369,7 @@ def test_answer_query_exposes_curated_actual_measure():
             "used_period": "2023",
             "source": "KOSIS",
             "org_id": "142",
-            "tbl_id": "DT_COMPANY",
+            "tbl_id": server.TIER_A_STATS["중소기업_사업체수"].tbl_id,
             "route": {"direct_stat_key": "중소기업_사업체수"},
         },
         query="중소기업 사업체 수",
@@ -333,6 +381,15 @@ def test_answer_query_exposes_curated_actual_measure():
     assert evidence["actual_measure"] == "중소기업 기업수"
     assert evidence["actual_measure_evidence"] == "verified_curation_description"
     assert evidence["measure_basis"] == "기업 단위(업종별 매출액·자산 기준으로 중소기업 규모 분류)"
+
+
+def test_curation_identity_cannot_be_attached_to_an_unrelated_executed_table():
+    import kosis_mcp_server as server
+    result = server._finalize_answer_query_response({"status": "executed", "value": 123, "unit": "개",
+                                                    "period": "2024", "org_id": "101", "tbl_id": "WRONG",
+                                                    "route": {"direct_stat_key": "중소기업_사업체수"}},
+                                                   query="중소기업 기업 수", region="전국", verbose=False)
+    assert result["stat_evidence"]["evidence"]["actual_measure_evidence"] != "verified_curation_description"
 
 
 def test_query_table_public_tool_wraps_early_failures(monkeypatch):

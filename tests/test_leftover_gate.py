@@ -91,6 +91,20 @@ class TestLegitimateIndicatorPasses:
         """동적 확장 108개(업종×기업규모×지표)가 오탐 거절되지 않는다는 근거."""
         assert matched_key("제조업 중소기업 사업체 수 알려줘") == "제조업_중소기업_사업체수"
 
+    @pytest.mark.parametrize("query", [
+        "2023년 도매 및 소매업 중소기업 매출액 알려줘",
+        "중소기업 도매 및 소매업 기업 수 알려줘",
+        "소상공인 숙박 및 음식점업 기업 수 알려줘",
+    ])
+    def test_composed_official_industry_is_not_an_additional_filter(self, query):
+        assert leftover(query) == []
+
+    @pytest.mark.parametrize("query", [
+        "도매업 중소기업 매출액", "소매업 중소기업 매출액", "도매 및 소매업 제외 중소기업 매출액",
+    ])
+    def test_alias_does_not_erase_component_or_exclusion(self, query):
+        assert leftover(query)
+
 
 class TestByeolIsNotDiscarded:
     """`…별` 을 일괄 제외하지 않는다.

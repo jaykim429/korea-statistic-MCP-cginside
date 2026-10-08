@@ -29,6 +29,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
+from kosis_analysis.rules import INDUSTRY_LABELS
+
 
 # ============================================================================
 # 지역 코드 체계 — 통계표마다 다름
@@ -1273,7 +1275,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
 # KOSIS DT_BR_A001/B001/C001 (시도별·산업중분류별·기업규모별 기업수/
 # 종사자수/매출액)은 동일한 분류 스키마를 공유 (objL1=KSIC 산업코드,
 # objL2=시도, objL3=기업규모). explore_industry_axes.py로 라이브 검증.
-# 18개 KSIC 섹션 × 3개 지표 = 54개 키워드를 dict literal 폭증 없이
+# 18개 KSIC 섹션 × 2개 규모 × 3개 지표 = 108개 키워드를 dict literal 폭증 없이
 # 동적으로 채워 넣는다.
 # ============================================================================
 
@@ -2655,10 +2657,56 @@ class NaturalLanguageRouter:
         )
         return any(term in query_norm for term in status_terms)
 
+    def _business_composition(self, query_norm: str) -> tuple[bool, Optional[str]]:
+        """Compose only registered slots. Unconsumed conditions must not become a direct total.
+
+        The boolean distinguishes a business request we declined from an unrelated request;
+        a declined composition must not fall through to a less specific synonym.
+        """
+        aliases = {_norm_key(alias): category["canonical"]
+                   for category in INDUSTRY_LABELS for alias in category["aliases"]}
+        aliases.update({_norm_key(name): name for name, _ in _KSIC_SECTIONS})
+        patterns = (
+            aliases,
+            {name: name for name, _ in _BR_SCALES},
+            {**{name: name for name in _BR_METRICS}, "기업수": "사업체수"},
+        )
+        remaining = query_norm
+        slots: list[set[str]] = []
+        for choices in patterns:
+            found: set[str] = set()
+            for alias in sorted(choices, key=len, reverse=True):
+                if alias in remaining:
+                    found.add(choices[alias])
+                    remaining = re.sub(re.escape(alias) + r"(?:의|에서|은|는|이|가|을|를)?", "", remaining)
+            slots.append(found)
+        # Preserve legacy routing for requests without a complete registered slot family.
+        if not all(slots):
+            return False, None
+        if any(len(slot) != 1 for slot in slots):
+            return True, None
+        # Only closed time, region and request words may remain. No arbitrary noun deletion.
+        remaining = re.sub(r"최근\d+년(?:간)?", "", remaining)
+        remaining = re.sub(r"(?:19|20)\d{2}년?(?:부터|까지)?", "", remaining)
+        for word in sorted({*REGION_BUSINESS, *REGION_ALIASES, "알려줘", "알려주세요", "보여줘", "얼마야",
+                            "최근", "최신", "값", "수치", "추이", "연도별", "연간", "시도별", "지역별"}, key=len, reverse=True):
+            remaining = remaining.replace(_norm_key(word), "")
+        remaining = remaining.strip("?!.,:~–")
+        if remaining:
+            return True, None
+        industry, scale, metric = (next(iter(slot)) for slot in slots)
+        key = f"{industry}_{scale}_{metric}"
+        param = self.tier_a_stats.get(key)
+        return True, key if param and param.verification_status == "verified" else None
+
     def match_direct_stat_key(self, query: str) -> Optional[str]:
         """자연어 → Tier A key. 오답 위험이 있는 상위어는 직접조회하지 않는다."""
         q = query.strip()
         q_norm = self.normalize(q)
+
+        handled, business_key = self._business_composition(q_norm)
+        if handled:
+            return business_key
 
         if (
             "실업률" in q_norm

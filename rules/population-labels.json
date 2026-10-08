@@ -1,0 +1,17 @@
+{
+  "equivalentGroups": [["여성", "여자"], ["남성", "남자"]],
+  "cases": [
+    {"input": "여성", "canonical": "여성"},
+    {"input": "여자", "canonical": "여성"},
+    {"input": "여자(15세 이상)", "canonical": "여성"},
+    {"input": "남성", "canonical": "남성"},
+    {"input": "남자", "canonical": "남성"},
+    {"input": "남 자", "canonical": "남성"},
+    {"input": "여성기업", "canonical": "여성기업"},
+    {"input": "여자 대표자", "canonical": "여자대표자"},
+    {"input": "여성청년", "canonical": "여성청년"},
+    {"input": "중소기업", "canonical": "중소기업"},
+    {"input": "전체", "canonical": "전체"},
+    {"input": "", "canonical": ""}
+  ]
+}

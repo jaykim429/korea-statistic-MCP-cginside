@@ -1,0 +1,21 @@
+{
+  "categories": [
+    { "canonical": "숙박음식점업", "section": "I", "aliases": ["숙박음식점업", "숙박 및 음식점업"] },
+    { "canonical": "도소매업", "section": "G", "aliases": ["도소매업", "도매 및 소매업"] }
+  ],
+  "cases": [
+    { "input": "숙박음식점업", "canonical": "숙박음식점업" },
+    { "input": "숙박 및 음식점업", "canonical": "숙박음식점업" },
+    { "input": "I.숙박 및 음식점업(55~56)", "canonical": "숙박음식점업" },
+    { "input": "G. 도매 및 소매업(45~47)", "canonical": "도소매업" },
+    { "input": "도매 및 소매업", "canonical": "도소매업" },
+    { "input": "숙박업", "canonical": null },
+    { "input": "음식점업", "canonical": null },
+    { "input": "비숙박음식점업", "canonical": null },
+    { "input": "숙박음식점업 제외", "canonical": null },
+    { "input": "숙박음식점업(제외)", "canonical": null },
+    { "input": "숙박음식점업(중소기업)", "canonical": null },
+    { "input": "J.숙박 및 음식점업(55~56)", "canonical": null },
+    { "input": "숙박 및 음식점업 및 제조업", "canonical": null }
+  ]
+}

@@ -24,6 +24,66 @@ _RULES_DIR = Path(__file__).resolve().parent.parent / "rules"
 with (_RULES_DIR / "total-label.json").open(encoding="utf-8") as _f:
     _TOTAL = json.load(_f)
 
+with (_RULES_DIR / "industry-labels.json").open(encoding="utf-8") as _f:
+    INDUSTRY_LABELS = json.load(_f)["categories"]
+
+with (_RULES_DIR / "measure-labels.json").open(encoding="utf-8") as _f:
+    _MEASURES = json.load(_f)
+
+with (_RULES_DIR / "population-labels.json").open(encoding="utf-8") as _f:
+    _POPULATIONS = json.load(_f)
+
+
+def measure_of(text: Any) -> str | None:
+    """Same noun and word-end contract as the TS adapter; classification is not a measure."""
+    tokens = [t for t in re.split(r"[\s·,()[\]{}_/]+", str(text or "")) if t]
+    body, ends, token_ids, rests = "", [], [], []
+    for token_id, token in enumerate(tokens):
+        for i, char in enumerate(token):
+            rest = token[i + 1:]
+            body += char
+            ends.append(not rest or rest in _MEASURES["particleTail"])
+            token_ids.append(token_id)
+            rests.append(rest)
+    best = None
+    for noun in _MEASURES["nouns"]:
+        at = body.rfind(noun)
+        while at >= 0:
+            last = at + len(noun) - 1
+            count_end = noun not in _MEASURES["countNouns"] or ends[last] or any(
+                rests[last].startswith(suffix) for suffix in _MEASURES["countSuffixes"])
+            if count_end and (token_ids[at] == token_ids[last] or ends[last]):
+                rank = (last, len(noun))
+                if best is None or rank > best[0]:
+                    best = (rank, noun)
+                break
+            at = body.rfind(noun, 0, at + len(noun) - 1)
+    return best[1] if best else None
+
+
+def measure_relation(asked: str | None, actual: str | None) -> str:
+    asked = _MEASURES["equivalentMeasures"].get(asked, asked)
+    actual = _MEASURES["equivalentMeasures"].get(actual, actual)
+    if not asked or not actual:
+        return "unknown"
+    if asked == actual:
+        return "exact"
+    if any(asked in group and actual in group for group in _MEASURES["proxyGroups"]):
+        return "proxy"
+    return "incompatible"
+
+
+def canonical_industry_label(label: str) -> str | None:
+    """Complete registered category only, including its correct KSIC section prefix."""
+    compact = re.sub(r"\s+", "", label)
+    compact = re.sub(r"\(\d{2}(?:[~–-]\d{2})?\)$", "", compact)
+    for category in INDUSTRY_LABELS:
+        for alias in category["aliases"]:
+            name = re.sub(r"\s+", "", alias)
+            if compact in (name, f'{category["section"]}.{name}'):
+                return category["canonical"]
+    return None
+
 _BROAD_WORDS = tuple(_TOTAL["shared"]) + tuple(_TOTAL["broadOnly"])
 _STRICT_WORDS = tuple(_TOTAL["shared"])
 
@@ -45,6 +105,12 @@ def normalize_item_label(label: Any) -> str:
     text = str(label or "").strip()
     text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
     return re.sub(r"\s+", "", text)
+
+
+def canonical_population_label(label: Any) -> str:
+    """Whole-label aliases shared with TS; no substring or unknown synonym approval."""
+    normalized = normalize_item_label(label)
+    return next((group[0] for group in _POPULATIONS["equivalentGroups"] if normalized in group), normalized)
 
 
 def is_total_label(label: Any) -> bool:
