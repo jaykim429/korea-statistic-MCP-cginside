@@ -8455,15 +8455,14 @@ async def _search_kosis_keywords(
     compact_query = re.sub(r"\s+", "", query)
     seeds = []
     seeded = set()
-    for stat_key, param in TIER_A_STATS.items():
+    for stat_key, param in sorted(TIER_A_STATS.items(), key=lambda entry: 0 if entry[0].replace("_", "") in compact_query else 1):
         if param.verification_status != "verified" or param.replacement_status != "current":
             continue
-        asked_measure = measure_of(query)
-        candidate_measure = measure_of(param.description)
-        if asked_measure and candidate_measure and measure_relation(asked_measure, candidate_measure) not in ("exact", "proxy"):
-            continue
         terms = [stat_key.replace("_", ""), param.description]
-        if not any(len(re.sub(r"\s+", "", term)) >= 4 and re.sub(r"\s+", "", term) in compact_query for term in terms):
+        metric_match = any(len(re.sub(r"\s+", "", term)) >= 4 and re.sub(r"\s+", "", term) in compact_query for term in terms)
+        population = stat_key.rsplit("_", 1)[0] if "_" in stat_key else ""
+        population_match = population in ("소상공인", "중소기업") and population in compact_query
+        if not metric_match and not population_match:
             continue
         identity = (param.org_id, param.tbl_id)
         if identity in seeded:

@@ -36,6 +36,9 @@ def test_curated_seed_is_only_a_candidate_and_counts_surviving_rows(monkeypatch)
     unknown = asyncio.run(s._search_kosis_keywords("zzz_unknown_zzz", ["zzz_unknown_zzz"], 8, api_key="dummy"))
     assert unknown["result_count"] == 0
     assert unknown["결과"] == []
+    sales = asyncio.run(s._search_kosis_keywords("소상공인 매출액", ["소상공인 매출액"], 8, api_key="dummy"))
+    assert any(row["통계표ID"] == "DT_3ME0100" for row in sales["결과"])
+    assert all("filters" not in row and "value" not in row for row in sales["결과"])
 
 
 def test_native_trend_retains_month_count_instead_of_interpreting_it_as_years(monkeypatch):
