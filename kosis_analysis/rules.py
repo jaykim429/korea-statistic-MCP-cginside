@@ -85,8 +85,9 @@ def measurement_normalizer(text: str) -> str | None:
 
 
 def measure_basis_compatible(question: str, actual: str) -> bool:
-    normalizer = measurement_normalizer(actual)
-    return not normalizer or normalizer == measurement_normalizer(question)
+    # Both directions matter: neither a total nor a per-unit observation can
+    # silently substitute for the other, even when their currency is identical.
+    return measurement_normalizer(actual) == measurement_normalizer(question)
 
 
 def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ...] = ()) -> str:

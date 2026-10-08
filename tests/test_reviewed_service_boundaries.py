@@ -10,6 +10,10 @@ from kosis_analysis.metadata import _measure_compatibility
 @pytest.mark.parametrize("question,actual,relation", [
     ("소상공인 매출액", "기업체당 매출액", "incompatible"),
     ("기업체당 매출액", "기업체당 매출액", "exact"),
+    ("기업체당 매출액", "매출액", "incompatible"),
+    ("사업체당 매출액", "매출액", "incompatible"),
+    ("인당 임금", "임금", "incompatible"),
+    ("1000명당 발생건수", "발생건수", "incompatible"),
     ("기업체당 매출액", "기업체당 영업비용", "incompatible"),
     ("1000명당 발생건수", "1명당 발생건수", "incompatible"),
 ])
