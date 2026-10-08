@@ -12,6 +12,7 @@ from kosis_curation import (
     canonical_region as _canonical_region,
     extract_region_candidate,
     requests_time_series,
+    PERIOD_CADENCE_TERMS,
 )
 from kosis_analysis.metadata import _compact_text
 from kosis_analysis.text_match import _QUERY_STOP_TERMS, _query_tokens_for_matching
@@ -234,12 +235,9 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
     add_tokens(*_QUERY_STOP_TERMS)
     # Period grouping is a temporal constraint, not an unknown population.
     # The time-series gate still prevents quick_stat from silently returning one value.
-    if param and "Y" in param.supported_periods:
-        add_tokens("연도별", "년도별", "연별")
-    if param and "M" in param.supported_periods:
-        add_tokens("월별")
-    if param and "Q" in param.supported_periods:
-        add_tokens("분기별")
+    if param:
+        for cadence in param.supported_periods:
+            add_tokens(*PERIOD_CADENCE_TERMS.get(cadence, ()))
 
     # 4) 지표가 스스로 선언한 말
     for term in (getattr(param, "encoded_terms", ()) or ()):

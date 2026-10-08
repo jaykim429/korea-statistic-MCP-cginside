@@ -242,7 +242,7 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
     asked = measure_of(request)
     items = (axes.get("ITEM") or {}).get("items") or {}
     evidence = [{"source": "ITEM", "code": code, "name": meta.get("label"),
-                 "measure": measure_of(meta.get("label"))}
+                 "measure": measure_of(meta.get("label")), "unit": meta.get("unit")}
                 for code, meta in items.items() if measure_of(meta.get("label"))]
     unknown = [str(meta.get("label")) for meta in items.values()
                if meta.get("label") and not measure_of(meta.get("label"))]
@@ -253,7 +253,7 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
             if measure:
                 evidence.append({"source": "table_name", "name": part, "measure": measure})
     measures = [entry["measure"] for entry in evidence]
-    relations = [measure_relation(asked, measure) for measure in measures]
+    relations = [measure_relation(asked, entry["measure"], (str(entry["unit"]),) if entry.get("unit") else ()) for entry in evidence]
     relation = "unknown"
     if "exact" in relations:
         relation = "exact"

@@ -65,7 +65,7 @@ def test_time_grouping_is_not_population_but_single_value_remains_blocked(group)
     assert "time_series" in _quick_stat_unsupported_dimensions(query, param)
 
 
-@pytest.mark.parametrize("group,cadence", [("월별", "M"), ("분기별", "Q"), ("연도별", "Y")])
+@pytest.mark.parametrize("group,cadence", [("월별", "M"), ("월간", "M"), ("분기별", "Q"), ("분기간", "Q"), ("연도별", "Y"), ("연간", "Y")])
 def test_temporal_grouping_queries_the_requested_cadence(monkeypatch, group, cadence):
     calls = []
 
@@ -120,6 +120,10 @@ def test_compact_projection_retains_nature_in_evidence():
 
 def test_latest_year_wording_is_not_an_unknown_population():
     assert leftover_gate_terms("한국 기대수명 최신 연도", server.TIER_A_STATS["기대수명"]) == []
+
+
+def test_trade_balance_annual_cadence_is_not_an_unknown_population():
+    assert leftover_gate_terms("무역수지 최근 연간 추이", server.TIER_A_STATS["무역수지"]) == []
 
 
 def test_recent_value_uses_latest_policy_not_default_annual_trend(monkeypatch):

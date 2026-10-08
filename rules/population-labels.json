@@ -1,5 +1,5 @@
 {
-  "equivalentGroups": [["여성", "여자"], ["남성", "남자"]],
+  "equivalentGroups": [["여성", "여자"], ["남성", "남자"], ["기초생활보장", "국민기초생활보장"]],
   "cases": [
     {"input": "여성", "canonical": "여성"},
     {"input": "여자", "canonical": "여성"},

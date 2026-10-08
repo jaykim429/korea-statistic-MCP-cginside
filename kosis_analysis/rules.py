@@ -61,12 +61,16 @@ def measure_of(text: Any) -> str | None:
     return best[1] if best else None
 
 
-def measure_relation(asked: str | None, actual: str | None) -> str:
+def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ...] = ()) -> str:
     asked = _MEASURES["equivalentMeasures"].get(asked, asked)
     actual = _MEASURES["equivalentMeasures"].get(actual, actual)
     if not asked or not actual:
         return "unknown"
     if asked == actual:
+        return "exact"
+    if units and any(asked in rule["measures"] and actual in rule["measures"]
+                     and all(unit.strip() in rule["units"] for unit in units)
+                     for rule in _MEASURES["unitScopedEquivalences"]):
         return "exact"
     if any(asked in group and actual in group for group in _MEASURES["proxyGroups"]):
         return "proxy"

@@ -250,6 +250,17 @@ VerificationStatus = Literal["verified", "unverified", "needs_check", "broken"]
 ValueKind = Literal["raw", "provider_index", "mcp_derived"]
 TimeSemantics = Literal["observed", "projection", "mixed"]
 
+# Temporal aliases are shared by cadence selection and the residual population gate.
+PERIOD_CADENCE_TERMS = {
+    "M": ("월별", "월간"), "Q": ("분기별", "분기간"),
+    "Y": ("연도별", "년도별", "연별", "연간"),
+}
+
+
+def requested_period_cadence(query: str) -> Optional[str]:
+    return next((cadence for cadence, terms in PERIOD_CADENCE_TERMS.items()
+                 if any(term in query for term in terms)), None)
+
 
 def requests_time_series(query: str) -> bool:
     """Recent/current alone asks for one latest value, not a multi-period series."""
@@ -1156,7 +1167,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         supported_periods=("Y",),
         verification_status="verified",
     ),
-    "생활폐기물발생량": QuickStatParam(
+    "생활계폐기물발생량": QuickStatParam(
         org_id="101", tbl_id="DT_1YL21311",
         tbl_nm="생활계폐기물 재활용률(시도/시/군/구)",
         description="생활계폐기물 총 발생량",
@@ -1164,6 +1175,26 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         region_scheme=REGION_DEMOGRAPHIC,
         supported_periods=("Y",),
         verification_status="verified",
+    ),
+
+    # 2026-10-08 provider metadata + actual rows: household waste is NOT the
+    # broader household-and-business-like daily waste total above.
+    "생활폐기물발생량": QuickStatParam(
+        org_id="106", tbl_id="DT_106N_29_2020005",
+        tbl_nm="폐기물 발생량 및 처리현황_생활폐기물",
+        description="생활폐기물 발생량",
+        obj_l1="13102134417A.50002", obj_l2="13102134417T.10001",
+        item_id="13103134417I119", unit="톤/년",
+        region_scheme={
+            "전국": "13102134417A.50002", "서울": "13102134417A.50053", "부산": "13102134417A.50104",
+            "대구": "13102134417A.50155", "인천": "13102134417A.50206", "광주": "13102134417A.50257",
+            "대전": "13102134417A.50308", "울산": "13102134417A.50359", "세종": "13102134417A.50410",
+            "경기": "13102134417A.50461", "강원": "13102134417A.50512", "충북": "13102134417A.50563",
+            "충남": "13102134417A.50614", "전북": "13102134417A.50665", "전남": "13102134417A.50716",
+            "경북": "13102134417A.50767", "경남": "13102134417A.50818", "제주": "13102134417A.50869",
+        },
+        supported_periods=("Y",), verification_status="verified", verified_at="2026-10-08",
+        note="생활폐기물의 연간 발생량입니다. 사업장생활계 폐기물을 포함한 생활계폐기물 총량과 구분합니다.",
     ),
 
     # 환노위 — 온실가스 (DT_106N_99_2800019, 전국만)

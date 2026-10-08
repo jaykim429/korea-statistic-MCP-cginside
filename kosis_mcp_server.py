@@ -991,6 +991,7 @@ from kosis_curation import (
     route_query as _route_query,
     routing_hints as _routing_hints,
     requests_time_series,
+    requested_period_cadence,
     topic_hints as _topic_hints,
     stats_summary as _curation_stats_summary,
     _AMBIGUOUS_TOKENS as _BARE_INDICATOR_TOKENS,
@@ -1658,10 +1659,7 @@ def _default_period_type(param: QuickStatParam) -> str:
 
 
 def _requested_trend_period_type(query: str) -> Optional[str]:
-    for cadence, terms in (("M", ("월별", "월간")), ("Q", ("분기별", "분기간")), ("Y", ("연도별", "년도별", "연별", "연간"))):
-        if any(term in query for term in terms):
-            return cadence
-    return None
+    return requested_period_cadence(query)
 
 
 def _format_aggregated_dt(value: float) -> str:
@@ -5614,6 +5612,7 @@ async def _quick_region_compare_core(
             "단위": param.unit,
             "시점": row.get("PRD_DE"),
             "통계표": param.tbl_nm,
+            "dimensions": kosis_row_dimensions(row, region_field=code_field, region_labels=regions_by_code),
         })
 
     reverse = sort != "asc"
