@@ -21,6 +21,16 @@ def test_measure_cannot_be_proved_by_classification_label():
     assert result.status != "selected"
 
 
+def test_full_energy_metric_is_not_an_extra_population_or_a_person_count():
+    from kosis_analysis.rules import measure_of, measure_relation
+    assert measure_of("에너지 소비량") == "에너지소비량"
+    assert measure_relation(measure_of("에너지 소비량"), measure_of("에너지사용량"), ("천toe",)) == "exact"
+    assert measure_relation(measure_of("에너지 소비량"), measure_of("종사자수"), ("명",)) == "incompatible"
+    result = MetadataCompatibilityScorer([], "에너지 소비량").evaluate(profile(
+        "기업 규모 업종별 에너지소비량", [("에너지사용량", "천toe")]))
+    assert result.to_response()["measure_compatibility"]["relation"] == "exact"
+
+
 def test_full_population_request_can_match_real_measure_metadata():
     result = MetadataCompatibilityScorer([], "제조업 중소기업 기업수").evaluate(profile(
         "산업별 기업규모별 현황", [("기업수", "개"), ("매출액", "억원")]))
