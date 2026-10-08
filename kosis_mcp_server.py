@@ -12037,8 +12037,10 @@ async def _query_table_core(
                 }
 
             semaphore = asyncio.Semaphore(QUERY_TABLE_CONCURRENCY)
+            latest_observation_recoveries: list[dict[str, Any]] = []
 
             async def fetch_filter_set(filter_set: dict[str, list[str]]) -> Any:
+                recovery_record: Optional[dict[str, Any]] = None
                 params = {
                     **_query_table_params(
                         org_id,
@@ -12053,13 +12055,50 @@ async def _query_table_core(
                 }
                 async with semaphore:
                     try:
-                        return await asyncio.wait_for(
+                        group = await asyncio.wait_for(
                             _kosis_call(client, "Param/statisticsParameterData.do", params),
                             timeout=QUERY_TABLE_CALL_TIMEOUT,
                         )
+                        # The table's newest period need not contain this measurement.
+                        # Recover only an implicit latest, single-filter lookup; explicit
+                        # periods, multi-group comparisons and infrastructure errors stay unchanged.
+                        if (auto_default_period_range and len(fanout_filters) == 1
+                                and isinstance(group, list)
+                                and not any(row.get("value") is not None for row in
+                                            _normalize_query_table_rows(group, filter_set, axes, axis_order))):
+                            recovery_params = {
+                                **_query_table_params(org_id, tbl_id, filter_set, axis_order, None, period_type, 5),
+                                "apiKey": key,
+                            }
+                            recovery_record = {"filters": filter_set, "lookback_count": 5,
+                                               "status": "attempted", "used_period": None,
+                                               "table_latest_period": auto_default_period_range[-1]}
+                            latest_observation_recoveries.append(recovery_record)
+                            recovered = await asyncio.wait_for(
+                                _kosis_call(client, "Param/statisticsParameterData.do", recovery_params),
+                                timeout=QUERY_TABLE_CALL_TIMEOUT,
+                            )
+                            if not isinstance(recovered, list):
+                                recovery_record["status"] = "provider_error"
+                                return recovered
+                            actual = []
+                            for raw_row in recovered:
+                                normalized = _normalize_query_table_rows([raw_row], filter_set, axes, axis_order)
+                                if normalized and normalized[0].get("value") is not None and normalized[0].get("period"):
+                                    actual.append((str(normalized[0]["period"]), raw_row))
+                            recovery_record.update({"status": "recovered" if actual else "no_observation",
+                                                    "used_period": max((period for period, _ in actual), default=None)})
+                            if actual:
+                                used_period = max(period for period, _ in actual)
+                                return [row for period, row in actual if period == used_period]
+                        return group
                     except asyncio.TimeoutError:
+                        if recovery_record is not None:
+                            recovery_record["status"] = "timeout"
                         return {"_error": "timeout", "_timeout_seconds": QUERY_TABLE_CALL_TIMEOUT}
                     except Exception as exc:
+                        if recovery_record is not None:
+                            recovery_record["status"] = "runtime_error"
                         return {"_error": f"{type(exc).__name__}: {exc}"}
 
             row_groups = await asyncio.gather(*[
@@ -12072,6 +12111,12 @@ async def _query_table_core(
                         _normalize_query_table_rows(group, filter_set, axes, axis_order)
                     )
             fanout_report = _fanout_coverage_report(fanout_filters, row_groups)
+            if latest_observation_recoveries:
+                fanout_report["latest_observation_recovery"] = latest_observation_recoveries
+                if any(recovery["status"] == "recovered" for recovery in latest_observation_recoveries):
+                    # Do not describe the recovered observation as the original table-wide year.
+                    effective_period_range = None
+                    auto_default_period_range = None
         except Exception as exc:
             return {
                 "상태": "failed",
