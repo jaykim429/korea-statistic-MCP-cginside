@@ -87,6 +87,10 @@ class TestLegitimateIndicatorPasses:
     def test_no_leftover(self, query: str) -> None:
         assert leftover(query) == []
 
+    def test_real_gdp_growth_basis_is_a_verified_metric_definition(self):
+        assert leftover('한국 경제성장률 최신 연간 실질 GDP 성장률') == []
+        assert '명목' in leftover('명목 GDP 경제성장률')
+
     def test_dynamic_key_covers_industry_and_scale(self) -> None:
         """동적 확장 108개(업종×기업규모×지표)가 오탐 거절되지 않는다는 근거."""
         assert matched_key("제조업 중소기업 사업체 수 알려줘") == "제조업_중소기업_사업체수"

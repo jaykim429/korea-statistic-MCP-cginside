@@ -71,3 +71,25 @@ def test_metric_name_does_not_hide_an_additional_operation(query):
 def test_unverified_total_identity_does_not_suppress_a_sum_requirement():
     result = fertility_payload(tbl_id="WRONG")
     assert "aggregation" in Engine._fulfillment_gap(result, "합계출산율", {"intents": []})["dropped_dimensions"]
+
+
+def per_capita_payload(**overrides):
+    param = TIER_A_STATS['1인당온실가스배출량']
+    return {'상태': 'executed', '답변유형': 'tier_a_value', 'org_id': param.org_id,
+            'tbl_id': param.tbl_id, 'route': {'direct_stat_key': '1인당온실가스배출량'}, **overrides}
+
+
+@pytest.mark.parametrize('query', ['1인당 온실가스 배출량', '한국 1인당 온실가스 배출량 최신 연도'])
+def test_verified_per_capita_metric_is_already_intrinsic_average(query):
+    route = {'intents': ['STAT_AVERAGE'], 'slots': {}}
+    assert Engine._fulfillment_gap(per_capita_payload(), query, route) is None
+    assert Engine._intent_execution_warnings(per_capita_payload(), query, route) == []
+
+
+@pytest.mark.parametrize('query', ['1인당 온실가스 배출량 최근 5년 평균', '지역별 1인당 온실가스 배출량의 평균'])
+def test_per_capita_metric_does_not_hide_an_additional_mean(query):
+    assert not Engine._intrinsic_average_fulfilled(per_capita_payload(), query)
+
+
+def test_unverified_per_capita_identity_does_not_fulfill_average():
+    assert not Engine._intrinsic_average_fulfilled(per_capita_payload(tbl_id='OTHER'), '1인당 온실가스 배출량')

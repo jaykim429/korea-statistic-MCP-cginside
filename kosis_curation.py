@@ -557,7 +557,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
     "경제성장률": QuickStatParam(
         org_id="301", tbl_id="DT_200Y101",
         tbl_nm="국민계정 (성장률)",
-        description="경제성장률",
+        description="경제성장률 (실질 GDP 성장률)",
         obj_l1="13102136288ACC_ITEM.20101",
         item_id="13103136288999",
         unit="%",

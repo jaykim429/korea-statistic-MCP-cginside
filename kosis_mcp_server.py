@@ -4467,7 +4467,7 @@ class NaturalLanguageAnswerEngine:
             return compact_query
         # Parenthetical definitions may themselves say 평균, but are not the metric's name.
         label = re.sub(r"\s+", "", re.split(r"[（(]", param.description, maxsplit=1)[0])
-        intrinsic = re.search(r"(?:(?:월|연|일|분기)?평균|합계|합산|총합)[가-힣]+", label)
+        intrinsic = re.search(r"(?:(?:월|연|일|분기)?평균|1인당|사업체당|기업당|종사자당|합계|합산|총합)[가-힣]+", label)
         if intrinsic and intrinsic.group(0) in compact_query:
             return compact_query.replace(intrinsic.group(0), "", 1)
         return compact_query
@@ -4475,7 +4475,9 @@ class NaturalLanguageAnswerEngine:
     @classmethod
     def _intrinsic_average_fulfilled(cls, result: dict[str, Any], query: str) -> bool:
         operation_query = cls._operation_query(result, query)
-        return operation_query != re.sub(r"\s+", "", query) and "평균" not in operation_query
+        return operation_query != re.sub(r"\s+", "", query) and not any(
+            word in operation_query for word in ('평균', '1인당', '사업체당', '기업당', '종사자당')
+        )
 
     @classmethod
     def _intent_execution_warnings(
