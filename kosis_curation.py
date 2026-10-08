@@ -712,6 +712,15 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         verification_status="verified",
         note="Verified via KOSIS API: nationwide and 17 regions, all industries (2023 nationwide 5,960,788)",
     ),
+    "소상공인_종사자수": QuickStatParam(
+        org_id="142", tbl_id="DT_3ME0100",
+        tbl_nm="시도/산업중분류별 주요지표",
+        description="소상공인 종사자수",
+        obj_l1="00", obj_l2="0", item_id="T02", unit="명",
+        region_scheme=REGION_DEMOGRAPHIC,
+        verification_status="verified",
+        note="KOSIS SOURCE=소상공인실태조사; actual ITEM T02=종사자수, 전국/전산업 (2024: 9,610,416명).",
+    ),
     "자영업자수": QuickStatParam(
         org_id="101", tbl_id="DT_1DA7010S",
         tbl_nm="종사상지위별 취업자 (자영업자)",
@@ -1495,6 +1504,8 @@ SYNONYMS: dict[str, str] = {
     "소상공인수": "소상공인_사업체수",
     "소상공인사업체수": "소상공인_사업체수",
     "소상공인업체수": "소상공인_사업체수",
+    "소상공인종사자": "소상공인_종사자수",
+    "소상공인종사자수": "소상공인_종사자수",
     "사업체수": "전체사업체수",
 }
 
@@ -2287,6 +2298,7 @@ _BUSINESS_BASE_STATS = {
     "중소기업_사업체수",
     "중소기업_종사자수",
     "소상공인_사업체수",
+    "소상공인_종사자수",
     "전체사업체수",
 }
 

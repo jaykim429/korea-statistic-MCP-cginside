@@ -11,6 +11,15 @@ import kosis_curation as c
 router = c.DEFAULT_ROUTER
 
 
+def test_microbusiness_workers_use_the_actual_survey_item_not_disabled_businesses():
+    key = router.match_direct_stat_key("소상공인 종사자 수 알려줘")
+    assert key == "소상공인_종사자수"
+    param = c.TIER_A_STATS[key]
+    assert (param.org_id, param.tbl_id, param.item_id, param.unit) == ("142", "DT_3ME0100", "T02", "명")
+    assert router.match_direct_stat_key("소상공인 종사자 수 업종별") != key
+    assert router.match_direct_stat_key("소상공인 종사자 수 여성만") != key
+
+
 class TestBusinessComposition:
     """등록된 업종·규모·지표를 조합한다. 문자열 순서가 조건을 버려서는 안 된다."""
 
