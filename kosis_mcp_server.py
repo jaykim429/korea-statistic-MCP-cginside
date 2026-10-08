@@ -4869,6 +4869,44 @@ async def quick_stat(
     return attach_stat_evidence(result, tool="quick_stat", requested_concepts=requested)
 
 
+def _effective_kosis_unit(row_unit: Any, curated_unit: Any) -> tuple[str, str]:
+    raw = str(row_unit or "").strip()
+    index_base = raw if "=" in raw.replace("＝", "=") else ""
+    clean = "" if index_base or " " in raw else raw
+    curated = str(curated_unit or "").strip()
+    more_specific = bool(clean) and clean in curated and len(curated) > len(clean)
+    return (curated if more_specific or not clean else clean), index_base
+
+
+def _curated_series_basis(param: QuickStatParam, data: list[dict]) -> dict:
+    """Actual ITEM identity and unit accompany native calculations, not just scalar values."""
+    names = {str(row.get("ITM_NM") or "").strip() for row in data if row.get("ITM_NM")}
+    measure = next(iter(names)) if len(names) == 1 else ""
+    definition = param.description
+    asked, actual = measure_of(definition), measure_of(measure)
+    if asked and actual and measure_relation(asked, actual) == "proxy":
+        pattern = r"\s*".join(re.escape(char) for char in asked)
+        definition = re.sub(pattern, actual, definition, count=1)
+    units = {_effective_kosis_unit(row.get("UNIT_NM"), param.unit)[0] for row in data}
+    if len(units) > 1:
+        return {"오류": "시계열에 서로 다른 단위가 포함되어 계산하지 않았습니다.", "코드": "UNIT_MISMATCH"}
+    return {
+        "통계명": definition, "actual_measure": measure or definition,
+        "measure_definition": definition,
+        "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
+        "단위": next(iter(units)) if units else param.unit,
+        "org_id": param.org_id, "tbl_id": param.tbl_id, "통계표": param.tbl_nm,
+        **({"measure_basis": param.measure_basis} if param.measure_basis else {}),
+    }
+
+
+def _native_calculation_basis(series_result: dict) -> dict:
+    return {key: series_result[key] for key in (
+        "actual_measure", "actual_measure_evidence", "measure_definition", "measure_basis",
+        "org_id", "tbl_id", "통계표", "survey_name", "used_period", "수록주기",
+    ) if series_result.get(key) not in (None, "")}
+
+
 async def _quick_stat_core(
     query: str, region: str = "전국", period: str = "latest",
     api_key: Optional[str] = None,
@@ -5109,14 +5147,10 @@ async def _quick_stat_core(
         # 출생아수는 명, 혼인건수는 건, 조출생률은 ‰ 다) 항목별 단위가 아니므로 쓰면 안 된다.
         # 공백으로 갈라지는 복합 표기는 버리고 커레이션을 쓴다.
         # 지수 기준(2020＝100)은 단위가 아니라 기준 시점이라 단위 자리에 넣지 않고 따로 싣는다.
-        index_base = row_unit if "=" in row_unit.replace("＝", "=") else ""
-        clean_row_unit = "" if (index_base or " " in row_unit) else row_unit
         # 커레이션이 더 구체적이면 그쪽을 쓴다. 표는 범죄율 단위를 그냥 "건" 이라고 적는데
         # (천명당은 표 이름에만 있다) 커레이션의 "천명당 건" 이 사용자에게 정확하다.
         # 서로 충돌할 때만(천달러 vs 100만달러) 데이터가 이긴다.
-        curated = str(param.unit or "").strip()
-        more_specific = bool(clean_row_unit) and clean_row_unit in curated and len(curated) > len(clean_row_unit)
-        effective_unit = curated if (more_specific or not clean_row_unit) else clean_row_unit
+        effective_unit, index_base = _effective_kosis_unit(row_unit, param.unit)
         answer_text = NaturalLanguageAnswerEngine._polish_answer_text(
             f"{period_label} {region}의 {param.description}은(는) "
             f"{_format_display_number(row.get('DT'), param.display_decimals)} {effective_unit}입니다."
@@ -5476,6 +5510,9 @@ async def _quick_trend_core(
     times, _ = _values_from_series(series)
     used_period = str(series[-1]["시점"]) if series else ""
     age = NaturalLanguageAnswerEngine._period_age_years(used_period)
+    basis = _curated_series_basis(param, data)
+    if "오류" in basis:
+        return basis
     result = {
         "통계명": param.description, "지역": region, "단위": param.unit,
         "시계열": series,
@@ -5488,6 +5525,7 @@ async def _quick_trend_core(
         "요청_시점수": latest_count if not start_period else None,
         "actual_measure": param.description,
         "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
+        **basis,
     }
     result.update(_curated_period_nature(param, used_period))
     provisional_periods = [
@@ -6116,6 +6154,7 @@ async def analyze_trend(
     result = {
         "status": "executed",
         "method": method_requested,
+        **_native_calculation_basis(series_result),
         "통계명": series_result.get("통계명"), "지역": region,
         "기간": f"{times[0]} ~ {times[-1]}",
         "requested_period": series_result.get("requested_period"),
@@ -8052,24 +8091,21 @@ async def stat_time_compare(
             )
         if not data:
             fallback = await _quick_trend_core(query, canonical, max(years, 5), api_key)
-            data = [
-                {"PRD_DE": row.get("시점"), "DT": row.get("값")}
-                for row in (fallback.get("시계열") or [])
-            ]
-        series_result = {
-            "통계명": param.description,
-            "지역": canonical,
-            "단위": param.unit,
-            "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT")} for r in data],
-            "통계표": param.tbl_nm,
-        }
+            series_result = fallback
+        else:
+            series_result = {
+                **_curated_series_basis(param, data), "지역": canonical,
+                "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT"),
+                    "dimensions": kosis_row_dimensions(r, region_field=_region_field_names(param)[0],
+                        region_labels=_region_labels_by_code(param))} for r in data],
+            }
         region = canonical
     else:
         series_result = await quick_trend(query, region, years, api_key)
     if "오류" in series_result:
         return {
             "상태": "failed",
-            "코드": STATUS_STAT_NOT_FOUND,
+            "코드": series_result.get("코드") or STATUS_STAT_NOT_FOUND,
             "오류": series_result.get("오류"),
             "질문": query,
         }
@@ -8125,6 +8161,8 @@ async def stat_time_compare(
         "코드": STATUS_EXECUTED,
         "질문": query,
         "answer": answer,
+        **_native_calculation_basis(series_result),
+        "통계명": series_result.get("통계명"),
         "비교": {
             "시작": {"시점": start_t, "값": start_v},
             "종료": {"시점": end_t, "값": end_v},

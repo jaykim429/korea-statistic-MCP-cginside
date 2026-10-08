@@ -2731,6 +2731,7 @@ class NaturalLanguageRouter:
         if any(len(slot) != 1 for slot in slots):
             return True, None
         # Only closed time, region and request words may remain. No arbitrary noun deletion.
+        remaining = re.sub(r"(?:최신|최근)연도(?:기준)?", "", remaining)
         remaining = re.sub(r"최근\d+년(?:간)?", "", remaining)
         remaining = re.sub(r"(?:19|20)\d{2}년?(?:부터|까지)?", "", remaining)
         for word in sorted({*REGION_BUSINESS, *REGION_ALIASES, "알려줘", "알려주세요", "보여줘", "얼마야",

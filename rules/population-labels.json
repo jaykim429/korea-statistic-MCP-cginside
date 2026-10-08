@@ -1,8 +1,17 @@
 {
   "equivalentGroups": [["여성", "여자"], ["남성", "남자"], ["기초생활보장", "국민기초생활보장"], ["고용원없는", "고용원이없는"]],
   "compoundLabels": ["고용원없는"],
-  "hierarchies": [{"parent": "임금근로자", "children": ["상용근로자", "임시근로자", "일용근로자"]}],
-  "scopedSurveys": [{"name": "북한이탈주민실태조사", "population": "북한이탈주민"}],
+  "hierarchies": [
+    {"parent": "임금근로자", "children": ["상용근로자", "임시근로자", "일용근로자"]},
+    {"parent": "연금", "children": ["국민연금", "공무원연금", "군인연금", "사학연금"]},
+    {"parent": "기업", "children": ["중소기업", "대기업"]},
+    {"parent": "중소기업", "children": ["소기업", "중기업"]},
+    {"parent": "소기업", "children": ["소상공인"]}
+  ],
+  "scopedSurveys": [
+    {"name": "북한이탈주민실태조사", "population": "북한이탈주민"},
+    {"name": "기업체장애인고용실태조사", "population": "기업체"}
+  ],
   "cases": [
     {"input": "여성", "canonical": "여성"},
     {"input": "여자", "canonical": "여성"},

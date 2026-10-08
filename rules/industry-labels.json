@@ -1,7 +1,7 @@
 {
   "categories": [
-    { "canonical": "숙박음식점업", "section": "I", "aliases": ["숙박음식점업", "숙박 및 음식점업"] },
-    { "canonical": "도소매업", "section": "G", "aliases": ["도소매업", "도매 및 소매업"] }
+    { "canonical": "숙박음식점업", "section": "I", "aliases": ["숙박음식점업", "숙박 및 음식점업", "숙박·음식점업"] },
+    { "canonical": "도소매업", "section": "G", "aliases": ["도소매업", "도매 및 소매업", "도매소매업", "도매·소매업"] }
   ],
   "cases": [
     { "input": "숙박음식점업", "canonical": "숙박음식점업" },
