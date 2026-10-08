@@ -87,3 +87,8 @@ def test_survey_population_survives_value_evidence_normalization():
         "used_period": "2025", "source": "KOSIS", "survey_name": "북한이탈주민실태조사"},
         query="임금", region="전국", verbose=False)
     assert result["stat_evidence"]["evidence"]["survey_name"] == "북한이탈주민실태조사"
+
+
+def test_compact_selection_preserves_survey_name_for_the_chatbot_judge():
+    survey = "「북한이탈주민실태조사」"
+    assert server._compact_table_candidate({"survey_name": survey})["survey_name"] == survey
