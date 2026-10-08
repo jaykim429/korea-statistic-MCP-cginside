@@ -8177,7 +8177,7 @@ async def stat_time_compare(
     if rate is not None:
         answer += f" 변화율은 {rate:+.2f}%입니다."
 
-    return {
+    return attach_stat_evidence({
         "상태": "executed",
         "코드": STATUS_EXECUTED,
         "질문": query,
@@ -8198,7 +8198,7 @@ async def stat_time_compare(
         ],
         "출처": "통계청 KOSIS",
         "검증_주의": ["변화율과 증감은 구분해서 해석해야 합니다."],
-    }
+    }, tool="stat_time_compare")
 
 
 @mcp.tool()

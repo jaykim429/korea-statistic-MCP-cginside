@@ -1,7 +1,8 @@
 {
   "categories": [
     { "canonical": "숙박음식점업", "section": "I", "aliases": ["숙박음식점업", "숙박 및 음식점업", "숙박·음식점업"] },
-    { "canonical": "도소매업", "section": "G", "aliases": ["도소매업", "도매 및 소매업", "도매소매업", "도매·소매업"] }
+    { "canonical": "도소매업", "section": "G", "aliases": ["도소매업", "도매 및 소매업", "도매소매업", "도매·소매업"] },
+    { "canonical": "원유및천연가스채굴업", "section": "B", "aliases": ["원유및천연가스채굴업", "원유 및 천연가스 채굴업"] }
   ],
   "cases": [
     { "input": "숙박음식점업", "canonical": "숙박음식점업" },
@@ -16,6 +17,13 @@
     { "input": "숙박음식점업(제외)", "canonical": null },
     { "input": "숙박음식점업(중소기업)", "canonical": null },
     { "input": "J.숙박 및 음식점업(55~56)", "canonical": null },
-    { "input": "숙박 및 음식점업 및 제조업", "canonical": null }
+    { "input": "숙박 및 음식점업 및 제조업", "canonical": null },
+    { "input": "원유 및 천연가스 채굴업", "canonical": "원유및천연가스채굴업" },
+    { "input": "원유및천연가스채굴업", "canonical": "원유및천연가스채굴업" },
+    { "input": "원유", "canonical": null },
+    { "input": "천연가스 채굴업", "canonical": null },
+    { "input": "비원유및천연가스채굴업", "canonical": null },
+    { "input": "원유 및 천연가스 채굴업 제외", "canonical": null },
+    { "input": "원유 및 천연가스 채굴업 및 제조업", "canonical": null }
   ]
 }
