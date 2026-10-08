@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -8,6 +9,33 @@ from kosis_analysis.rules import measure_relation
 from kosis_analysis.metadata import TableMetadataProfile, MetadataCompatibilityScorer
 from kosis_analysis.rules import survey_allows_question
 from kosis_analysis.rules import measure_of
+
+
+def test_native_chart_keeps_actual_measure_definition_and_periods(monkeypatch):
+    async def series(*args, **kwargs):
+        return {"통계명": "소상공인 기업체수", "지역": "전국", "단위": "개", "수록주기": "Y",
+                "org_id": "142", "tbl_id": "DT_3ME0100", "통계표": "시도/산업중분류별 주요지표",
+                "actual_measure": "기업체 수", "measure_definition": "소상공인 기업체수",
+                "actual_measure_evidence": "verified_curation_description",
+                "시계열": [{"시점": "2023", "값": "5960788"}, {"시점": "2024", "값": "6134324"}]}
+
+    monkeypatch.setattr(server, "quick_trend", series)
+    result = json.loads(asyncio.run(server.chart_line("소상공인 사업체 수", years=5, api_key="dummy"))[0].text)
+    envelope = result["stat_evidence"]
+    assert envelope["tool"] == "chart_line"
+    assert envelope["fulfillment"]["completeness"] == "complete"
+    assert envelope["evidence"]["actual_measure"] == "기업체 수"
+    assert envelope["evidence"]["measure_definition"] == "소상공인 기업체수"
+    assert envelope["evidence"]["period"]["cadence"] == "Y"
+    assert [row["period"] for row in envelope["evidence"]["observations"]] == ["2023", "2024"]
+
+
+def test_provided_chart_rows_do_not_acquire_native_curation_evidence():
+    result = json.loads(asyncio.run(server.chart_line("소상공인 사업체 수", input_rows=[
+        {"period": "2024", "value": 1, "unit": "개"},
+    ]))[0].text)
+    assert result["verification_level"] == "provided_rows"
+    assert "stat_evidence" not in result
 
 
 def test_native_time_comparison_preserves_verified_population_definition(monkeypatch):

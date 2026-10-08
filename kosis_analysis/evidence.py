@@ -305,7 +305,7 @@ def _period_contract(payload: dict[str, Any], observations: list[dict[str, Any]]
         "used": used or None,
         "available": available,
         "selection_mode": _first_present(payload, "period_selection_mode", "최신값_선택정책"),
-        "cadence": _first_present(payload, "period_type", "선택_수록주기") or metadata.get("cadence"),
+        "cadence": _first_present(payload, "period_type", "선택_수록주기", "수록주기") or metadata.get("cadence"),
     }
 
 

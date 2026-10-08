@@ -6875,12 +6875,13 @@ async def chart_line(
         source=f"KOSIS · {s.get('통계표')}",
         note=f"최근: {times[-1]}",
     )
-    return [TextContent(type="text", text=json.dumps({
+    return _chart_json_response(attach_stat_evidence({
         "상태": "executed",
         "status": "executed",
         "capability_state": "query_executed",
         "actual_query_supported": True,
         "verification_level": "query_rows",
+        **_native_calculation_basis(s),
         "query": query,
         "requested_region": requested_region,
         "used_region": s.get("지역"),
@@ -6894,7 +6895,7 @@ async def chart_line(
         "source": f"KOSIS · {s.get('통계표')}",
         "svg": svg,
         "text_summary": f"{s.get('지역')}, {times[0]}~{times[-1]}, {len(times)}개 실제 조회 시점으로 생성했습니다.",
-    }, ensure_ascii=False))]
+    }, tool="chart_line"))
 
 
 @mcp.tool()
