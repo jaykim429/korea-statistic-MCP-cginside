@@ -6,6 +6,23 @@ from kosis_analysis.quick import leftover_gate_terms
 from kosis_analysis.rules import measure_of, measure_relation
 
 
+def test_search_broadens_closed_series_quality_and_measure_alias_without_changing_requested_indicator(monkeypatch):
+    calls = []
+
+    async def search(client, path, params):
+        calls.append(params["searchNm"])
+        return []
+
+    monkeypatch.setattr(s, "_kosis_call", search)
+    result = asyncio.run(s._search_kosis_keywords("소매판매액지수 계절조정", ["소매판매액지수 계절조정"], 8, api_key="dummy"))
+    assert calls == ["소매판매액지수 계절조정", "소매판매액지수"]
+    assert result["입력"] == "소매판매액지수 계절조정"
+    calls.clear()
+    result = asyncio.run(s._search_kosis_keywords("서울 인구이동", ["서울 인구이동"], 8, api_key="dummy"))
+    assert calls == ["서울 인구이동", "서울 이동자수"]
+    assert result["입력"] == "서울 인구이동"
+
+
 def test_curated_seed_is_only_a_candidate_and_counts_surviving_rows(monkeypatch):
     async def search(*args, **kwargs):
         return []

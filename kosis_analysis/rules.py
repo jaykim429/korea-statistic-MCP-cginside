@@ -75,6 +75,10 @@ def measure_of(text: Any) -> str | None:
     return best[1] if best else None
 
 
+def canonical_measure(measure: str | None) -> str | None:
+    return _MEASURES["equivalentMeasures"].get(measure, measure)
+
+
 def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ...] = ()) -> str:
     asked = _MEASURES["equivalentMeasures"].get(asked, asked)
     actual = _MEASURES["equivalentMeasures"].get(actual, actual)

@@ -68,7 +68,7 @@ from kosis_analysis.metadata import (
     _suggest_axis_codes,
     _validate_query_table_filters,
 )
-from kosis_analysis.rules import canonical_population_label, measure_of, measure_relation
+from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation
 from kosis_analysis.text_match import (
     _content_search_query,
     _match_quality_rank,
@@ -8301,6 +8301,20 @@ async def _search_kosis_keywords(
     ]
     if not keywords:
         keywords = [query]
+    keywords = list(dict.fromkeys(keywords))
+    # Discovery may broaden the lexical search, never the execution request.
+    # A seasonal ITEM can belong to a table whose title omits that quality word.
+    base_query = re.sub(r"계절\s*조정(?:계열|지수)?|원계열|원지수", " ", query)
+    base_query = re.sub(r"\s+", " ", base_query).strip()
+    if base_query != query and len(base_query) >= 2:
+        keywords.append(base_query)
+    asked_measure = measure_of(query)
+    canonical = canonical_measure(asked_measure)
+    if asked_measure and canonical and asked_measure != canonical:
+        noun_pattern = r"\s*".join(re.escape(char) for char in asked_measure)
+        equivalent_query = re.sub(noun_pattern, canonical, query, count=1)
+        if equivalent_query != query:
+            keywords.append(equivalent_query)
     keywords = list(dict.fromkeys(keywords))
 
     # 검색어별 호출은 서로 독립이다. 순차로 돌면 검색어 7개에 35초가 걸린다(실측 "재생에너지 발전 비중").
