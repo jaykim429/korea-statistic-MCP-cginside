@@ -466,6 +466,7 @@ def _finalize_answer_query_response(
         result.setdefault("actual_measure_evidence", "verified_curation_description")
         if param.measure_basis:
             result.setdefault("measure_basis", param.measure_basis)
+        result.update(_curated_period_nature(param, str(result.get("used_period") or "")))
     requested = [{"dimension": item} for item in _infer_required_dimensions_from_query(query)]
     enriched = attach_stat_evidence(
         result,
@@ -989,6 +990,7 @@ from kosis_curation import (
     lookup as _curation_lookup,
     route_query as _route_query,
     routing_hints as _routing_hints,
+    requests_time_series,
     topic_hints as _topic_hints,
     stats_summary as _curation_stats_summary,
     _AMBIGUOUS_TOKENS as _BARE_INDICATOR_TOKENS,
@@ -1655,6 +1657,13 @@ def _default_period_type(param: QuickStatParam) -> str:
     return periods[0]
 
 
+def _requested_trend_period_type(query: str) -> Optional[str]:
+    for cadence, terms in (("M", ("월별", "월간")), ("Q", ("분기별", "분기간")), ("Y", ("연도별", "년도별", "연별", "연간"))):
+        if any(term in query for term in terms):
+            return cadence
+    return None
+
+
 def _format_aggregated_dt(value: float) -> str:
     if value == int(value):
         return str(int(value))
@@ -1738,6 +1747,7 @@ async def _fetch_latest_by_policy(
     param: QuickStatParam,
     region_code: Optional[str],
     policy: str,
+    *, allow_future: bool = False,
 ) -> tuple[list[dict], str, tuple[str, ...]]:
     """Fetch the latest row for every policy cadence and select by endpoint."""
     supported = tuple(getattr(param, "supported_periods", ()) or ("Y",))
@@ -1755,13 +1765,14 @@ async def _fetch_latest_by_policy(
         )
 
     fetched = await asyncio.gather(*(
-        _fetch_series(
+        _fetch_latest_current_series(
             client,
             key,
             param,
             region_code,
             period_type=period_type,
             latest_n=1,
+            allow_future=allow_future,
         )
         for period_type in period_types
     ))
@@ -1779,6 +1790,37 @@ async def _fetch_latest_by_policy(
     if not selected:
         return [], period_types[0], period_types
     return selected["rows"], selected["period_type"], period_types
+
+
+def _curated_period_nature(param: QuickStatParam, period: str) -> dict[str, Any]:
+    if not period:
+        return {}
+    if param.time_semantics == "observed" and period[:4] <= str(datetime.now().year):
+        return {}
+    nature = "projection" if period[:4] > str(datetime.now().year) or param.time_semantics == "projection" else "mixed"
+    return {"data_nature": nature, "data_quality_note": "장래추계가 포함된 자료입니다. 관측 실적과 동일시하지 마세요."}
+
+
+async def _fetch_latest_current_series(client, key, param, region_code, *, period_type, latest_n, allow_future=False):
+    """Default latest means latest as of today, not the far end of a projection series.
+
+    This does not prove a value is observed: mixed/projection sources retain their nature.
+    Explicit future periods and explicit latest_available keep their stored-period semantics.
+    """
+    rows = await _fetch_series(client, key, param, region_code, period_type=period_type,
+                               start_year=None, end_year=None, latest_n=latest_n)
+    now = datetime.now()
+    current = str(now.year) if period_type == "Y" else f"{now.year}{(now.month - 1) // 3 + 1 if period_type == 'Q' else now.month:02d}"
+    def eligible(row):
+        period = str(row.get("PRD_DE") or row.get("prdDe") or "")
+        return bool(period) and period <= current
+    if allow_future or not any(not eligible(row) for row in rows):
+        return rows
+    rows = await _fetch_series(client, key, param, region_code, period_type=period_type,
+                               start_year="1900" if period_type == "Y" else "190001", end_year=current)
+    rows = [row for row in rows if eligible(row)]
+    periods = sorted({str(row.get("PRD_DE") or "") for row in rows})[-latest_n:]
+    return [row for row in rows if str(row.get("PRD_DE") or "") in periods]
 
 
 def _values_from_series(series: list[dict]) -> tuple[list[str], list[float]]:
@@ -3391,6 +3433,7 @@ class NaturalLanguageAnswerEngine:
                 self.api_key,
                 start_year=normalized_start_year,
                 end_year=normalized_end_year,
+                **({"period_type": _requested_trend_period_type(query)} if _requested_trend_period_type(query) else {}),
             )
             if "오류" in trend:
                 region_failure = _region_failure_answer(
@@ -3417,6 +3460,7 @@ class NaturalLanguageAnswerEngine:
                 ),
                 "표": rows,
                 "단위": trend.get("단위"),
+                "period_type": trend.get("수록주기"),
                 "지역": region,
                 "데이터수": len(rows),
                 "통계표": trend.get("통계표"),
@@ -3432,7 +3476,7 @@ class NaturalLanguageAnswerEngine:
             }
             return result
 
-        if any(term in q for term in ("추이", "최근", "시계열", "그래프", "선그래프", "분석")):
+        if requests_time_series(query) or "분석" in q:
             years_match = re.search(r"최근\s*(\d+)\s*년", query)
             years = int(years_match.group(1)) if years_match else 5
             open_start_year = _extract_open_start_year(query)
@@ -3442,6 +3486,7 @@ class NaturalLanguageAnswerEngine:
                 years,
                 self.api_key,
                 start_year=open_start_year,
+                **({"period_type": _requested_trend_period_type(query)} if _requested_trend_period_type(query) else {}),
             )
             if "오류" in trend:
                 region_failure = _region_failure_answer(
@@ -3474,6 +3519,7 @@ class NaturalLanguageAnswerEngine:
                 "answer": answer,
                 "표": trend.get("시계열", []),
                 "단위": trend.get("단위"),
+                "period_type": trend.get("수록주기"),
                 "지역": region,
                 "데이터수": len(trend.get("시계열", [])),
                 "통계표": trend.get("통계표"),
@@ -3494,6 +3540,7 @@ class NaturalLanguageAnswerEngine:
                 5,
                 self.api_key,
                 start_year=open_start_year,
+                **({"period_type": _requested_trend_period_type(query)} if _requested_trend_period_type(query) else {}),
             )
             if "오류" not in trend:
                 return {
@@ -3509,6 +3556,7 @@ class NaturalLanguageAnswerEngine:
                     ),
                     "표": trend.get("시계열", []),
                     "단위": trend.get("단위"),
+                    "period_type": trend.get("수록주기"),
                     "지역": region,
                     "데이터수": len(trend.get("시계열", [])),
                     "통계표": trend.get("통계표"),
@@ -4326,11 +4374,9 @@ class NaturalLanguageAnswerEngine:
         if end:
             return str(end)
         rows = result.get("표") or []
-        for row in rows:
-            if isinstance(row, dict):
-                period = row.get("시점")
-                if period:
-                    return str(period)
+        periods = [str(row["시점"]) for row in rows if isinstance(row, dict) and row.get("시점")]
+        if periods:
+            return max(periods)
         period = result.get("시점")
         if period:
             return str(period)
@@ -4967,6 +5013,7 @@ async def _quick_stat_core(
                         param,
                         region_code,
                         latest_policy,
+                        allow_future=str(period) == LATEST_AVAILABLE,
                     )
                 else:
                     data = await _fetch_series(
@@ -5066,6 +5113,9 @@ async def _quick_stat_core(
             "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
             **({"measure_basis": param.measure_basis} if param.measure_basis else {}),
         }
+        result.update(_curated_period_nature(param, used_period))
+        if result.get("data_nature"):
+            result["answer"] += " 장래추계가 포함된 자료의 값입니다."
         # 같은 지표라도 모집단·작성 기준이 다르면 값이 다르다. 최신 표를 주값으로 주되
         # 다른 기준이 있으면 함께 알린다 — 하나만 보여 주면 실무자는 다른 기준이 있다는 사실조차
         # 모른 채 인용한다. 폐지된 옛 표도 여기에 과거 계열로 들어 있다.
@@ -5305,6 +5355,7 @@ async def _quick_trend_core(
     api_key: Optional[str] = None,
     start_year: Optional[str] = None,
     end_year: Optional[str] = None,
+    period_type: Optional[str] = None,
 ) -> dict:
     normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(start_year, end_year)
     if period_error:
@@ -5373,7 +5424,9 @@ async def _quick_trend_core(
         )
     region = canonical
 
-    period_type = _default_period_type(param)
+    period_type = period_type or _requested_trend_period_type(query) or _default_period_type(param)
+    if period_type not in param.supported_periods:
+        return {"오류": f"요청 주기 {period_type}를 이 통계표가 지원하지 않습니다.", "코드": "PERIOD_TYPE_UNSUPPORTED"}
     latest_count = _latest_count_for_years(years, period_type)
     start_period = end_period = None
     if normalized_start_year:
@@ -5381,16 +5434,12 @@ async def _quick_trend_core(
         _, end_period = _period_bounds(normalized_end_year or str(datetime.now().year), period_type)
 
     async with httpx.AsyncClient() as client:
-        data = await _fetch_series(
-            client,
-            key,
-            param,
-            region_code,
-            period_type=period_type,
-            start_year=start_period,
-            end_year=end_period,
-            latest_n=None if start_period else latest_count,
-        )
+        if start_period:
+            data = await _fetch_series(client, key, param, region_code, period_type=period_type,
+                                       start_year=start_period, end_year=end_period, latest_n=None)
+        else:
+            data = await _fetch_latest_current_series(client, key, param, region_code,
+                                                      period_type=period_type, latest_n=latest_count)
 
     data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
     series = [{"시점": r.get("PRD_DE"), "값": r.get("DT"),
@@ -5409,7 +5458,10 @@ async def _quick_trend_core(
         "수록주기": period_type,
         "요청_기간_년": years,
         "요청_시점수": latest_count if not start_period else None,
+        "actual_measure": param.description,
+        "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
     }
+    result.update(_curated_period_nature(param, used_period))
     provisional_periods = [
         period
         for period in (getattr(param, "provisional_periods", ()) or ())
@@ -5512,6 +5564,7 @@ async def _quick_region_compare_core(
                     param,
                     "ALL",
                     latest_policy,
+                    allow_future=str(period) == LATEST_AVAILABLE,
                 )
             else:
                 data = await _fetch_series(

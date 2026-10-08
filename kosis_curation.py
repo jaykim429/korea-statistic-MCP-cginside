@@ -249,6 +249,14 @@ def canonical_region(region: Optional[str]) -> Optional[str]:
 VerificationStatus = Literal["verified", "unverified", "needs_check", "broken"]
 ValueKind = Literal["raw", "provider_index", "mcp_derived"]
 TimeSemantics = Literal["observed", "projection", "mixed"]
+
+
+def requests_time_series(query: str) -> bool:
+    """Recent/current alone asks for one latest value, not a multi-period series."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    return bool(re.search(r"최근\d+년", compact)) or any(term in compact for term in (
+        "추이", "시계열", "연도별", "년도별", "연별", "월별", "분기별", "그래프", "코로나이후", "2020년이후",
+    ))
 ReplacementStatus = Literal["current", "candidate", "deprecated"]
 
 
@@ -777,6 +785,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         org_id="101", tbl_id="DT_1YL12501E",
         tbl_nm="노령화지수(시도)",
         description="노령화지수 (65세 이상 인구 / 0-14세 인구 × 100)",
+        time_semantics="mixed",
         obj_l1="00", item_id="T10", unit="지수",
         region_scheme=REGION_DEMOGRAPHIC,
         supported_periods=("Y",),
@@ -2821,7 +2830,7 @@ class NaturalLanguageRouter:
             add("TERM_DEFINITION")
         if any(term in q_norm for term in ("출처", "기준시점", "갱신주기", "단위", "메타")):
             add("METADATA_LOOKUP")
-        if any(term in q_norm for term in ("최근", "추이", "연도별", "시계열", "코로나이후", "2020년이후")):
+        if requests_time_series(query):
             add("STAT_TIME_SERIES")
         # "물가 상승률"처럼 상승률·하락률을 물으면 지수 수준이 아니라 변화율을 계산해야 한다 (실측: 소비자물가 상승률 → 120.05 지수)
         if any(term in q_norm for term in ("늘", "증가", "감소", "변화율", "증가율", "전년대비", "전월대비", "회복", "상승률", "하락률", "올랐", "떨어졌", "내렸")):

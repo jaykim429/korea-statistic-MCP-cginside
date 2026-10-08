@@ -11,6 +11,7 @@ from kosis_curation import (
     SYNONYMS,
     canonical_region as _canonical_region,
     extract_region_candidate,
+    requests_time_series,
 )
 from kosis_analysis.metadata import _compact_text
 from kosis_analysis.text_match import _QUERY_STOP_TERMS, _query_tokens_for_matching
@@ -77,7 +78,7 @@ def _quick_stat_unsupported_dimensions(
         dimensions.append("age")
     if any(term in compact for term in ("여성", "여자", "남성", "남자", "성별")):
         dimensions.append("gender")
-    if any(term in compact for term in ("추이", "시계열", "최근10년", "최근5년", "팬데믹기간")):
+    if requests_time_series(query) or "팬데믹기간" in compact:
         dimensions.append("time_series")
     if any(term in compact for term in ("vs", "대비", "비교")):
         dimensions.append("comparison")
@@ -134,7 +135,7 @@ _NATIONWIDE_TERMS = ("우리나라", "한국", "대한민국", "국내", "전국
 
 #: 최신 시점을 뜻하는 말. 잡말이 아니라 시간 의미다 — 따로 두어야 회귀 분석 때 근거가 남는다.
 #: quick_stat 은 최신 시점을 돌려주므로 결과적으로 덮인다.
-_LATEST_PERIOD_TERMS = ("최근", "현재", "지금", "요즘", "현재기준", "최신")
+_LATEST_PERIOD_TERMS = ("최근", "현재", "지금", "요즘", "현재기준", "최신", "연도", "년도", "시점")
 
 #: 대화 표현. `_QUERY_STOP_TERMS` 가 토큰 **등가**로만 걸려 활용형이 샌다 — 그 위에 더한다.
 _CONVERSATION_FILLERS = (
@@ -231,6 +232,14 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
     add_tokens(*_LATEST_PERIOD_TERMS)
     add_tokens(*_CONVERSATION_FILLERS)
     add_tokens(*_QUERY_STOP_TERMS)
+    # Period grouping is a temporal constraint, not an unknown population.
+    # The time-series gate still prevents quick_stat from silently returning one value.
+    if param and "Y" in param.supported_periods:
+        add_tokens("연도별", "년도별", "연별")
+    if param and "M" in param.supported_periods:
+        add_tokens("월별")
+    if param and "Q" in param.supported_periods:
+        add_tokens("분기별")
 
     # 4) 지표가 스스로 선언한 말
     for term in (getattr(param, "encoded_terms", ()) or ()):

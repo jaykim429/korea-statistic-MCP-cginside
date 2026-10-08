@@ -365,6 +365,8 @@ def build_stat_evidence(
         "actual_measure": actual_measure,
         "actual_measure_evidence": actual_measure_evidence,
         "measure_basis": _first_present(payload, "measure_basis", "측정_기준"),
+        "data_nature": payload.get("data_nature"),
+        "data_quality_note": payload.get("data_quality_note"),
         "period": _period_contract(payload, observations),
     }
     return {
