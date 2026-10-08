@@ -6,7 +6,7 @@ from itertools import product
 from typing import Any, Optional
 
 from kosis_analysis.periods import _api_period_de
-from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation
+from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation, survey_allows_question
 
 STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
@@ -324,6 +324,7 @@ class TableMetadataProfile:
     period_rows: list[dict[str, Any]]
     candidate_source: Any = None
     search_term: Any = None
+    survey_name: Optional[str] = None
 
     @classmethod
     def from_rows(
@@ -334,6 +335,7 @@ class TableMetadataProfile:
         name_rows: list[dict[str, Any]] | Any,
         item_rows: list[dict[str, Any]] | Any,
         period_rows: list[dict[str, Any]] | Any,
+        source_rows: list[dict[str, Any]] | Any = None,
     ) -> "TableMetadataProfile":
         axes, axis_order = _build_axis_codebook(item_rows if isinstance(item_rows, list) else [])
         table_name = None
@@ -350,6 +352,8 @@ class TableMetadataProfile:
             period_rows=clean_periods,
             candidate_source=candidate_row.get("source"),
             search_term=candidate_row.get("search_term"),
+            survey_name=(source_rows[0].get("JOSA_NM") or source_rows[0].get("josaNm"))
+            if isinstance(source_rows, list) and source_rows and isinstance(source_rows[0], dict) else None,
         )
 
     def dimension_coverage(
@@ -481,6 +485,7 @@ class MetadataCompatibilityResult:
             "org_id": self.profile.org_id,
             "tbl_id": self.profile.tbl_id,
             "table_name": self.profile.table_name,
+            "survey_name": self.profile.survey_name,
             "source": self.profile.candidate_source,
             "search_term": self.profile.search_term,
             "matched_dimensions": self.matched_dimensions,
@@ -572,7 +577,9 @@ class MetadataCompatibilityScorer:
             + len(matched_items) * 12
             - len(missing_items) * 15
         )
-        if measurement["relation"] == "incompatible":
+        if not survey_allows_question(self.measure_request, profile.survey_name):
+            status = "rejected_survey_population"
+        elif measurement["relation"] == "incompatible":
             status = "rejected_measurement"
         elif self.indicator and indicator_score <= 0:
             status = "not_matched_indicator"

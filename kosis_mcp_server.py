@@ -340,6 +340,15 @@ def _attach_shortcut_contract(payload: Any, *, tool: str, ignored_params: Option
     return result
 
 
+async def _fetch_survey_rows(client: httpx.AsyncClient, key: str, org_id: str, tbl_id: str) -> list[dict[str, Any]]:
+    """Optional SOURCE evidence; a failure is unknown, not a false population assertion."""
+    try:
+        rows = await _fetch_meta(client, key, org_id, tbl_id, "SOURCE")
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
 def _compact_answer_query_response(payload: dict[str, Any], *, query: str, region: str) -> dict[str, Any]:
     """Return a slim answer_query shape for chatbot clients that do their own reasoning."""
     def _first_payload_row_field(field: str) -> Any:
@@ -349,6 +358,25 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
                 value = rows[0].get(field)
                 if value not in (None, "", [], {}):
                     return value
+        return None
+
+    def _representative_value() -> Any:
+        for field in ("value", "값"):
+            if payload.get(field) is not None and payload[field] != "":
+                return payload[field]  # Zero is an observation, not a missing value.
+        period = payload.get("used_period") or payload.get("period") or payload.get("시점")
+        for row_key in ("data", "rows", "results", "표", "시계열", "결과"):
+            rows = payload.get(row_key)
+            if not isinstance(rows, list):
+                continue
+            matching = [row for row in rows if isinstance(row, dict)
+                        and (not period or str(row.get("period") or row.get("시점") or row.get("PRD_DE")) == str(period))]
+            if len(matching) != 1:
+                return None  # Multi-region/measure comparisons do not have a scalar representative.
+            row = matching[0]
+            for field in ("value", "값", "DT"):
+                if row.get(field) is not None and row[field] != "":
+                    return row[field]
         return None
 
     metadata_keys = {
@@ -425,10 +453,10 @@ def _compact_answer_query_response(payload: dict[str, Any], *, query: str, regio
         "answer_type": metadata.get("answer_type"),
         "answer": payload.get("answer") or payload.get("답변"),
         "error": payload.get("error") or payload.get("오류"),
-        "value": growth_value if growth_value is not None else (payload.get("value") or payload.get("값") or _first_payload_row_field("값")),
+        "value": growth_value if growth_value is not None else _representative_value(),
         "unit": "%" if growth_value is not None else metadata.get("unit"),
         # 증가율로 바꾼 경우 원래 수준값과 단위도 함께 남긴다 — 표·차트에서 그대로 쓴다
-        "level_value": payload.get("value") or payload.get("값") or _first_payload_row_field("값") if growth_value is not None else None,
+        "level_value": _representative_value() if growth_value is not None else None,
         "level_unit": metadata.get("unit") if growth_value is not None else None,
         "region": metadata.get("region"),
         "used_period": payload.get("used_period") or metadata.get("period"),
@@ -8669,7 +8697,8 @@ def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
     # A plain metric lookup keeps the existing near-tie freshness rule (e.g. CPI ITEM='전체').
     weak_population_measure = bool((candidate.get("population_compatibility") or {}).get("requested_terms")) and not any(
         evidence.get("source") == "ITEM"
-        and measure_relation(measure.get("asked_measure"), evidence.get("measure")) == measure.get("relation")
+        and measure_relation(measure.get("asked_measure"), evidence.get("measure"),
+                             (str(evidence.get("unit")),) if evidence.get("unit") else ()) == measure.get("relation")
         for evidence in measure.get("evidence", []))
     return (
         candidate.get("status") != "selected",
@@ -11132,10 +11161,11 @@ async def select_table_for_query(
         tbl_id = str(row.get("통계표ID") or "")
         async with semaphore:
             try:
-                name_rows, item_rows, period_rows = await asyncio.gather(
+                name_rows, item_rows, period_rows, source_rows = await asyncio.gather(
                     _fetch_meta(client, key, org_id, tbl_id, "TBL"),
                     _fetch_meta(client, key, org_id, tbl_id, "ITM"),
                     _fetch_meta(client, key, org_id, tbl_id, "PRD"),
+                    _fetch_survey_rows(client, key, org_id, tbl_id),
                 )
             except Exception as exc:  # 개별 표의 메타 실패는 다른 후보 평가를 막지 않는다
                 return {
@@ -11154,6 +11184,7 @@ async def select_table_for_query(
             name_rows=name_rows,
             item_rows=item_rows,
             period_rows=period_rows,
+            source_rows=source_rows,
         )
         return scorer.evaluate(profile).to_response()
 
@@ -11660,10 +11691,11 @@ async def _query_table_core(
     fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     async with httpx.AsyncClient() as client:
         try:
-            name_rows, item_rows, period_rows = await asyncio.gather(
+            name_rows, item_rows, period_rows, source_rows = await asyncio.gather(
                 _fetch_meta(client, key, org_id, tbl_id, "TBL"),
                 _fetch_meta(client, key, org_id, tbl_id, "ITM"),
                 _fetch_meta(client, key, org_id, tbl_id, "PRD"),
+                _fetch_survey_rows(client, key, org_id, tbl_id),
             )
         except Exception as exc:
             return {
@@ -12030,6 +12062,8 @@ async def _query_table_core(
         "tbl_id": tbl_id,
         "table_name": table_name,
         "table_name_en": table_name_eng,
+        "survey_name": (source_rows[0].get("JOSA_NM") or source_rows[0].get("josaNm"))
+        if source_rows and isinstance(source_rows[0], dict) else None,
         "filters_used": normalized_filters,
         "auto_default_filters": auto_defaults,
         "period_range": effective_period_range,

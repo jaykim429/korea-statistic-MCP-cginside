@@ -34,6 +34,20 @@ with (_RULES_DIR / "population-labels.json").open(encoding="utf-8") as _f:
     _POPULATIONS = json.load(_f)
 
 
+def survey_population(survey: str | None) -> str | None:
+    normalized = re.sub(r'''[\s「」『』"']''', "", str(survey or ""))
+    return next((entry["population"] for entry in _POPULATIONS["scopedSurveys"] if entry["name"] == normalized), None)
+
+
+def survey_allows_question(question: str | None, survey: str | None) -> bool:
+    population = survey_population(survey)
+    if not population:
+        return True
+    compact = re.sub(r"\s+", "", str(question or ""))
+    return population in compact and f"비{population}" not in compact and not re.search(
+        re.escape(population) + r"(?:을|를|이|가)?(?:제외|이외|아닌|말고)", compact)
+
+
 def measure_of(text: Any) -> str | None:
     """Same noun and word-end contract as the TS adapter; classification is not a measure."""
     tokens = [t for t in re.split(r"[\s·,()[\]{}_/]+", str(text or "")) if t]
