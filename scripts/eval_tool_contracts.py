@@ -1325,9 +1325,11 @@ async def test_answer_query_explicit_period_uses_trend_not_latest_value() -> Non
     assert result["data"][0]["시점"] == "2010", result
 
 
-async def test_answer_query_does_not_label_total_unemployment_as_youth() -> None:
+async def test_answer_query_does_not_label_total_unemployment_as_unmapped_age() -> None:
+    # Youth 15–29 is now a verified curation. An unregistered age group still
+    # must never receive the overall unemployment rate as its own value.
     result = await kosis_mcp_server.answer_query(
-        "청년(15~29세) 실업률 최근 5년 데이터 보여줘",
+        "고령자(65세 이상) 실업률 최근 5년 데이터 보여줘",
         start_year="2021",
         end_year="2025",
         api_key="dummy",
@@ -3098,7 +3100,7 @@ async def main() -> None:
         ("answer_query_compact_response", lambda: test_answer_query_compact_response_hides_control_contract()),
         ("answer_query_compact_partial_provenance", lambda: test_answer_query_compact_response_preserves_partial_and_provenance()),
         ("answer_query_explicit_period_trend", lambda: test_answer_query_explicit_period_uses_trend_not_latest_value()),
-        ("answer_query_youth_not_total", lambda: test_answer_query_does_not_label_total_unemployment_as_youth()),
+        ("answer_query_unmapped_age_not_total", lambda: test_answer_query_does_not_label_total_unemployment_as_unmapped_age()),
         ("marker_guidance_contract", lambda: test_marker_guidance_in_contract()),
         ("output_contract_compact_default", lambda: test_output_contract_compact_by_default()),
         ("quick_stat_shortcut_contract", lambda: test_quick_stat_shortcut_contract()),

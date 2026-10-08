@@ -992,6 +992,7 @@ from kosis_curation import (
     routing_hints as _routing_hints,
     requests_time_series,
     requested_period_cadence,
+    requested_series_years,
     topic_hints as _topic_hints,
     stats_summary as _curation_stats_summary,
     _AMBIGUOUS_TOKENS as _BARE_INDICATOR_TOKENS,
@@ -3475,8 +3476,7 @@ class NaturalLanguageAnswerEngine:
             return result
 
         if requests_time_series(query) or "분석" in q:
-            years_match = re.search(r"최근\s*(\d+)\s*년", query)
-            years = int(years_match.group(1)) if years_match else 5
+            years = requested_series_years(query) or 5
             open_start_year = _extract_open_start_year(query)
             trend = await _quick_trend_core(
                 direct_key,

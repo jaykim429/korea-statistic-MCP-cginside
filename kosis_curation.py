@@ -262,10 +262,15 @@ def requested_period_cadence(query: str) -> Optional[str]:
                  if any(term in query for term in terms)), None)
 
 
+def requested_series_years(query: str) -> Optional[int]:
+    match = re.search(r"(?:최근|지난)\s*(\d{1,2})\s*(?:개)?년(?:간|동안)?", str(query or ""))
+    return min(max(int(match.group(1)), 1), 30) if match else None
+
+
 def requests_time_series(query: str) -> bool:
     """Recent/current alone asks for one latest value, not a multi-period series."""
     compact = re.sub(r"\s+", "", str(query or ""))
-    return bool(re.search(r"최근\d+년", compact)) or any(term in compact for term in (
+    return requested_series_years(query) is not None or any(term in compact for term in (
         "추이", "시계열", "연도별", "년도별", "연별", "월별", "분기별", "그래프", "코로나이후", "2020년이후",
     ))
 ReplacementStatus = Literal["current", "candidate", "deprecated"]

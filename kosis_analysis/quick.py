@@ -13,6 +13,7 @@ from kosis_curation import (
     extract_region_candidate,
     requests_time_series,
     PERIOD_CADENCE_TERMS,
+    requested_series_years,
 )
 from kosis_analysis.metadata import _compact_text
 from kosis_analysis.text_match import _QUERY_STOP_TERMS, _query_tokens_for_matching
@@ -233,6 +234,8 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
     add_tokens(*_LATEST_PERIOD_TERMS)
     add_tokens(*_CONVERSATION_FILLERS)
     add_tokens(*_QUERY_STOP_TERMS)
+    if requested_series_years(query) is not None:
+        add_tokens("지난")
     # Period grouping is a temporal constraint, not an unknown population.
     # The time-series gate still prevents quick_stat from silently returning one value.
     if param:
@@ -296,6 +299,10 @@ def leftover_qualifier_terms(
     leftover: list[str] = []
     for token in _query_tokens_for_matching(query):
         if _PERIOD_TOKEN.match(token):
+            continue
+        # 5년 is a duration only in a parsed recent-years request. Never erase
+        # population qualifiers such as 5년차 기업 or arbitrary numeric labels.
+        if requested_series_years(query) is not None and re.fullmatch(r"\d{1,2}(?:개)?년(?:간|동안)?", token):
             continue
         stem = _strip_particle(token)
         # 조사를 떼면 한 글자 계량어만 남는 말("수는" → "수")은 내용어가 아니다.

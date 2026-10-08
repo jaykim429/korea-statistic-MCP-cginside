@@ -126,6 +126,33 @@ def test_trade_balance_annual_cadence_is_not_an_unknown_population():
     assert leftover_gate_terms("무역수지 최근 연간 추이", server.TIER_A_STATS["무역수지"]) == []
 
 
+@pytest.mark.parametrize("query", ["출생아 수 최근 5년 추이", "출생아 수 최근 3개년 추이", "출생아 수 지난 7년 추이"])
+def test_recent_year_count_is_not_an_unknown_population(query):
+    assert leftover_gate_terms(query, server.TIER_A_STATS["출생아수"]) == []
+
+
+def test_years_old_enterprises_remain_a_population_constraint():
+    assert leftover_gate_terms("5년차 중소기업 기업 수", server.TIER_A_STATS["중소기업_사업체수"])
+
+
+def test_verified_youth_series_uses_the_actual_age_code_not_overall_unemployment(monkeypatch):
+    calls = []
+
+    async def fetch(*args, **kwargs):
+        param = args[2]
+        assert param.obj_l2 == "75" and param.item_id == "T80"
+        calls.append(param)
+        return [{"PRD_DE": "2025", "DT": "6.1", "UNIT_NM": "%", "ITM_ID": "T80", "ITM_NM": "실업률",
+                 "C1": "0", "C1_NM": "계", "C2": "75", "C2_NM": "15~29세"}]
+
+    monkeypatch.setattr(server, "_fetch_series", fetch)
+    result = asyncio.run(server.answer_query("청년(15~29세) 실업률 최근 5년 데이터 보여줘", api_key="dummy"))
+    assert result["status"] == "executed"
+    assert calls
+    assert result["unit"] == "%"
+    assert "3.7" not in str(result)
+
+
 def test_recent_value_uses_latest_policy_not_default_annual_trend(monkeypatch):
     calls = []
 
