@@ -48,6 +48,7 @@ from kosis_analysis.client import (
     _fetch_period_range,
     _fetch_table_name,
     _kosis_call,
+    kosis_http_timeout,
     _resolve_key,
 )
 from kosis_analysis.evidence import attach_stat_evidence, kosis_row_dimensions
@@ -12108,10 +12109,10 @@ async def _query_table_core(
                 }
                 async with semaphore:
                     try:
-                        group = await asyncio.wait_for(
-                            _kosis_call(client, "Param/statisticsParameterData.do", params),
-                            timeout=QUERY_TABLE_CALL_TIMEOUT,
-                        )
+                        # Rate-limit queueing is not a KOSIS network timeout.
+                        # The transport deadline starts after acquiring a permit.
+                        with kosis_http_timeout(QUERY_TABLE_CALL_TIMEOUT):
+                            group = await _kosis_call(client, "Param/statisticsParameterData.do", params)
                         # The table's newest period need not contain this measurement.
                         # Recover only an implicit latest, single-filter lookup; explicit
                         # periods, multi-group comparisons and infrastructure errors stay unchanged.
@@ -12127,10 +12128,8 @@ async def _query_table_core(
                                                "status": "attempted", "used_period": None,
                                                "table_latest_period": auto_default_period_range[-1]}
                             latest_observation_recoveries.append(recovery_record)
-                            recovered = await asyncio.wait_for(
-                                _kosis_call(client, "Param/statisticsParameterData.do", recovery_params),
-                                timeout=QUERY_TABLE_CALL_TIMEOUT,
-                            )
+                            with kosis_http_timeout(QUERY_TABLE_CALL_TIMEOUT):
+                                recovered = await _kosis_call(client, "Param/statisticsParameterData.do", recovery_params)
                             if not isinstance(recovered, list):
                                 recovery_record["status"] = "provider_error"
                                 return recovered

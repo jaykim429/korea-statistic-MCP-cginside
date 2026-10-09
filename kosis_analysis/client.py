@@ -5,6 +5,8 @@ import os
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 
 import httpx
@@ -12,6 +14,17 @@ import httpx
 KOSIS_BASE = "https://kosis.kr/openapi"
 API_KEY_DEFAULT = os.environ.get("KOSIS_API_KEY", "")
 HTTP_TIMEOUT = 30.0
+_REQUEST_TIMEOUT: ContextVar[float] = ContextVar("kosis_request_timeout", default=HTTP_TIMEOUT)
+
+
+@contextmanager
+def kosis_http_timeout(seconds: float):
+    """Bound real HTTP I/O, not local rate-limit queueing; isolate concurrent callers."""
+    token = _REQUEST_TIMEOUT.set(seconds)
+    try:
+        yield
+    finally:
+        _REQUEST_TIMEOUT.reset(token)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -156,7 +169,7 @@ async def _kosis_call(client: httpx.AsyncClient, endpoint: str, params: dict) ->
     for attempt in range(attempts):
         await _KOSIS_RATE_LIMITER.acquire()
         try:
-            resp = await client.get(url, params=clean, timeout=HTTP_TIMEOUT)
+            resp = await client.get(url, params=clean, timeout=_REQUEST_TIMEOUT.get())
         except httpx.TimeoutException:
             raise KosisTransportError("TIMEOUT") from None
         except httpx.RequestError:
