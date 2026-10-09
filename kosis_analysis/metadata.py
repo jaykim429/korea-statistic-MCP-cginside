@@ -989,7 +989,7 @@ def _fanout_coverage_report(
 
 
 def _to_number(value: Any) -> Optional[float]:
-    text = str(value or "").replace(",", "").strip()
+    text = str(value if value is not None else "").replace(",", "").strip()
     if not text:
         return None
     try:
@@ -1001,7 +1001,7 @@ def _to_number(value: Any) -> Optional[float]:
 def _normalize_stat_value(value: Any) -> dict[str, Any]:
     """Split provider raw values from numeric values for safe downstream use."""
     raw = value
-    text = str(value or "").replace(",", "").strip()
+    text = str(value if value is not None else "").replace(",", "").strip()
     if not text:
         return {
             "value": None,

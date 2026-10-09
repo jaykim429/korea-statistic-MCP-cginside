@@ -69,7 +69,7 @@ from kosis_analysis.metadata import (
     _suggest_axis_codes,
     _validate_query_table_filters,
 )
-from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible
+from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases
 from kosis_analysis.text_match import (
     _content_search_query,
     _match_quality_rank,
@@ -8333,6 +8333,9 @@ async def _search_kosis_keywords(
         keywords.append(base_query)
     asked_measure = measure_of(query)
     canonical = canonical_measure(asked_measure)
+    for alias in measure_discovery_aliases(asked_measure):
+        noun_pattern = r"\s*".join(re.escape(char) for char in asked_measure)
+        keywords.append(re.sub(noun_pattern, alias, query, count=1))
     if asked_measure and canonical and asked_measure != canonical:
         noun_pattern = r"\s*".join(re.escape(char) for char in asked_measure)
         equivalent_query = re.sub(noun_pattern, canonical, query, count=1)

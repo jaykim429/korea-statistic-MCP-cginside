@@ -79,6 +79,11 @@ def canonical_measure(measure: str | None) -> str | None:
     return _MEASURES["equivalentMeasures"].get(measure, measure)
 
 
+def measure_discovery_aliases(measure: str | None) -> tuple[str, ...]:
+    """Lexical discovery only. These are NOT measurement equivalences."""
+    return tuple(_MEASURES.get("discoveryAliases", {}).get(canonical_measure(measure), []))
+
+
 def measurement_normalizer(text: str) -> str | None:
     match = re.search(_MEASURES["perUnitNormalizerPattern"], re.sub(r"\s+", "", text))
     return match.group(0) if match else None

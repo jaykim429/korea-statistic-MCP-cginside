@@ -100,7 +100,9 @@ def _normalize_observation(row: dict[str, Any]) -> Optional[dict[str, Any]]:
             dimensions[dimension] = {"code": None, "label": label}
     if not any((_present(value), _present(unit), _present(period), bool(dimensions))):
         return None
-    return {"value": value, "unit": unit, "period": period, "dimensions": dimensions}
+    suppressed = value is None and row.get("missing_reason") == "suppressed" and row.get("value_raw") in {"*", "＊"}
+    return {"value": value, "unit": unit, "period": period, "dimensions": dimensions,
+            **({"observation_state": "suppressed"} if suppressed else {})}
 
 
 def _observations(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -256,8 +258,10 @@ def _missing_evidence_fields(
         missing.append("observations")
     else:
         for field in ("value", "unit", "period"):
-            if any(not _present(row.get(field)) for row in observations):
+            if any(not _present(row.get(field)) and not (field == "value" and row.get("observation_state") == "suppressed") for row in observations):
                 missing.append(field)
+        if not any(_present(row.get("value")) for row in observations) and "value" not in missing:
+            missing.append("value")
         # A mixed table-level unit is not proof of an individual ITEM's unit.
         # Preserve the raw string; never strip '%' according to the requested metric.
         if any(_ambiguous_unit(row.get("unit")) for row in observations) and "unit" not in missing:

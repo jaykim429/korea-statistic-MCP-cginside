@@ -10,6 +10,7 @@ import re
 from typing import Any, Optional
 
 from kosis_analysis.metadata import _compact_text
+from kosis_analysis.rules import measure_discovery_aliases
 
 
 _QUERY_STOP_TERMS = {
@@ -90,6 +91,8 @@ def _query_token_matches_text(token: str, text: Any) -> bool:
     norm = _compact_text(token)
     if norm:
         body = _compact_text(str(text or "").replace("R&D", "RD").replace("r&d", "rd"))
+        if any(alias in body for alias in measure_discovery_aliases(norm)):
+            return True  # Search ranking only; metadata/execution still require measure proof.
         if norm not in body:
             # 표기 흔들림(실업율/실업률)과 붙여 쓴 합성어(소상공인사업체수)를 한 번 더 본다
             fixed = _normalize_typo_token(norm)
