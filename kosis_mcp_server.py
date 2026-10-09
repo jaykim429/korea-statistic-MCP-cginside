@@ -51,6 +51,7 @@ from kosis_analysis.client import (
     _resolve_key,
 )
 from kosis_analysis.evidence import attach_stat_evidence, kosis_row_dimensions
+from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure
 from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
     TableMetadataProfile,
@@ -347,6 +348,27 @@ async def _fetch_survey_rows(client: httpx.AsyncClient, key: str, org_id: str, t
         return rows if isinstance(rows, list) else []
     except Exception:
         return []
+
+
+async def _fetch_annotation_measure(client: httpx.AsyncClient, key: str, org_id: str, tbl_id: str, items: Any) -> Optional[dict]:
+    """Optional corroboration only for tables without a known ITEM measure.
+
+    Failure leaves identity unknown; it never authorizes a request-derived label.
+    The candidate metadata budget is unchanged and normal ITEM tables cost no calls.
+    """
+    if not isinstance(items, list) or not items or any(
+        row.get("OBJ_ID") == "ITEM" and measure_of(row.get("ITM_NM")) for row in items
+    ):
+        return None
+    try:
+        comments, units = await asyncio.gather(
+            _fetch_meta(client, key, org_id, tbl_id, "CMMT"),
+            _fetch_meta(client, key, org_id, tbl_id, "UNIT"),
+        )
+        definition = annotation_measure(comments, units)
+        return {**definition, "contract_version": "kosis-measure-role/v1", "org_id": org_id, "tbl_id": tbl_id} if definition else None
+    except Exception:
+        return None
 
 
 def _compact_answer_query_response(payload: dict[str, Any], *, query: str, region: str) -> dict[str, Any]:
@@ -8331,7 +8353,7 @@ async def _search_kosis_keywords(
                 try:
                     rows = await _kosis_call(client, "statisticsSearch.do", {
                         "method": "getList", "apiKey": key,
-                        "searchNm": kw, "format": "json", "jsonVD": "Y", "resultCount": max(limit, 20),
+                        "searchNm": kw, "format": "json", "jsonVD": "Y", "resultCount": max(limit, 60), "startCount": 1,
                     })
                 except RuntimeError as exc:
                     return kw, None, type(exc).__name__
@@ -8370,8 +8392,8 @@ async def _search_kosis_keywords(
     seen = set()
     unique = []
     for item in all_results:
-        tid = item.get("TBL_ID")
-        if tid and tid not in seen:
+        tid = (item.get("ORG_ID"), item.get("TBL_ID"))
+        if tid[1] and tid not in seen:
             seen.add(tid)
             unique.append(item)
 
@@ -8442,10 +8464,10 @@ async def _search_kosis_keywords(
         matched_rows = [row for row in result_rows if (row.get("match_quality") or {}).get("matched_terms")]
         # 내용어가 하나도 안 걸린 표만 남았으면 KOSIS 검색이 느슨하게 맞춘 잡음이다 → 빈 결과로 돌려 "없다"고 말하게 한다
         result_rows = matched_rows
-    seen_names: set[str] = set()
+    seen_names: set[tuple] = set()
     deduped_rows: list[dict[str, Any]] = []
     for row in result_rows:
-        name = re.sub(r"\s+", "", str(row.get("통계표명") or ""))
+        name = (row.get("기관ID"), re.sub(r"\s+", "", str(row.get("통계표명") or "")), row.get("수록기간"))
         if name and name in seen_names:
             continue
         if name:
@@ -8888,6 +8910,7 @@ def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "indicator_evidence": candidate.get("indicator_evidence"),
         "measure_items": candidate.get("measure_items"),
         "measure_compatibility": candidate.get("measure_compatibility"),
+        "measure_role_evidence": candidate.get("measure_role_evidence"),
         "population_compatibility": candidate.get("population_compatibility"),
         "survey_name": candidate.get("survey_name"),
         "axis_summary": candidate.get("axis_summary"),
@@ -11147,6 +11170,7 @@ async def select_table_for_query(
     limit: int = 8,
     verbose: bool = False,
     api_key: Optional[str] = None,
+    required_breakdowns: Optional[list[str]] = None,
 ) -> dict:
     """[🧭] 자연어 질문에 맞는 KOSIS 통계표 후보를 메타데이터 기반으로 고른다.
 
@@ -11162,6 +11186,9 @@ async def select_table_for_query(
     실제로 나눠 볼 수 있는 것을 그대로 말한다. 그래서 **항목 증거가 축 이름 증거보다
     위**다 — required_items가 통과시킨 표는 required_dimensions가 놓쳐도 버리지 않는다.
     추가 KOSIS 조회는 없다(후보 메타에 이미 항목 라벨이 실려 있다).
+    required_breakdowns는 고정된 모집단 조건과 별개인 명시적 분해 요구다.
+    각 역할을 서로 다른 가변 분류축으로 충족해야 하며, required_items나
+    표명/항목 안의 '지역별' 같은 주변분포 라벨로 대체할 수 없다.
     """
     inferred_dimensions = _infer_required_dimensions_from_query(query) if infer_dimensions else []
     required = _normalize_required_dimensions([
@@ -11242,6 +11269,8 @@ async def select_table_for_query(
                 continue  # Spaced components such as '사업체 수' are one measure.
             measurement = measure_of(term)
             term = term.replace(measurement, "", 1) if measurement else term
+            if term.endswith("별") and any(_axis_matches_dimension(term, dim) for dim in required):
+                continue  # Presentation roles are not population conditions.
             if len(term) >= 2 and not re.search(r"\d", term):
                 population_terms.append(term)
     scorer = MetadataCompatibilityScorer(
@@ -11251,6 +11280,7 @@ async def select_table_for_query(
         required_items=required_items,
         measure_request=explicit_indicator or query_text,
         population_terms=list(dict.fromkeys(population_terms)),
+        required_breakdowns=required_breakdowns,
     )
     # 후보 메타데이터는 후보별로 순차 조회하면 KOSIS 왕복이 그대로 쌓인다(실측: 콜드 캐시에서 한 질문 40~56초).
     # 후보끼리는 서로 독립이므로 동시에 받아 온다. 동시 실행 수는 KOSIS 쪽 부담을 고려해 제한한다.
@@ -11297,6 +11327,7 @@ async def select_table_for_query(
                     _fetch_meta(client, key, org_id, tbl_id, "PRD"),
                     _fetch_survey_rows(client, key, org_id, tbl_id),
                 )
+                definition = await _fetch_annotation_measure(client, key, org_id, tbl_id, item_rows)
             except Exception as exc:  # 개별 표의 메타 실패는 다른 후보 평가를 막지 않는다
                 return {
                     "org_id": org_id,
@@ -11315,6 +11346,7 @@ async def select_table_for_query(
             item_rows=item_rows,
             period_rows=period_rows,
             source_rows=source_rows,
+            measure_definition=definition,
         )
         return scorer.evaluate(profile).to_response()
 
@@ -11870,6 +11902,7 @@ async def _query_table_core(
             }
 
         axes, axis_order = _build_axis_codebook(item_rows)
+        definition = await _fetch_annotation_measure(client, key, org_id, tbl_id, item_rows)
         normalized_filters, errors, auto_defaults = _validate_query_table_filters(filters, axes, axis_order)
         metadata_source = {
             "org_id": org_id,
@@ -12239,6 +12272,7 @@ async def _query_table_core(
         "table_name_en": table_name_eng,
         "survey_name": (source_rows[0].get("JOSA_NM") or source_rows[0].get("josaNm"))
         if source_rows and isinstance(source_rows[0], dict) else None,
+        "measure_role_evidence": definition,
         "filters_used": normalized_filters,
         "auto_default_filters": auto_defaults,
         "period_range": effective_period_range,
@@ -12360,6 +12394,7 @@ async def query_table(
         include_raw=include_raw,
         api_key=api_key,
     )
+    apply_annotation_measure(result, result.get("measure_role_evidence"))
     return attach_stat_evidence(result, tool="query_table")
 
 

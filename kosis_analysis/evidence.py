@@ -371,6 +371,7 @@ def build_stat_evidence(
         "actual_measure": actual_measure,
         "actual_measure_evidence": actual_measure_evidence,
         "measure_definition": payload.get("measure_definition"),
+        "measure_role_evidence": payload.get("measure_role_evidence"),
         "measure_basis": _first_present(payload, "measure_basis", "측정_기준"),
         "survey_name": payload.get("survey_name"),
         "data_nature": payload.get("data_nature"),

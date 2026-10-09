@@ -234,7 +234,7 @@ def _indicator_evidence(
     return score, evidence
 
 
-def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, Any]], request: Optional[str]) -> dict:
+def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, Any]], request: Optional[str], definition: Optional[dict] = None) -> dict:
     """Keep known measure alternatives separate from unknown ITEM/classification labels.
 
     This does not prove population coverage or authorize executing a proxy as an exact value.
@@ -246,6 +246,8 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
                 for code, meta in items.items() if measure_of(meta.get("label"))]
     unknown = [str(meta.get("label")) for meta in items.values()
                if meta.get("label") and not measure_of(meta.get("label"))]
+    if not evidence and definition:
+        evidence.append({**definition, "unit": definition["units"][0]})
     # Title-only evidence is explicitly weaker and never replaces contradictory complete ITEM evidence.
     if not evidence or unknown:
         for part in re.split(r"\s+(?:및|와|과)\s+|[·,/]", table_name or ""):
@@ -261,7 +263,7 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
         relation = "exact"
     elif "proxy" in relations:
         relation = "proxy"
-    elif asked and measures and not unknown:
+    elif asked and measures and (not unknown or definition):
         relation = "incompatible"
     return {"asked_measure": asked, "relation": relation, "evidence": evidence, "unknown_items": unknown}
 
@@ -327,6 +329,7 @@ class TableMetadataProfile:
     candidate_source: Any = None
     search_term: Any = None
     survey_name: Optional[str] = None
+    measure_definition: Optional[dict] = None
 
     @classmethod
     def from_rows(
@@ -338,6 +341,7 @@ class TableMetadataProfile:
         item_rows: list[dict[str, Any]] | Any,
         period_rows: list[dict[str, Any]] | Any,
         source_rows: list[dict[str, Any]] | Any = None,
+        measure_definition: Optional[dict] = None,
     ) -> "TableMetadataProfile":
         axes, axis_order = _build_axis_codebook(item_rows if isinstance(item_rows, list) else [])
         table_name = None
@@ -356,6 +360,7 @@ class TableMetadataProfile:
             search_term=candidate_row.get("search_term"),
             survey_name=(source_rows[0].get("JOSA_NM") or source_rows[0].get("josaNm"))
             if isinstance(source_rows, list) and source_rows and isinstance(source_rows[0], dict) else None,
+            measure_definition=measure_definition,
         )
 
     def dimension_coverage(
@@ -423,7 +428,8 @@ class TableMetadataProfile:
             named_country_axis = any(word in name for word in ("국가", "country", "nation"))
             if not (has_home or named_country_axis) or len(labels) < 2:
                 continue
-            trade = any(word in name for word in ("교역", "상대국", "수출국", "수입국", "대상국"))
+            trade = any(word in name for word in ("교역", "상대국", "수출국", "수입국", "대상국")) or (
+                named_country_axis and measure_of(self.table_name or "") in {"수출액", "수입액"})
             evidence.append({"OBJ_ID": obj_id, "OBJ_NM": axis.get("OBJ_NM"),
                              "role": "trade_partner" if trade else "country_comparison", "labels": labels})
         kind = "country_comparison" if any(row["role"] == "country_comparison" for row in evidence) else "trade_partner" if evidence else "unknown"
@@ -448,7 +454,7 @@ class TableMetadataProfile:
                 if meta.get("unit"):
                     unit_count += 1
         return {
-            "sources_used": ["TBL", "ITM", "PRD"],
+            "sources_used": ["TBL", "ITM", "PRD", *(["CMMT", "UNIT"] if self.measure_definition else [])],
             "axis_count": len(self.axes),
             "item_count": item_count,
             "unit_item_count": unit_count,
@@ -495,6 +501,7 @@ class MetadataCompatibilityResult:
             "axis_evidence": self.axis_evidence,
             "indicator_evidence": self.indicator_evidence,
             "measure_compatibility": self.measure_compatibility,
+            "measure_role_evidence": self.profile.measure_definition,
             "population_compatibility": self.population_compatibility,
             "geographic_scope": self.profile.geographic_scope(),
             # Preserve actual measure alternatives. A multi-measure title's last noun is
@@ -544,8 +551,11 @@ class MetadataCompatibilityScorer:
         required_items: Optional[list[str]] = None,
         measure_request: Optional[str] = None,
         population_terms: Optional[list[str]] = None,
+        required_breakdowns: Optional[list[str]] = None,
     ) -> None:
         self.required_dimensions = _normalize_required_dimensions(required_dimensions)
+        self.required_breakdowns = _normalize_required_dimensions(required_breakdowns or [])
+        self.required_dimensions = list(dict.fromkeys(self.required_dimensions + self.required_breakdowns))
         self.indicator = indicator
         self.measure_request = measure_request or indicator
         self.population_terms = population_terms or []
@@ -556,11 +566,32 @@ class MetadataCompatibilityScorer:
     def evaluate(self, profile: TableMetadataProfile) -> MetadataCompatibilityResult:
         matched, missing, axis_evidence = profile.dimension_coverage(self.required_dimensions)
         indicator_score, indicator_hits = profile.indicator_evidence(self.indicator)
-        measurement = _measure_compatibility(profile.table_name, profile.axes, self.measure_request)
+        measurement = _measure_compatibility(profile.table_name, profile.axes, self.measure_request, profile.measure_definition)
         if measurement["relation"] in {"exact", "proxy"}:
             indicator_score = max(indicator_score, 3)
             indicator_hits += [f'measure:{entry["source"]}:{entry["name"]}' for entry in measurement["evidence"]]
-        for dim in list(missing):
+        # A joint breakdown requires independent variable axes. Fixed names and
+        # marginal categories cannot create a region x industry cross product.
+        # Legacy dimensions also describe fixed scope (e.g. age-specific rates).
+        # Only the additive breakdown contract requests independently varying axes.
+        strict = self.required_breakdowns
+        variable = [dim for dim in strict if dim != "time"]
+        def assign(remaining: list[str], used: set[str]) -> bool:
+            if not remaining:
+                return True
+            return any(assign(remaining[1:], used | {axis_id})
+                       for axis_id, axis in profile.axes.items()
+                       if axis_id != "ITEM" and axis_id not in used
+                       and len(axis.get("items") or {}) > 1
+                       and _axis_matches_dimension(str(axis.get("OBJ_NM") or ""), remaining[0]))
+        if not assign(variable, set()):
+            for dim in variable:
+                if dim in matched:
+                    matched.remove(dim)
+                if dim not in missing:
+                    missing.append(dim)
+                axis_evidence.pop(dim, None)
+        for dim in [dim for dim in missing if dim not in strict]:
             embedded = profile.embedded_dimension_evidence(dim, self.indicator)
             if not embedded or indicator_score <= 0:
                 continue
@@ -588,7 +619,7 @@ class MetadataCompatibilityScorer:
         elif missing_items:
             # 물은 항목을 나눠 볼 수 없는 표다. 축 이름이 맞아도 값을 낼 수 없다.
             status = "rejected_missing_items"
-        elif missing and self.reject_if_missing_dimensions and not matched_items:
+        elif missing and self.reject_if_missing_dimensions and (any(dim in strict for dim in missing) or not matched_items):
             # **항목 증거가 있으면 축 이름 미매칭으로 버리지 않는다.**
             # 탈락은 점수가 아니라 status 가 정하므로 여기서 함께 봐야 한다 —
             # 점수식만 고치면 이 한 줄이 그대로 떨어뜨린다(스펙 12.5).
