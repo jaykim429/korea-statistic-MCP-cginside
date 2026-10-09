@@ -192,6 +192,9 @@ def _normalize_requested_concepts(
 def _execution_status(payload: dict[str, Any], observations: list[dict[str, Any]]) -> str:
     status = str(_first_present(payload, "execution_status", "status", "상태") or "").lower()
     capability = str(payload.get("capability_state") or "").lower()
+    fanout = payload.get("fanout") or {}
+    if not any(_present(row.get("value")) for row in observations) and isinstance(fanout, dict) and fanout.get("failed_calls"):
+        return "failed"  # An unsuccessful provider call cannot prove data absence.
     if status in {"failed", "unsupported", "invalid_input", "error"}:
         return "failed"
     if status in {"no_data", "empty"} or capability == "no_data":
@@ -225,7 +228,10 @@ def _failure(payload: dict[str, Any], execution_status: str) -> tuple[Optional[s
     code = str(_first_present(payload, "code", "코드") or "").upper()
     message = str(_first_present(payload, "error", "오류") or "").lower()
     markers = _markers(payload)
-    combined = " ".join((code.lower(), message, " ".join(markers)))
+    fanout = payload.get("fanout") or {}
+    failures = [str(detail.get("error") or "").lower() for detail in fanout.get("call_details", [])
+                if isinstance(detail, dict) and detail.get("status") == "failed"] if isinstance(fanout, dict) else []
+    combined = " ".join((code.lower(), message, " ".join(markers), *failures))
     if any(token in combined for token in ("timeout", "runtime_error", "network", "rate_limit", "connection")):
         return "infrastructure", True
     if "period" in combined and any(token in combined for token in ("not_found", "unavailable", "invalid")):

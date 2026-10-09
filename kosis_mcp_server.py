@@ -11238,6 +11238,8 @@ async def select_table_for_query(
         for term in _query_tokens_for_matching(query_text):
             if _compact_text(term) == _compact_text(explicit_indicator or effective_indicator or ""):
                 continue  # The metric's own name is not a population condition.
+            if _compact_text(term) in _compact_text(measure_of(query_text) or ""):
+                continue  # Spaced components such as '사업체 수' are one measure.
             measurement = measure_of(term)
             term = term.replace(measurement, "", 1) if measurement else term
             if len(term) >= 2 and not re.search(r"\d", term):
@@ -11270,7 +11272,12 @@ async def select_table_for_query(
             name = str(row.get("통계표명") or "")
             return (len(indicator_terms) + 1 if row.get("candidate_basis") == "verified_curation_table" else 0) + sum(1 for t in indicator_terms if _query_token_matches_text(t, name))
 
-        unique_rows.sort(key=lambda row: -_name_hits(row))
+        # A normalized generic ITEM cannot squeeze the original population out
+        # of the bounded metadata inspection. This is discovery, not scope proof.
+        unique_rows.sort(key=lambda row: (
+            -sum(_query_token_matches_text(term, str(row.get("통계표명") or "")) for term in population_terms),
+            -_name_hits(row),
+        ))
     # 반환은 limit 개다. 그보다 크게 잡아도 순위만 흔들릴 뿐 호출량(분당 한도)만 먹는다.
     # limit 개만 반환하지만 상위 몇 개는 메타 검증에서 탈락하므로 여유를 둔다. 8로 줄였더니 후보 회수율이 떨어졌다(실측 "원자력 발전량").
     meta_budget = max(limit + 4, 12)

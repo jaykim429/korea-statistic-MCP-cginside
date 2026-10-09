@@ -247,6 +247,27 @@ def test_no_rows_is_nonretryable_no_data():
     assert envelope["fulfillment"]["missing_concepts"] == ["ITEM:T001"]
 
 
+def test_empty_fanout_timeout_is_failure_not_nonretryable_absence():
+    envelope = build_stat_evidence({"status": "no_data", "rows": [],
+        "fanout": {"failed_calls": 1, "call_details": [{"status": "failed", "error": "timeout"}]}}, tool="query_table")
+    assert envelope["execution"] == {"status": "failed", "code": None, "failure_class": "infrastructure", "retryable": True}
+
+
+def test_empty_fanout_unknown_failure_is_not_proved_no_rows():
+    envelope = build_stat_evidence({"status": "no_data", "rows": [],
+        "fanout": {"failed_calls": 1, "call_details": [{"status": "failed", "error": "provider response unrecognized"}]}}, tool="query_table")
+    assert envelope["execution"]["status"] == "failed"
+    assert envelope["execution"]["failure_class"] != "no_rows"
+
+
+def test_failed_other_filter_does_not_erase_observed_zero():
+    envelope = build_stat_evidence({"status": "executed", "org_id": "101", "tbl_id": "PARTIAL",
+        "rows": [{"value": 0, "unit": "개", "period": "2024"}],
+        "fanout": {"failed_calls": 1, "call_details": [{"status": "failed", "error": "timeout"}]}}, tool="query_table")
+    assert envelope["execution"]["status"] == "executed"
+    assert envelope["evidence"]["observations"][0]["value"] == 0
+
+
 def test_query_rows_become_observations_and_verified_concept_bindings():
     payload = {
         "status": "executed",
