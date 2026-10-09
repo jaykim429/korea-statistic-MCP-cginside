@@ -68,7 +68,7 @@ from kosis_analysis.metadata import (
     _suggest_axis_codes,
     _validate_query_table_filters,
 )
-from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation
+from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible
 from kosis_analysis.text_match import (
     _content_search_query,
     _match_quality_rank,
@@ -9043,6 +9043,16 @@ async def _normalize_indicator_from_kosis_meta(
             for item in item_rows:
                 label = item.get("ITM_NM") or item.get("label")
                 label_en = item.get("ITM_NM_ENG") or item.get("label_en")
+                # Lexical normalization may not replace a recognized measurement
+                # with another measure, a disclosed proxy, a classification label,
+                # or a different denominator. Reuse the execution identity rules.
+                if measure_of(raw) and (
+                    item.get("OBJ_ID") != "ITEM"
+                    or not measure_basis_compatible(raw, str(label or ""))
+                    or measure_relation(measure_of(raw), measure_of(label),
+                                        (str(item["UNIT_NM"]),) if item.get("UNIT_NM") else ()) != "exact"
+                ):
+                    continue
                 scored = [
                     ("ITM_NM", label, max(
                         _indicator_meta_match_score(raw, label, "ITM_NM"),
