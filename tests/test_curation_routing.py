@@ -11,6 +11,18 @@ import kosis_curation as c
 router = c.DEFAULT_ROUTER
 
 
+@pytest.mark.parametrize("scope,code", [("병원", "861"), ("의원", "862")])
+def test_healthcare_sales_use_a_verified_industry_scope_not_an_all_medical_alias(scope, code):
+    key = router.match_direct_stat_key(f"2023년 {scope} 매출액 알려줘")
+    assert key == f"{scope}_매출액"
+    param = c.TIER_A_STATS[key]
+    assert (param.org_id, param.tbl_id, param.item_id, param.obj_l1, param.obj_l2, param.unit) == ("101", "DT_3KB9001", "T03", "00", code, "백만원")
+    # Routing proposes a source. The existing executed-value scope gate owns refusal.
+    from kosis_analysis.quick import _quick_stat_unsupported_dimensions
+    assert "gender" in _quick_stat_unsupported_dimensions(f"여성 {scope} 매출액", param)
+    assert router.match_direct_stat_key("의료기관 매출액") not in {"병원_매출액", "의원_매출액"}
+
+
 def test_microbusiness_workers_use_the_actual_survey_item_not_disabled_businesses():
     key = router.match_direct_stat_key("소상공인 종사자 수 알려줘")
     assert key == "소상공인_종사자수"

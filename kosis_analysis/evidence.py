@@ -139,7 +139,7 @@ def _source(payload: dict[str, Any], tool: str) -> dict[str, Any]:
     url = _first_present(payload, "source_url", "출처_URL")
     if not url and label and "KOSIS" in str(label).upper():
         url = "https://kosis.kr"
-    return {"label": label, "url": url}
+    return {"label": label, "url": url, "native_identity": payload.get("source_identity")}
 
 
 def _concept_key(dimension: Any, code: Any) -> str:
@@ -268,9 +268,13 @@ def _missing_evidence_fields(
             missing.append("unit")
     if not _present(source.get("label")):
         missing.append("source")
-    if not _present(table.get("org_id")):
+    from kosis_analysis.primary_series import valid_native_identity
+    native_source = valid_native_identity(source.get("native_identity"))
+    if source.get("native_identity") and not native_source:
+        missing.append("source.native_identity")
+    if not _present(table.get("org_id")) and not native_source:
         missing.append("table.org_id")
-    if not _present(table.get("table_id")):
+    if not _present(table.get("table_id")) and not native_source:
         missing.append("table.table_id")
     return missing
 

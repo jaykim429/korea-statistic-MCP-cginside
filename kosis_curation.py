@@ -1319,6 +1319,22 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         verification_status="verified",
     ),
 
+    # Generic table titles need verified item + industry scope, not title aliases.
+    # KOSIS live ITEM/SGG/IND_11 metadata and 2023 observations checked 2026-10-09.
+    "병원_매출액": QuickStatParam(
+        org_id="101", tbl_id="DT_3KB9001", tbl_nm="시도/산업별 총괄",
+        description="병원 매출액", obj_l1="00", obj_l2="861", item_id="T03", unit="백만원",
+        region_scheme={"전국": "00"}, supported_periods=("Y",), verification_status="verified",
+        verified_at="2026-10-09", measure_basis="서비스업조사 산업분류 861(병원). 의원·기타 보건업을 포함한 의료기관 전체와 다릅니다.",
+        note="SGG=00, IND_11=861, ITEM=T03. 매출액의 공식 합계이며 평균이나 의료기관 전체값이 아님.",
+    ),
+    "의원_매출액": QuickStatParam(
+        org_id="101", tbl_id="DT_3KB9001", tbl_nm="시도/산업별 총괄",
+        description="의원 매출액", obj_l1="00", obj_l2="862", item_id="T03", unit="백만원",
+        region_scheme={"전국": "00"}, supported_periods=("Y",), verification_status="verified",
+        verified_at="2026-10-09", measure_basis="서비스업조사 산업분류 862(의원). 병원·기타 보건업을 포함한 의료기관 전체와 다릅니다.",
+        note="SGG=00, IND_11=862, ITEM=T03. 매출액의 공식 합계이며 평균이나 의료기관 전체값이 아님.",
+    ),
     # 국토위 — 주택보급률 (DT_1YL13401E)
     "주택보급률": QuickStatParam(
         org_id="101", tbl_id="DT_1YL13401E",
@@ -1418,6 +1434,8 @@ del _industry, _industry_code, _scale_label, _scale_code, _metric, _tbl, _itm, _
 # ============================================================================
 
 SYNONYMS: dict[str, str] = {
+    "병원 매출액": "병원_매출액",
+    "의원 매출액": "의원_매출액",
     # 대기오염도·가계대출은 표·항목·단위까지 확정돼 있는데 부르는 말이 없어 어휘 검색으로 떨어졌다.
     # 실측 S40: "초미세먼지 농도 알려줘" 가 '농도' 한 단어만 걸려 '요중 납 농도'를 후보로 냈다.
     # '초미세먼지'가 '미세먼지'를 포함하므로 구체어 우선 규칙이 둘을 옳게 가른다.

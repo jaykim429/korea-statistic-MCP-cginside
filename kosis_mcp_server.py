@@ -52,6 +52,7 @@ from kosis_analysis.client import (
     _resolve_key,
 )
 from kosis_analysis.evidence import attach_stat_evidence, kosis_row_dimensions
+from kosis_analysis.primary_series import query_primary_series
 from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure
 from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
@@ -7834,6 +7835,9 @@ async def answer_query(
     start_year/end_year가 있으면 최신 단일값 shortcut 대신 명시 기간 시계열을 반환한다.
     verbose=False를 지정하면 data/metadata/notes 중심의 슬림 응답을 반환한다.
     """
+    primary = await query_primary_series(query, region, start_year, end_year)
+    if primary is not None:
+        return _finalize_answer_query_response(primary, query=query, region=region, verbose=verbose)
     try:
         key = _resolve_key(api_key)
     except RuntimeError as exc:
