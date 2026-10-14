@@ -1,10 +1,11 @@
 {
   "profile": "gemma_default",
-  "version": "1.0",
+  "version": "1.1",
   "compatible_with": ">=0.6.0",
   "description": "Recommended KOSIS MCP tool exposure for Gemma chatbot integrations. Prefer transparent data/materials over forced final-answer control.",
   "expose": [
     "answer_query",
+    "explain_statistic",
     "list_supported_statistics",
     "browse_kosis_catalog",
     "browse_topic",
@@ -45,6 +46,7 @@
   ],
   "entrypoint": "answer_query_or_plan_query",
   "rules": [
+    "Discover explain_statistic in tools/list before use. Use it for pure survey-methodology or index-base questions; preserve role=methodology, actual_query_supported=false, official fields and all applicability warnings. Design information is not realized sampling error or evidence of a requested vintage.",
     "Use answer_query for simple natural-language lookups; use plan_query for composite, multi-metric, ambiguous, or high-stakes statistical questions.",
     "Use list_supported_statistics for chatbot discovery. Use browse_kosis_catalog only for explicit KOSIS-wide candidate search; use stat_detail for mapping details and quick_stat for the actual value. Catalog or mapping details alone never prove query success.",
     "Do not present plan_query output as a final answer.",

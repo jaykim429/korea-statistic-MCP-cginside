@@ -19,6 +19,7 @@ Design choices (kept intentionally narrow):
 from __future__ import annotations
 
 import re
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
@@ -31,22 +32,30 @@ def _to_number(value: Any) -> Optional[float]:
     if not text or text in {"-", ".", "..", "...", "NA", "N/A"}:
         return None
     try:
-        return float(text)
+        number = float(text)
+        return number if math.isfinite(number) else None
     except ValueError:
         return None
 
 
-_YEAR_PREFIX_RE = re.compile(r"^(\d{4})")
+def period_index(period: Any, cadence: Optional[str] = None) -> Optional[tuple[int, int]]:
+    """Calendar coordinate and periods/year; six-digit periods require cadence."""
+    text = str(period or "")
+    if (cadence in (None, "Y")) and re.fullmatch(r"\d{4}", text):
+        return int(text), 1
+    match = re.fullmatch(r"(\d{4})(\d{2})" if cadence == "M" else r"(\d{4})(?:Q|0)?([1-4])", text, re.I)
+    if not match or cadence not in {"M", "Q"} or cadence == "M" and "Q" in text.upper():
+        return None
+    year, part = int(match[1]), int(match[2])
+    count = 12 if cadence == "M" else 4
+    return (year * count + part - 1, count) if 1 <= part <= count else None
 
 
-def _year_of_period(period: Any) -> Optional[int]:
-    match = _YEAR_PREFIX_RE.match(str(period or ""))
-    if not match:
+def elapsed_years(start: Any, end: Any, cadence: Optional[str] = None) -> Optional[float]:
+    a, b = period_index(start, cadence), period_index(end, cadence)
+    if not a or not b or a[1] != b[1] or b[0] <= a[0]:
         return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
+    return (b[0] - a[0]) / a[1]
 
 
 def _yoy_lag_key(period: Any) -> Optional[str]:
@@ -295,10 +304,16 @@ class _PairOverPeriodOperation(IndicatorOperation):
         rows: list[dict[str, Any]],
         group_by: Optional[Sequence[str]],
     ) -> dict[tuple[str, ...], list[dict[str, Any]]]:
-        axes = list(group_by) if group_by else _normalize_match_keys(rows, None)
+        axes = list(group_by) if group_by else sorted({axis for row in rows for axis in _non_item_axes(row)})
+        # Time arithmetic cannot join different ITEMs, units, sources or tables.
+        if any("ITEM" in _row_dimensions(row) for row in rows) and "ITEM" not in axes:
+            axes.append("ITEM")
         groups: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
-            key = _dimension_codes(row, axes) if axes else ()
+            key = tuple(str((_row_dimensions(row).get(axis) or {}).get("code")
+                            or (_row_dimensions(row).get(axis) or {}).get("label") or "") for axis in axes)
+            profile = _profile_rows([row])
+            key += (str(_row_unit(row) or ""), str(_row_source_system(row) or ""), "|".join(profile["table_ids"]))
             groups[key].append(row)
         return groups
 
@@ -319,6 +334,9 @@ class GrowthRate(_PairOverPeriodOperation):
         outcome = ComputationOutcome(status="ok")
         for key, group_rows in self._groups(rows, group_by).items():
             ordered = sorted(group_rows, key=lambda r: str(r.get("period") or ""))
+            if len({str(row.get("period")) for row in ordered}) != len(ordered):
+                outcome.unmatched.append({"reason": "duplicate_period", "group_codes": list(key)})
+                continue
             if len(ordered) < 2:
                 outcome.unmatched.append({
                     "reason": "insufficient_periods",
@@ -395,6 +413,7 @@ class Cagr(_PairOverPeriodOperation):
         *,
         group_by: Optional[Sequence[str]] = None,
         decimals: int = 4,
+        cadence: Optional[str] = None,
         **_: Any,
     ) -> ComputationOutcome:
         outcome = ComputationOutcome(status="ok")
@@ -406,19 +425,23 @@ class Cagr(_PairOverPeriodOperation):
             start_row, end_row = ordered[0], ordered[-1]
             start_v = _to_number(start_row.get("value"))
             end_v = _to_number(end_row.get("value"))
-            start_year = _year_of_period(start_row.get("period"))
-            end_year = _year_of_period(end_row.get("period"))
+            years = elapsed_years(start_row.get("period"), end_row.get("period"), cadence)
             if start_v is None or end_v is None:
                 outcome.unmatched.append({"reason": "non_numeric_value", "group_codes": list(key)})
                 continue
-            if start_year is None or end_year is None or end_year == start_year:
+            if years is None or len({str(row.get("period")) for row in ordered}) != len(ordered):
                 outcome.unmatched.append({"reason": "indeterminate_year_span", "group_codes": list(key)})
                 continue
             if start_v <= 0 or end_v <= 0:
                 outcome.unmatched.append({"reason": "non_positive_value", "group_codes": list(key)})
                 continue
-            years = end_year - start_year
-            value = ((end_v / start_v) ** (1.0 / years) - 1.0) * 100
+            try:
+                value = ((end_v / start_v) ** (1.0 / years) - 1.0) * 100
+            except OverflowError:
+                value = float("inf")
+            if not math.isfinite(value):
+                outcome.unmatched.append({"reason": "non_finite_result", "group_codes": list(key)})
+                continue
             outcome.results.append(IndicatorResult(
                 value=_round(value, decimals),
                 period=str(end_row.get("period") or ""),
@@ -431,6 +454,7 @@ class Cagr(_PairOverPeriodOperation):
                     "start_period": str(start_row.get("period") or ""),
                     "end_period": str(end_row.get("period") or ""),
                     "years": years,
+                    "annualization_basis": "calendar_elapsed",
                 },
             ))
         outcome.status = _final_status(outcome)
@@ -450,6 +474,9 @@ class _YearOverYear(_PairOverPeriodOperation):
     ) -> ComputationOutcome:
         outcome = ComputationOutcome(status="ok")
         for key, group_rows in self._groups(rows, group_by).items():
+            if len({str(row.get("period")) for row in group_rows}) != len(group_rows):
+                outcome.unmatched.append({"reason": "duplicate_period", "group_codes": list(key)})
+                continue
             by_period: dict[str, dict[str, Any]] = {}
             for row in group_rows:
                 period = str(row.get("period") or "")

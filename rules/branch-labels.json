@@ -1,0 +1,9 @@
+{
+  "dimensions": [
+    {"dimension":"region","pattern":"^(?:군[·・/]*구|시[·・/]*군[·・/]*구|지역|행정구역)(?:별|구분)?$","memberKinds":["city","county","district"],"grain":"municipality"},
+    {"dimension":"gender","pattern":"^(?:대표자)?성별$"},
+    {"dimension":"age","pattern":"^(?:대표자)?연령(?:대|계층)?별$"},
+    {"dimension":"industry","pattern":"^(?:산업|업종)(?:(?:대|중|소|세세|세)분류)?별$"},
+    {"dimension":"size","pattern":"^(?:기업|종사자|매출액)?규모별$"}
+  ]
+}

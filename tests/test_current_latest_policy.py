@@ -71,7 +71,7 @@ def test_temporal_grouping_queries_the_requested_cadence(monkeypatch, group, cad
 
     async def fetch(*args, **kwargs):
         calls.append(kwargs)
-        return [{"PRD_DE": "2025" if cadence == "Y" else "202501", "DT": "123"}]
+        return [{"PRD_DE": "2025" if cadence == "Y" else "202501", "DT": "123", "UNIT_NM": "건"}]
 
     monkeypatch.setattr(server, "_fetch_series", fetch)
     query = f"혼인 건수 최근 {group} 추이"

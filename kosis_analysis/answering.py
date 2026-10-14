@@ -41,6 +41,24 @@ class AnswerPlan:
     direct_key: Optional[str] = None
     params: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def supported_dimensions(self) -> tuple[str, ...]:
+        # A selected regional comparison is not a scalar lookup. This does not
+        # authorize any additional population/age/sex/measurement dimension.
+        return ('comparison',) if self.action in {'region_compare', 'top_n'} else ()
+
+    @property
+    def execution_terms(self) -> tuple[str, ...]:
+        if self.action not in {'region_compare', 'top_n'}:
+            return ()
+        terms = ('시도', '지역', '17개시도', '지역순위', '비교', '비교해줘', '비교해주세요', '비교해', '비교해봐')
+        if self.action == 'top_n':
+            count = self.params.get('top_n')
+            terms += ('상위', '하위', '가장', '높은', '낮은', '많은', '적은', '순위')
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                terms += (str(count)+'개', str(count)+'곳')
+        return terms
+
 
 class AnswerPlanner:
     """Turn a routed natural-language query into one executable action."""

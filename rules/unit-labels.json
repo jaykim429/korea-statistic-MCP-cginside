@@ -1,0 +1,29 @@
+{
+  "percentPattern": "%|퍼센트|백분율",
+  "numeratorPattern": "원|달러|USD|KRW|엔|유로|개|명|건|가구|개소",
+  "alternativeSeparatorPattern": "[\\s,]+",
+  "alternativeForbiddenPattern": "[/()\\[\\]=]",
+  "alternativeUnitPattern": "^(?:%p?|퍼센트|백분율|(?:천|만|백만|억|십억|100만)?(?:원|달러|USD|KRW|엔|유로|개|명|건|가구|호|개소|대))$",
+  "countUnitPattern": "^(?:천|만|백만|억)?(?:명|건|개|호|가구|개소|대)$",
+  "indexBasePattern": "^\\d{4}\\s*[=＝]\\s*100$",
+  "unitSuffixPattern": "[（(]([^（）()]+)[）)]\\s*$",
+  "perPopulationPattern": "^인구\\s*((?:천|만|10만|십만|백만|100만))\\s*명당\\s*\\S",
+  "cases": [
+    {"source": "백만원 %p", "unit": "백만원", "ambiguous": true, "alternative": true},
+    {"source": "백만원, %p", "unit": "백만원", "ambiguous": true, "alternative": true},
+    {"source": "백만원 %p", "unit": "%p", "ambiguous": true, "alternative": true},
+    {"source": "백만원 %p", "unit": "원", "ambiguous": true, "alternative": false},
+    {"source": "USD/%", "unit": "USD", "ambiguous": true, "alternative": false},
+    {"source": "원/명", "unit": "원", "ambiguous": false, "alternative": false},
+    {"source": "백만원 (%p)", "unit": "백만원", "ambiguous": true, "alternative": false},
+    {"source": "백만원 임의표기 %", "unit": "백만원", "ambiguous": true, "alternative": false},
+    {"source": "명 %", "unit": "명", "ambiguous": true, "alternative": true},
+    {"source": "%p", "unit": "%p", "ambiguous": false, "alternative": false},
+    {"source": "백만원", "unit": "백만원", "ambiguous": false, "alternative": false},
+    {"source": "2020=100", "unit": "지수", "ambiguous": false, "alternative": false},
+    {"source": "명 건", "unit": "명", "ambiguous": true, "alternative": true},
+    {"source": "명 가임여자 1명당 명", "unit": "명", "ambiguous": false, "alternative": false},
+    {"source": "천명당 건", "unit": "건", "ambiguous": false, "alternative": false},
+    {"source": "명 건", "unit": "‰", "ambiguous": true, "alternative": false}
+  ]
+}

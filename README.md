@@ -19,6 +19,8 @@ KOSIS 국가통계와 NABOSTATS(국회예산정책처 재정경제통계시스�
 
 - **가장 권장하는 사용 방식은요?**
   `plan_query`로 먼저 질문을 분석한 뒤, `select_table_for_query` → `resolve_concepts` → `query_table` → 필요 시 `compute_indicator` 순서로 진행합니다.
+  표본 규모/설계·조사 방법·지수 기준년 같은 순수 방법론 질문은 `explain_statistic`으로 공식 조사 설명을 확인합니다.
+  도구 제공 여부는 `tools/list`에서 확인하며 설명자료는 관측값 실행 성공으로 세지 않습니다.
 
 ## 주요 기능
 
@@ -45,6 +47,11 @@ KOSIS 국가통계와 NABOSTATS(국회예산정책처 재정경제통계시스�
   (`stat-evidence/v1`)를 반환합니다. 호출 성공 여부, 정확/부분 충족 여부, 값·단위·기간·출처·표,
   요청/해결/누락 개념, 실제 측정항목을 한 계약에서 확인할 수 있습니다. 자세한 사용 규칙은
   [챗봇 통합 가이드](docs/chatbot_integration.md#statevidenceenvelope-v1)를 참고하세요.
+
+- 공식 조사 설명과 관측값을 분리합니다.
+  `explain_statistic`은 `stat-methodology/v1`의 공식 필드·출처·미확인 항목·경고를 반환합니다.
+  `role=methodology`, `actual_query_supported=false`이며 표본 설계/목표 오차를 실현 표본오차로, 현재 설명을 특정 과거 연도 적용의 증명으로 바꾸지 않습니다.
+  자세한 호출·후속 규칙과 미완료 범위는 [공식 조사 설명 통합 안내](docs/chatbot_integration.md#공식-조사-설명은-관측값과-다른-역할입니다)를 참고하세요.
 
 ## 지원 현황
 

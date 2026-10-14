@@ -10,7 +10,7 @@ import re
 from typing import Any, Optional
 
 from kosis_analysis.metadata import _compact_text
-from kosis_analysis.rules import measure_discovery_aliases
+from kosis_analysis.rules import measure_discovery_aliases, discovery_measure_of
 
 
 _QUERY_STOP_TERMS = {
@@ -85,6 +85,27 @@ def _query_tokens_for_matching(query: Any) -> list[str]:
             continue
         cleaned.append(norm)
     return list(dict.fromkeys(cleaned))
+
+
+def _discovery_subject_terms(query: Any, indicator: Any = None) -> list[str]:
+    """Retain open-set subjects separately from lexical measure/axis/time roles.
+
+    These hints only rank discovery; they never discharge executed qualifiers.
+    The original question, not a shortened indicator, owns measurement identity.
+    """
+    measure = discovery_measure_of(query) or discovery_measure_of(indicator) or ""
+    aliases = measure_discovery_aliases(measure)
+    subjects = []
+    for term in _query_tokens_for_matching(query):
+        if term in aliases or term in measure:
+            continue
+        if re.fullmatch(r".+별(?:로|은|는|을|를)?|(?:19|20)\d{2}년?|\d{1,2}월|[1-4]분기", term):
+            continue
+        if measure and term.endswith(measure):
+            term = term[:-len(measure)]
+        if term and term not in ("합계", "총", "전국", "연간", "월간", "분기", "기간", "부터", "까지"):
+            subjects.append(term)
+    return list(dict.fromkeys(subjects))
 
 
 def _query_token_matches_text(token: str, text: Any) -> bool:

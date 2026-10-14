@@ -13,6 +13,9 @@ import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import urlencode
+from .rules import intrinsic_table_scopes
+from .units import is_ambiguous_unit, bound_unit_coordinates
 
 
 CONTRACT_VERSION = "stat-evidence/v1"
@@ -100,8 +103,12 @@ def _normalize_observation(row: dict[str, Any]) -> Optional[dict[str, Any]]:
             dimensions[dimension] = {"code": None, "label": label}
     if not any((_present(value), _present(unit), _present(period), bool(dimensions))):
         return None
-    suppressed = value is None and row.get("missing_reason") == "suppressed" and row.get("value_raw") in {"*", "＊"}
+    suppressed = (isinstance(value, str) and value.strip() in {"*", "＊"}) or (
+        value is None and row.get("missing_reason") == "suppressed" and row.get("value_raw") in {"*", "＊"})
+    if suppressed:
+        value = None
     return {"value": value, "unit": unit, "period": period, "dimensions": dimensions,
+            **({"source_unit": row["source_unit"]} if _present(row.get("source_unit")) else {}),
             **({"observation_state": "suppressed"} if suppressed else {})}
 
 
@@ -138,7 +145,10 @@ def _source(payload: dict[str, Any], tool: str) -> dict[str, Any]:
         label = "통계청 KOSIS"
     url = _first_present(payload, "source_url", "출처_URL")
     if not url and label and "KOSIS" in str(label).upper():
-        url = "https://kosis.kr"
+        table = _table(payload)
+        identity = {"orgId": table["org_id"], "tblId": table["table_id"]}
+        url = ("https://kosis.kr/statHtml/statHtml.do?" + urlencode(identity)
+               if all(_present(value) for value in identity.values()) else "https://kosis.kr")
     return {"label": label, "url": url, "native_identity": payload.get("source_identity")}
 
 
@@ -264,7 +274,7 @@ def _missing_evidence_fields(
             missing.append("value")
         # A mixed table-level unit is not proof of an individual ITEM's unit.
         # Preserve the raw string; never strip '%' according to the requested metric.
-        if any(_ambiguous_unit(row.get("unit")) for row in observations) and "unit" not in missing:
+        if any(is_ambiguous_unit(row.get("unit")) for row in observations) and "unit" not in missing:
             missing.append("unit")
     if not _present(source.get("label")):
         missing.append("source")
@@ -277,11 +287,6 @@ def _missing_evidence_fields(
     if not _present(table.get("table_id")) and not native_source:
         missing.append("table.table_id")
     return missing
-
-
-def _ambiguous_unit(unit: Any) -> bool:
-    text = str(unit or "")
-    return bool(re.search(r"%|퍼센트|백분율", text) and re.search(r"원|달러|USD|KRW|엔|유로|개|명|건|가구|개소", text, re.I))
 
 
 def _actual_measure(payload: dict[str, Any], rows: list[dict[str, Any]]) -> tuple[Any, Optional[str]]:
@@ -336,6 +341,11 @@ def build_stat_evidence(
     execution_status = _execution_status(payload, observations)
     failure_class, retryable = _failure(payload, execution_status)
     missing_fields = _missing_evidence_fields(execution_status, observations, source, table)
+    unit_binding = payload.get('unit_coordinate_binding')
+    if unit_binding is not None and (payload.get('aggregation', 'none') != 'none'
+            or not bound_unit_coordinates(unit_binding, observations, table.get('org_id'), table.get('table_id'))):
+        if 'unit' not in missing_fields:
+            missing_fields.append('unit')
 
     requested = _normalize_requested_concepts(payload, requested_concepts)
     resolved = _concepts_from_rows(observations)
@@ -372,19 +382,40 @@ def build_stat_evidence(
         fulfillment_status = "unknown"
 
     actual_measure, actual_measure_evidence = _actual_measure(payload, observations)
+    from kosis_curation import TIER_A_STATS
+    from .series_context import bound_series_context
+    from .geography import native_regional_coordinates
+    series_context, geography = (bound_series_context(payload, observations, table, source, tool, TIER_A_STATS)
+                                 if execution_status == 'executed' else (None, None))
+    if series_context:
+        source = {**source, 'label': f"{series_context['compiler']} · KOSIS"}
+    regional_coordinates = payload.get('regional_coordinates') if tool in {'query_table', 'answer_query', 'quick_stat', 'quick_trend', 'quick_region_compare'} and payload.get('aggregation', 'none') == 'none' else None
+    if not regional_coordinates and execution_status == 'executed' and 'KOSIS' in str(source.get('label') or '').upper() and not source.get('native_identity'):
+        regional_coordinates = native_regional_coordinates(payload, observations, table, tool, TIER_A_STATS)
     evidence = {
         "observations": observations,
         "source": source,
         "table": table,
+        # Completeness/execution is not a claim to cover the user's entire population.
+        # Request-independent constraints survive even when all row axes say 'total'.
+        "source_scope": {"contract_version": "stat-source-scope/v1", "basis": "official_table_title",
+                         "org_id": table["org_id"], "table_id": table["table_id"],
+                         "constraints": intrinsic_table_scopes(table["name"])},
         "actual_measure": actual_measure,
         "actual_measure_evidence": actual_measure_evidence,
         "measure_definition": payload.get("measure_definition"),
         "measure_role_evidence": payload.get("measure_role_evidence"),
+        "curation_measure_binding": payload.get("curation_measure_binding"),
+        "unit_coordinate_binding": payload.get("unit_coordinate_binding"),
+        "ranking": payload.get("ranking"),
         "measure_basis": _first_present(payload, "measure_basis", "측정_기준"),
         "survey_name": payload.get("survey_name"),
         "data_nature": payload.get("data_nature"),
         "data_quality_note": payload.get("data_quality_note"),
         "period": _period_contract(payload, observations),
+        **({"series_context": series_context} if series_context else {}),
+        **({"geography": geography} if geography else {}),
+        **({"regional_coordinates": regional_coordinates} if regional_coordinates else {}),
     }
     return {
         "contract_version": CONTRACT_VERSION,

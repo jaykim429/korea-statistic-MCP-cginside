@@ -306,6 +306,20 @@ class AlternativeSource:
     status: Literal["current", "discontinued"] = "current"
 
 
+@dataclass(frozen=True)
+class SeriesContext:
+    """Reviewed series meaning, never values or an inferred table-wide scope.
+
+    Attach only after current ITEM/classification coordinates and units match.
+    reviewed_at is a definition review date, NOT the data release/update date.
+    """
+    country: str
+    compiler: str
+    price_basis: Literal["real", "nominal", "not_applicable"]
+    references: tuple[str, ...]
+    reviewed_at: str
+
+
 @dataclass
 class QuickStatParam:
     """사전 검증된 통계 파라미터 (즉시 호출 가능)."""
@@ -319,6 +333,10 @@ class QuickStatParam:
     # 모집단·관측 단위처럼 값의 의미를 바꾸는 작성 기준. 근거가 확인된
     # 지표만 채우며, 표 이름이나 note에서 추측해 자동 생성하지 않는다.
     measure_basis: str = ""
+    # Metric head and explanatory formula have different roles. No automatic
+    # parenthesis/operand stripping: reviewed compound definitions name the head.
+    measure_name: Optional[str] = None
+    series_context: Optional[SeriesContext] = None
     region_scheme: Optional[dict] = None  # 지역명 → 코드
     region_obj: Literal["obj_l1", "obj_l2", "obj_l3"] = "obj_l1"
     obj_l2: Optional[str] = None
@@ -342,10 +360,17 @@ class QuickStatParam:
     provisional_periods: tuple[str, ...] = ()
     # 같은 지표의 다른 기준(모집단·작성방법이 달라 값이 다르다). 답변에 한 줄로 함께 알린다.
     alternatives: tuple[AlternativeSource, ...] = ()
+    # Optional reviewed labels for the coordinates that determine a table-wide
+    # alternative unit. Region coordinates use the reviewed region_scheme.
+    unit_coordinate_labels: Optional[dict[str, dict[str, str]]] = None
 
     @property
     def table_identity(self) -> tuple[str, str]:
         return (self.org_id, self.tbl_id)
+
+    @property
+    def measurement_name(self) -> str:
+        return self.measure_name or self.description
 
 
 # Tier A 데이터: 110+ 항목
@@ -533,6 +558,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         tbl_nm="시도별 경제활동별 지역내총생산",
         description="지역내총생산 (명목)",
         obj_l1="00", item_id="T1", unit="백만원",
+        unit_coordinate_labels={"ITEM": {"T1": "명목"}, "obj_l2": {"Z10": "지역내총생산(시장가격)"}},
         region_scheme=REGION_DEMOGRAPHIC,
         obj_l2="Z10",
         supported_periods=("Y",),
@@ -573,7 +599,12 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         item_id="13103136288999",
         unit="%",
         verification_status="verified",
-        note="Verified via KOSIS API: real GDP growth (2025 1.0)",
+        series_context=SeriesContext(
+            country="KR", compiler="한국은행", price_basis="real", reviewed_at="2026-10-13",
+            references=("https://kosis.kr/statHtml/statHtml.do?orgId=301&tblId=DT_200Y101",
+                        "https://www.bok.or.kr/portal/bbs/B0000170/view.do?menuNo=200060&nttId=10098406"),
+        ),
+        note="Verified current KOSIS ITEM/C1 coordinates for annual real GDP growth; values come from the current query, not this note.",
     ),
 
     # ========================================================================
@@ -1107,6 +1138,7 @@ TIER_A_STATS: dict[str, QuickStatParam] = {
         org_id="101", tbl_id="DT_1YL21171",
         tbl_nm="교원 1인당 학생수(시도/시/군/구)",
         description="교원 1인당 학생수 (재적학생수 ÷ 교원수)",
+        measure_name="교원 1인당 학생수",
         obj_l1="00", item_id="T10", unit="명",
         region_scheme=REGION_DEMOGRAPHIC,
         supported_periods=("Y",),
@@ -2849,6 +2881,20 @@ class NaturalLanguageRouter:
         # '중소기업 매출액'에 걸려 전국 수치로 답했다 — 업종이 조용히 사라졌고, 값이
         # 안 나오는 게 아니라 그럴듯한 틀린 값이 나갔다(실측: Tier A 191개 중 41개가 이랬다).
         if synonym_candidates:
+            from kosis_analysis.rules import measurement_normalizer, normalize_measurement_basis_phrases
+            requested_basis = measurement_normalizer(q)
+            if requested_basis:
+                # A per-unit request cannot silently select the same noun's total.
+                synonym_candidates = [(alias, key) for alias, key in synonym_candidates
+                    if measurement_normalizer(self.tier_a_stats[key].measurement_name, source_definition=True) == requested_basis]
+                for key, param in self.tier_a_stats.items():
+                    head = re.split(r'[（(]', param.measurement_name, maxsplit=1)[0]
+                    if param.verification_status == 'verified' and param.replacement_status == 'current' and not param.aggregation \
+                            and measurement_normalizer(param.measurement_name, source_definition=True) == requested_basis \
+                            and self.normalize(normalize_measurement_basis_phrases(head)) in self.normalize(normalize_measurement_basis_phrases(q)):
+                        synonym_candidates.append((head, key))
+            if not synonym_candidates:
+                return None
             _, canonical = max(synonym_candidates, key=lambda pair: len(self.normalize(pair[0])))
             return canonical
         return None

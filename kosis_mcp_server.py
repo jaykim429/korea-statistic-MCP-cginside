@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -35,6 +36,8 @@ from mcp.types import TextContent
 from scipy import stats as scipy_stats
 
 from kosis_analysis.answering import AnswerPlan, AnswerPlanner, AnswerStat
+from kosis_analysis.branches import metadata_branches
+from kosis_analysis.rules import metadata_regional_scope
 from kosis_analysis.charts import (
     _chart_bar_svg,
     _chart_line_svg,
@@ -52,8 +55,14 @@ from kosis_analysis.client import (
     _resolve_key,
 )
 from kosis_analysis.evidence import attach_stat_evidence, kosis_row_dimensions
+from kosis_analysis.curated_identity import apply_curated_coordinate_measure
+from kosis_analysis.units import apply_curated_coordinate_unit, apply_official_coordinate_unit, is_ambiguous_unit
+from kosis_analysis.native_units import needs_unit_metadata, normalize_native_units, native_unit_payload, source_unit
+from kosis_analysis.native_regions import native_region_scope, resolve_native_region_code, bind_native_regions, native_region_payload, select_native_region_rows
+from kosis_analysis.ranking import ranked_comparison
 from kosis_analysis.primary_series import query_primary_series
-from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure
+from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure, apply_classification_measure
+from kosis_analysis.methodology import request_for as methodology_request, methodology_payload
 from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
     TableMetadataProfile,
@@ -71,9 +80,10 @@ from kosis_analysis.metadata import (
     _suggest_axis_codes,
     _validate_query_table_filters,
 )
-from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases
+from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases, discovery_measure_of
 from kosis_analysis.text_match import (
     _content_search_query,
+    _discovery_subject_terms,
     _match_quality_rank,
     _normalize_typo_query,
     _query_match_quality,
@@ -118,6 +128,8 @@ from kosis_analysis.indicators import (
     OPERATIONS as INDICATOR_OPERATIONS,
     OPERATION_ALIASES_KO,
     operation_catalog as _indicator_operation_catalog,
+    elapsed_years as _elapsed_years,
+    period_index as _indicator_period_index,
 )
 from kosis_analysis.planner import QueryWorkflowPlanner
 from kosis_analysis.quick import (
@@ -514,7 +526,8 @@ def _finalize_answer_query_response(
     if param is not None and param.verification_status == "verified" and (
         str(result.get("org_id") or "") == param.org_id and str(result.get("tbl_id") or "") == param.tbl_id
     ):
-        result.setdefault("actual_measure", param.description)
+        result.setdefault("actual_measure", param.measurement_name)
+        result.setdefault("measure_definition", param.description)
         result.setdefault("actual_measure_evidence", "verified_curation_description")
         if param.measure_basis:
             result.setdefault("measure_basis", param.measure_basis)
@@ -525,21 +538,18 @@ def _finalize_answer_query_response(
         tool="answer_query",
         requested_concepts=requested,
     )
-    # Home-country words are scope constraints. Prove them only with a verified
-    # domestic codebook and the actual region code/label of every observation.
-    if param is not None and param.verification_status == "verified" and param.region_scheme and "전국" in param.region_scheme and (
-        str(result.get("org_id") or "") == param.org_id and str(result.get("tbl_id") or "") == param.tbl_id
-    ):
-        domestic = {"전국", "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종", "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주"}
-        block = enriched["stat_evidence"]["evidence"]
-        observations = block.get("observations") or []
-        def proved_region(row):
-            selected = (row.get("dimensions") or {}).get("region") or {}
-            label, code = str(selected.get("label") or ""), str(selected.get("code") or "")
-            return (_canonical_region(label) or label) in domestic and param.region_scheme.get(label) == code
-        if observations and all(proved_region(row) for row in observations):
-            block["geography"] = {"country": "KR", "basis": "verified_curation_region_scheme"}
     return enriched if verbose else _compact_answer_query_response(enriched, query=query, region=region)
+
+
+def _native_answer_context(payload: dict[str, Any]) -> dict[str, Any]:
+    """Legacy answer prose must not discard the executed canonical row/unit owner."""
+    return {key: payload[key] for key in (
+        'rows', 'unit_coordinate_binding', 'actual_measure', 'actual_measure_evidence',
+        'measure_definition', 'measure_role_evidence', 'curation_measure_binding',
+        'measure_basis', 'aggregation', 'source_url', 'regional_coordinates',
+        'regional_selection', 'warnings', '범위_안내',
+        'ranking',
+    ) if payload.get(key) not in (None, '', [])}
 
 
 def _mcp_tool_output_contract(
@@ -1051,6 +1061,7 @@ from kosis_curation import (
     REGION_COMPOSITES,
     REGION_DEMOGRAPHIC,
     TIER_A_STATS,
+    SYNONYMS,
     TOPICS,
     canonical_region as _canonical_region,
     lookup as _curation_lookup,
@@ -1742,6 +1753,19 @@ async def _fetch_series(
     start_year: Optional[str] = None, end_year: Optional[str] = None,
     latest_n: Optional[int] = None,
 ) -> list[dict]:
+    item_meta = None
+    region_scope = None
+    if param.region_scheme and param.verification_status == 'verified' and param.replacement_status == 'current':
+        try:
+            item_meta = await _fetch_meta(client, key, param.org_id, param.tbl_id, 'ITM')
+            region_scope = native_region_scope(param, item_meta)
+            region_code = resolve_native_region_code(param, region_code, region_scope)
+        except RuntimeError as error:
+            if str(error).startswith('[REGION_'):
+                raise
+            # Failed metadata cannot authorize a new code or hierarchy. Legacy
+            # paths retain their explicit code and cannot declare official coverage.
+            pass
     p = {
         "method": "getList", "apiKey": key,
         "orgId": param.org_id, "tblId": param.tbl_id,
@@ -1761,30 +1785,59 @@ async def _fetch_series(
         elif region_obj == "obj_l3":
             p["objL3"] = region_code
     if start_year and end_year:
-        p["startPrdDe"] = start_year
-        p["endPrdDe"] = end_year
+        # Calendar aliases are accepted internally; KOSIS receives YYYYQQ.
+        # Never reinterpret a monthly code as a quarter without Q cadence.
+        def api_period(value):
+            coordinate = _indicator_period_index(value, period_type)
+            return f"{coordinate[0] // 4}{coordinate[0] % 4 + 1:02d}" if period_type == "Q" and coordinate else _api_period_de(value)
+        p["startPrdDe"] = api_period(start_year)
+        p["endPrdDe"] = api_period(end_year)
     elif latest_n:
         p["newEstPrdCnt"] = str(latest_n)
+
+    async def resolve_units(rows):
+        meta = item_meta
+        if rows and needs_unit_metadata(rows, param):
+            try:
+                if meta is None:
+                    meta = await _fetch_meta(client, key, param.org_id, param.tbl_id, 'ITM')
+            except RuntimeError:
+                # Missing metadata cannot authorize an invented or curated unit.
+                pass
+        return bind_native_regions(normalize_native_units(rows, param, period_type, meta), param, region_scope)
 
     obj_l2_list = getattr(param, "obj_l2_list", ()) or ()
     if obj_l2_list and getattr(param, "aggregation", None) == "sum":
         sums: dict[str, float] = {}
         counts: dict[str, int] = {}
         base_rows: dict[str, dict] = {}
+        units: dict[str, set[str]] = {}
 
         for obj_l2 in obj_l2_list:
             component_params = dict(p)
             component_params["objL2"] = obj_l2
-            rows = await _kosis_call(client, "Param/statisticsParameterData.do", component_params)
+            rows = await resolve_units(await _kosis_call(client, "Param/statisticsParameterData.do", component_params))
+            component_periods = set()
             for row in rows:
                 period = row.get("PRD_DE") or row.get("시점")
-                raw_value = row.get("DT") or row.get("값")
+                raw_value = row.get("DT") if row.get("DT") is not None else row.get("값")
                 if not period or raw_value in (None, ""):
                     continue
+                if period in component_periods:
+                    raise RuntimeError('[UNIT_BASIS_MISMATCH] 합산 구성요소에 같은 시점의 행이 여러 개 있습니다.')
+                component_periods.add(period)
                 try:
                     value = float(str(raw_value).replace(",", ""))
                 except ValueError:
                     continue
+                unit = str(row.get('UNIT_NM') or '')
+                if not math.isfinite(value) or not unit or is_ambiguous_unit(unit):
+                    raise RuntimeError('[UNIT_UNRESOLVED] 합산 구성요소의 값·단위를 검증할 수 없습니다.')
+                if re.search(r'당|/|%|‰|지수', unit):
+                    raise RuntimeError('[UNIT_NONADDITIVE] 비율·지수·분모가 있는 단위를 단순 합산하지 않았습니다.')
+                units.setdefault(period, set()).add(unit)
+                if len(units[period]) > 1:
+                    raise RuntimeError('[UNIT_MISMATCH] 서로 다른 단위의 구성요소를 합산하지 않았습니다.')
                 sums[period] = sums.get(period, 0.0) + value
                 counts[period] = counts.get(period, 0) + 1
                 base_rows.setdefault(period, dict(row))
@@ -1795,7 +1848,9 @@ async def _fetch_series(
                 continue
             row = base_rows[period]
             row["DT"] = _format_aggregated_dt(sums[period])
-            row["UNIT_NM"] = param.unit
+            row["UNIT_NM"] = next(iter(units[period]))
+            for field in ('_UNIT_OBSERVATION', '_UNIT_BINDING', '_MEASURE_IDENTITY'):
+                row.pop(field, None)
             row["ITM_NM"] = param.description
             row["C2"] = ",".join(obj_l2_list)
             row["C2_NM"] = "합산"
@@ -1804,7 +1859,7 @@ async def _fetch_series(
             aggregated.append(row)
         return aggregated
 
-    return await _kosis_call(client, "Param/statisticsParameterData.do", p)
+    return await resolve_units(await _kosis_call(client, "Param/statisticsParameterData.do", p))
 
 
 async def _fetch_latest_by_policy(
@@ -1894,8 +1949,11 @@ def _values_from_series(series: list[dict]) -> tuple[list[str], list[float]]:
     for r in series:
         try:
             t = r.get("시점") or r.get("PRD_DE")
-            v = float(r.get("값") or r.get("DT"))
-            if t:
+            raw_value = r.get("값")
+            if raw_value is None:
+                raw_value = r.get("DT")
+            v = float(str(raw_value).replace(",", ""))
+            if t and math.isfinite(v):
                 pairs.append((t, v))
         except (ValueError, TypeError):
             continue
@@ -2055,36 +2113,47 @@ def _analysis_must_know(
     }
 
 
-def _growth_materials(times: list[str], values: list[float], unit: Optional[str] = None) -> dict[str, Any]:
+def _growth_materials(times: list[str], values: list[float], unit: Optional[str] = None, cadence: Optional[str] = None) -> dict[str, Any]:
     """연평균증가율(CAGR)·총증감·연평균 증감액을 산식과 함께 돌려준다.
 
     전문가는 "최근 5년 연평균 증가율"을 그대로 묻는다. 시계열만 주고 계산을 호출자에게 떠넘기면
     모델이 제각기 계산해 값이 흔들린다(실측). 계산은 코드가 하고, 산식을 함께 실어 검증 가능하게 둔다.
     """
-    if len(values) < 2:
+    if len(values) < 2 or len(times) != len(values) or any(not math.isfinite(float(value)) for value in values):
         return {}
     start_value, end_value = float(values[0]), float(values[-1])
-    periods = max(1, len(values) - 1)
+    elapsed = _elapsed_years(times[0], times[-1], cadence)
+    coordinates = [_indicator_period_index(time, cadence) for time in times]
+    valid_time = elapsed is not None and all(coordinates) and len(set(times)) == len(times)
+    periods = coordinates[-1][0] - coordinates[0][0] if valid_time else None
     total_change = end_value - start_value
-    total_change_pct = (total_change / abs(start_value) * 100) if start_value else None
+    total_change_pct = (total_change / start_value * 100) if start_value > 0 else None
     cagr = None
-    if start_value > 0 and end_value > 0:
-        cagr = ((end_value / start_value) ** (1 / periods) - 1) * 100
+    if valid_time and start_value > 0 and end_value > 0:
+        try:
+            cagr = ((end_value / start_value) ** (1 / elapsed) - 1) * 100
+        except OverflowError:
+            cagr = None
+        if cagr is not None and not math.isfinite(cagr):
+            cagr = None
     return {
         "시작": {"시점": times[0], "값": start_value},
         "종료": {"시점": times[-1], "값": end_value},
         "구간수": periods,
+        "경과_연수": elapsed if valid_time else None,
+        "관측_시점수": len(values),
+        "annualization_basis": "calendar_elapsed",
         "총증감": round(total_change, 4),
         "총증감률_퍼센트": round(total_change_pct, 4) if total_change_pct is not None else None,
-        "연평균증감": round(total_change / periods, 4),
+        "연평균증감": round(total_change / elapsed, 4) if valid_time else None,
         "연평균증가율_퍼센트": round(cagr, 4) if cagr is not None else None,
         "단위": unit,
         "산식": {
-            "총증감률": "(종료값 - 시작값) / |시작값| x 100",
-            "연평균증가율": "((종료값 / 시작값)^(1/구간수) - 1) x 100  (양수 구간에서만 계산)",
-            "연평균증감": "(종료값 - 시작값) / 구간수",
+            "총증감률": "(종료값 - 시작값) / 시작값 x 100 (시작값이 양수일 때만 계산)",
+            "연평균증가율": "((종료값 / 시작값)^(1/경과_연수) - 1) x 100 (양수 구간에서만 계산)",
+            "연평균증감": "(종료값 - 시작값) / 경과_연수",
         },
-        "주의": "구간수는 관측 시점 수 - 1이다. 시점이 연속하지 않으면(결측) 연평균 해석에 주의한다.",
+        "주의": "연환산에는 관측 행 개수가 아닌 실제 달력 경과 연수를 사용합니다. 중간 결측은 실제 관측으로 채우지 않습니다.",
     }
 
 
@@ -2842,7 +2911,7 @@ class NaturalLanguageAnswerEngine:
             label=label or (param.description if param else key),
             value=self._to_float(result["값"]),
             formatted=_format_number(result["값"]),
-            unit=result.get("단위", param.unit if param else ""),
+            unit=result.get("단위") or "",
             period=str(result.get("시점", "")),
             table=result.get("통계표", param.tbl_nm if param else ""),
             region=region,
@@ -3540,6 +3609,7 @@ class NaturalLanguageAnswerEngine:
                 "route": route_payload["route"],
                 "출처": "통계청 KOSIS",
             }
+            result.update(_native_answer_context(trend))
             return result
 
         if requests_time_series(query) or "분석" in q:
@@ -3597,6 +3667,7 @@ class NaturalLanguageAnswerEngine:
             }
             if "분석" in q:
                 result["분석"] = await analyze_trend(direct_key, region, max(years, 5), self.api_key)
+            result.update(_native_answer_context(trend))
             return result
 
         open_start_year = _extract_open_start_year(query)
@@ -3631,6 +3702,7 @@ class NaturalLanguageAnswerEngine:
                     "검증_주의": route_payload["validation"].get("warnings", []),
                     "route": route_payload["route"],
                     "출처": "통계청 KOSIS",
+                    **_native_answer_context(trend),
                 }
 
         period = self._period_argument(query, route_payload)
@@ -3679,12 +3751,15 @@ class NaturalLanguageAnswerEngine:
             "검증_주의": route_payload["validation"].get("warnings", []),
             "route": route_payload["route"],
             "출처": stat.get("출처", "통계청 KOSIS"),
+            **_native_answer_context(stat),
         }
 
-    async def _answer_region_compare(self, query: str, direct_key: Optional[str] = None) -> dict[str, Any]:
+    async def _answer_region_compare(self, query: str, direct_key: Optional[str] = None, period: Optional[str] = None) -> dict[str, Any]:
         route_payload = self._route_payload(query)
         direct_key = direct_key or self._infer_direct_stat_key(query, route_payload) or query
-        comparison = await quick_region_compare(direct_key, api_key=self.api_key)
+        requested_year = period or _extract_single_year_from_query(query)
+        comparison = await quick_region_compare(direct_key, api_key=self.api_key,
+                                               **({'period': requested_year} if requested_year else {}))
         if "오류" in comparison:
             return await self._answer_search_fallback(query, route_payload)
         route_payload["route"]["direct_stat_key"] = direct_key
@@ -3693,11 +3768,14 @@ class NaturalLanguageAnswerEngine:
         top = rows[:3]
         bottom = rows[-3:] if len(rows) >= 3 else rows
         unit = comparison.get("단위", "")
+        partial = comparison.get('regional_selection', {}).get('complete') is False
+        if partial:
+            top, bottom = [], []
         answer = (
             f"{comparison.get('시점')}년 기준 {comparison.get('통계명', direct_key)} 시도별 비교 결과, "
             f"가장 많은 지역은 {top[0]['지역']}({top[0]['값']}{unit})입니다."
             if top else
-            "시도별 비교 데이터를 조회했습니다."
+            (comparison.get('범위_안내') or "시도별 비교 데이터를 조회했습니다.")
         )
         return {
             "상태": "executed",
@@ -3712,6 +3790,7 @@ class NaturalLanguageAnswerEngine:
             "선택_수록주기": comparison.get("선택_수록주기"),
             "비교_수록주기": comparison.get("비교_수록주기"),
             "추천_시각화": ["bar_chart"],
+            **_native_answer_context(comparison),
             "검증_주의": route_payload["validation"].get("warnings", []),
             "route": route_payload["route"],
             # 어느 표에서 나온 값인지 밝힌다. 호출자가 같은 표를 다른 축으로 다시 볼 수 있어야 한다 —
@@ -3727,18 +3806,33 @@ class NaturalLanguageAnswerEngine:
         direct_key: str,
         top_n: int,
         include_share_ratio: bool = False,
+        period: Optional[str] = None,
     ) -> dict[str, Any]:
         route_payload = self._route_payload(query)
-        comparison = await quick_region_compare(direct_key, api_key=self.api_key)
+        requested_year = period or _extract_single_year_from_query(query)
+        comparison = await quick_region_compare(direct_key, api_key=self.api_key,
+                                               **({'period': requested_year} if requested_year else {}))
         if "오류" in comparison:
             return await self._answer_search_fallback(query, route_payload)
         route_payload["route"]["direct_stat_key"] = direct_key
 
         rows = comparison.get("표", [])
+        if comparison.get('regional_selection', {}).get('complete') is False:
+            return {'상태': 'executed', '코드': STATUS_EXECUTED, '답변유형': 'tier_a_region_comparison',
+                    '질문': query, 'answer': comparison.get('범위_안내') or '일부 지역 값을 확인하지 못해 전체 순위를 제공하지 않았습니다.',
+                    '표': rows, **_native_answer_context(comparison), **_tier_a_table_identity(direct_key), '출처': '통계청 KOSIS'}
         q = self._norm(query)
         descending = not any(term in q for term in ("가장적", "적은", "하위", "낮은"))
-        ordered = rows if descending else list(reversed(rows))
-        selected = ordered[:top_n]
+        identity = _tier_a_table_identity(direct_key)
+        ranked = ranked_comparison(comparison, identity.get('기관ID'), identity.get('통계표ID'), top_n, descending)
+        if not ranked:
+            return {'상태': 'executed', '코드': STATUS_EXECUTED, '답변유형': 'tier_a_region_comparison',
+                    '질문': query, 'answer': '전체 후보의 같은 지표·시점·단위·지역 범위를 확인하지 못해 순위를 제공하지 않았습니다.',
+                    '표': rows, **_native_answer_context(comparison), **identity, '출처': '통계청 KOSIS',
+                    'warnings': ['partial_fulfillment'], '범위_안내': '확인된 지역 값이며 전체 순위가 아닙니다.'}
+        axis_id = ranked['ranking']['axis_id']
+        display_by_code = {row.get('dimensions', {}).get(axis_id, {}).get('code'): row for row in rows}
+        selected = [display_by_code[code] for code in ranked['ranking']['selected_codes']]
         unit = comparison.get("단위", "")
         period = comparison.get("시점")
         direction = "많은" if descending else "적은"
@@ -3769,9 +3863,23 @@ class NaturalLanguageAnswerEngine:
             "검증_주의": notes,
             "route": route_payload["route"],
             "출처": "통계청 KOSIS",
+            **ranked,
         }
+        if ranked['ranking']['cutoff_tied']:
+            payload['answer'] += ' 경계의 동률은 지역 코드 순으로 정해 요청한 개수만 표시했습니다.'
+        if top_n > len(rows):
+            payload['answer'] += f' 비교 가능한 전체 지역은 {len(rows)}개입니다.'
         if not include_share_ratio or not selected:
             return payload
+
+        def share_unavailable(reason):
+            payload['warnings'] = ['partial_fulfillment']
+            payload['answer'] += ' ' + reason + ' 순위와 별개로 전국 대비 비중은 계산하지 않았습니다.'
+            return payload
+
+        if re.search(r'당|/|%|‰|지수|비율|출산율|고용률|실업률',
+                     unit + str(comparison.get('actual_measure') or '') + str(comparison.get('measure_definition') or '')):
+            return share_unavailable('비율·지수·분모가 있는 지표는 지역 값을 단순 합산할 수 없습니다.')
 
         try:
             subtotal = sum(
@@ -3792,8 +3900,8 @@ class NaturalLanguageAnswerEngine:
             return payload
 
         whole_period = str(whole.get("시점", ""))
-        if period and whole_period and str(period) != whole_period:
-            notes.append(f"분자 시점 {period} ↔ 분모 시점 {whole_period} 불일치")
+        if not period or whole_period != str(period) or whole.get('단위') != unit:
+            return share_unavailable('지역 값과 전국 값의 시점·단위가 같지 않습니다.')
         share = subtotal / whole_value * 100
         stat_label = comparison.get("통계명", direct_key)
         payload.update({
@@ -4356,7 +4464,11 @@ class NaturalLanguageAnswerEngine:
         # an age/sex/industry subgroup that the mapping does not encode.
         if direct_key:
             param = TIER_A_STATS.get(direct_key)
-            unsupported_dimensions = _quick_trend_unsupported_dimensions(query, param)
+            regional_capability = bool(param and param.region_scheme and param.verification_status == 'verified'
+                                       and param.replacement_status == 'current')
+            allowed = plan.supported_dimensions if regional_capability else ()
+            unsupported_dimensions = [dimension for dimension in _quick_trend_unsupported_dimensions(query, param)
+                                      if dimension not in allowed]
             if unsupported_dimensions and param:
                 return _unsupported_quick_stat_response(
                     query,
@@ -4365,6 +4477,11 @@ class NaturalLanguageAnswerEngine:
                     plan.region,
                     self._period_argument(query, route_payload),
                 )
+            if param and plan.supported_dimensions:
+                remaining = leftover_gate_terms(query, param, plan.execution_terms if regional_capability else ())
+                if remaining:
+                    return _unsupported_quick_stat_response(query, param, [], plan.region,
+                                                            self._period_argument(query, route_payload), terms=remaining)
 
         if plan.action == "mixed_population":
             return await self._answer_self_employed_sme_population_warning(query, plan.region)
@@ -4393,15 +4510,26 @@ class NaturalLanguageAnswerEngine:
             )
         if plan.action == "region_sum" and direct_key:
             return await self._answer_region_sum(query, direct_key, params["regions"])
+        regional_period_args = {}
+        if plan.action in {'top_n', 'region_compare'} and (start_year or end_year):
+            start, end, error = _normalize_explicit_year_range(start_year, end_year)
+            if error:
+                return error
+            question_year = _extract_single_year_from_query(query)
+            if not start or start != end or question_year and question_year != start:
+                return {'상태': 'unsupported', '코드': 'REGIONAL_PERIOD_SCOPE_UNSUPPORTED',
+                        '오류': '지역 비교와 순위는 같은 단일 시점을 지정해야 합니다. 문장과 기간 인자의 충돌 또는 여러 시점을 최신값으로 대체하지 않았습니다.'}
+            regional_period_args = {'period': start}
         if plan.action == "top_n" and direct_key:
             return await self._answer_top_n(
                 query,
                 direct_key,
                 params["top_n"],
                 include_share_ratio=params["include_share_ratio"],
+                **regional_period_args,
             )
         if plan.action == "region_compare" and direct_key:
-            return await self._answer_region_compare(query, direct_key)
+            return await self._answer_region_compare(query, direct_key, **regional_period_args)
         if plan.action == "share_ratio" and direct_key:
             return await self._answer_share_ratio(query, plan.region, direct_key)
         if plan.action == "direct" and direct_key:
@@ -4498,7 +4626,9 @@ class NaturalLanguageAnswerEngine:
         fulfillment from answer prose or table-title substring matches.
         """
         compact_query = re.sub(r"\s+", "", query)
-        if result.get("상태") != "executed" or result.get("답변유형") not in {"tier_a_value", "tier_a_trend"}:
+        if result.get("상태") != "executed" or result.get("답변유형") not in {
+            "tier_a_value", "tier_a_trend", "tier_a_region_comparison", "tier_a_top_n",
+        }:
             return compact_query
         direct_key = str((result.get("route") or {}).get("direct_stat_key") or "")
         param = TIER_A_STATS.get(direct_key)
@@ -4719,7 +4849,7 @@ class NaturalLanguageAnswerEngine:
         text = re.sub(r"년년", "년", text)
         text = re.sub(r"월월", "월", text)
         text = re.sub(
-            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|십억원|천달러|억원|명|개|대|건)(?!\s*\()",
+            r"(\d[\d,]*(?:\.\d+)?)\s*(천명|십억원|천달러|억원|명|개|대|건)(?!\s*(?:\(|당|[/／]|per\b))",
             cls._append_humanized_unit,
             text,
         )
@@ -4911,12 +5041,8 @@ async def quick_stat(
 
 
 def _effective_kosis_unit(row_unit: Any, curated_unit: Any) -> tuple[str, str]:
-    raw = str(row_unit or "").strip()
-    index_base = raw if "=" in raw.replace("＝", "=") else ""
-    clean = "" if index_base or " " in raw else raw
-    curated = str(curated_unit or "").strip()
-    more_specific = bool(clean) and clean in curated and len(curated) > len(clean)
-    return (curated if more_specific or not clean else clean), index_base
+    # Compatibility wrapper: curated wording is never unit-resolution evidence.
+    return source_unit(row_unit)
 
 
 def _curated_series_basis(param: QuickStatParam, data: list[dict]) -> dict:
@@ -4931,21 +5057,39 @@ def _curated_series_basis(param: QuickStatParam, data: list[dict]) -> dict:
     units = {_effective_kosis_unit(row.get("UNIT_NM"), param.unit)[0] for row in data}
     if len(units) > 1:
         return {"오류": "시계열에 서로 다른 단위가 포함되어 계산하지 않았습니다.", "코드": "UNIT_MISMATCH"}
+    if data and (not next(iter(units), '') or any(is_ambiguous_unit(unit) for unit in units)):
+        return {"오류": "선택한 행의 단위를 원자료와 공식 분류 근거로 확정할 수 없습니다.", "코드": "UNIT_UNRESOLVED"}
+    context = native_unit_payload(data, param.org_id, param.tbl_id, param)
+    if '오류' in context:
+        return context
+    regional = native_region_payload(data, param)
+    if '오류' in regional:
+        return regional
     return {
         "통계명": definition, "actual_measure": measure or definition,
         "measure_definition": definition,
         "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
-        "단위": next(iter(units)) if units else param.unit,
+        "단위": next(iter(units), ''),
         "org_id": param.org_id, "tbl_id": param.tbl_id, "통계표": param.tbl_nm,
+        "출처": "통계청 KOSIS",
+        "source_url": f"https://kosis.kr/statHtml/statHtml.do?orgId={param.org_id}&tblId={param.tbl_id}",
         **({"measure_basis": param.measure_basis} if param.measure_basis else {}),
+        **context,
+        **regional,
+        **({'aggregation': 'sum'} if any(row.get('_AGGREGATION') for row in data) else {}),
     }
 
 
 def _native_calculation_basis(series_result: dict) -> dict:
-    return {key: series_result[key] for key in (
+    basis = {key: series_result[key] for key in (
         "actual_measure", "actual_measure_evidence", "measure_definition", "measure_basis",
-        "org_id", "tbl_id", "통계표", "survey_name", "used_period", "수록주기",
+        "org_id", "tbl_id", "통계표", "survey_name", "used_period", "수록주기", "data_nature", "data_quality_note", "geography",
     ) if series_result.get(key) not in (None, "")}
+    notes = list(dict.fromkeys(str(series_result[key]) for key in
+                               ("data_quality_note", "⚠️ 데이터_신선도", "⚠️ 잠정치") if series_result.get(key)))
+    if notes:
+        basis["data_quality_note"] = "\n".join(notes)
+    return basis
 
 
 async def _quick_stat_core(
@@ -5178,20 +5322,13 @@ async def _quick_stat_core(
         period_label = _format_period_label(row.get("PRD_DE"), period_type)
         used_period = str(row.get("PRD_DE") or "")
         age = NaturalLanguageAnswerEngine._period_age_years(used_period)
-        # KOSIS 원행이 단위를 싣고 온다. 손으로 적은 param.unit 보다 그것이 정답이다.
-        # 실측: 수출액이 커레이션에 "천달러"로 적혀 있었지만 표는 "100만달러"였고, 사용자에게
-        # 1000배 작은 값이 나갔다(2024년 6,836억 달러를 6.8억 달러로). 값·단위·출처가 모두
-        # 붙어 있어 라이브 검증 375케이스가 전부 통과했다 — 크기를 보는 검증이 없었기 때문이다.
-        # 표가 말하지 않을 때만 커레이션 값을 쓴다.
-        row_unit = str(row.get("UNIT_NM") or "").strip()
-        # 표 단위가 여러 항목을 뭉뚱그려 적혀 있으면(실측: 인구동향 DT_1B8000G 의 "명 건" —
-        # 출생아수는 명, 혼인건수는 건, 조출생률은 ‰ 다) 항목별 단위가 아니므로 쓰면 안 된다.
-        # 공백으로 갈라지는 복합 표기는 버리고 커레이션을 쓴다.
-        # 지수 기준(2020＝100)은 단위가 아니라 기준 시점이라 단위 자리에 넣지 않고 따로 싣는다.
-        # 커레이션이 더 구체적이면 그쪽을 쓴다. 표는 범죄율 단위를 그냥 "건" 이라고 적는데
-        # (천명당은 표 이름에만 있다) 커레이션의 "천명당 건" 이 사용자에게 정확하다.
-        # 서로 충돌할 때만(천달러 vs 100만달러) 데이터가 이긴다.
-        effective_unit, index_base = _effective_kosis_unit(row_unit, param.unit)
+        # Fetch-time source coordinates own units for every native consumer.
+        # Never discard denominators or choose a larger scale from curated text.
+        basis = _curated_series_basis(param, [row])
+        if '오류' in basis:
+            return basis
+        effective_unit = basis['단위']
+        index_base = row.get('_INDEX_BASE') or source_unit(row.get('UNIT_NM'))[1]
         answer_text = NaturalLanguageAnswerEngine._polish_answer_text(
             f"{period_label} {region}의 {param.description}은(는) "
             f"{_format_display_number(row.get('DT'), param.display_decimals)} {effective_unit}입니다."
@@ -5212,10 +5349,12 @@ async def _quick_stat_core(
             # the selected statistic counts a more specific population.  Expose
             # what was actually measured; service policy decides whether a
             # short terminology note is sufficient or a clarification is needed.
-            "actual_measure": param.description,
+            "actual_measure": param.measurement_name,
+            "measure_definition": param.description,
             "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
             **({"measure_basis": param.measure_basis} if param.measure_basis else {}),
         }
+        result.update(basis)
         result.update(_curated_period_nature(param, used_period))
         if result.get("data_nature"):
             result["answer"] += " 장래추계가 포함된 자료의 값입니다."
@@ -5350,6 +5489,10 @@ async def quick_trend(
     source_system: Optional[str] = None,
     start_year: Optional[str] = None,
     end_year: Optional[str] = None,
+    start_period: Optional[str] = None,
+    end_period: Optional[str] = None,
+    period_type: Optional[str] = None,
+    latest_count: Optional[int] = None,
 ) -> dict:
     """[⚡] 시계열 데이터 조회 (분석/시각화 입력으로 사용).
 
@@ -5359,6 +5502,10 @@ async def quick_trend(
         years: 최근 N년 (기본 10)
         start_year: 명시 조회 시작 연도. 지정 시 years보다 우선
         end_year: 명시 조회 종료 연도. start_year와 함께 지정
+        start_period: 정확한 시작 시점. Y=YYYY, M=YYYYMM, Q=YYYYQQ(01~04)
+        end_period: 정확한 종료 시점. 생략 시 start_period 한 시점
+        period_type: Y/M/Q. 주기를 지원하지 않으면 다른 주기로 대체하지 않음
+        latest_count: 명시 범위가 없을 때 조회할 시점 수(1~100)
 
     extra_params는 quick_stat과 동일하게 실제 슬라이싱에 사용하지 않고
     응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
@@ -5367,6 +5514,25 @@ async def quick_trend(
     if resolved_source and resolved_source != "KOSIS":
         return _unsupported_source_response("quick_trend", query, resolved_source)
     ignored_params = sorted((extra_params or {}).keys())
+    requested_range = None
+    if period_type is not None and period_type not in {"Y", "M", "Q"}:
+        return {"status": "invalid_input", "코드": STATUS_INVALID_PERIOD_RANGE, "오류": "period_type은 Y/M/Q여야 합니다."}
+    if latest_count is not None and not 1 <= latest_count <= 100:
+        return {"status": "invalid_input", "코드": STATUS_INVALID_PERIOD_RANGE, "오류": "latest_count는 1~100이어야 합니다. 더 긴 기간은 명시 범위로 요청하세요."}
+    if start_period or end_period:
+        if start_year or end_year:
+            return {"status": "invalid_input", "코드": STATUS_INVALID_PERIOD_RANGE, "오류": "연도 범위와 정밀 시점 범위를 함께 지정하지 마세요."}
+        period_type = period_type or _requested_trend_period_type(query)
+        if period_type not in {"Y", "M", "Q"}:
+            return {"status": "invalid_input", "코드": STATUS_INVALID_PERIOD_RANGE, "오류": "정밀 시점에는 period_type이 필요합니다."}
+        a = _indicator_period_index(start_period or end_period, period_type)
+        b = _indicator_period_index(end_period or start_period, period_type)
+        if not a or not b or a[1] != b[1] or a[0] > b[0]:
+            return {"status": "invalid_input", "코드": STATUS_INVALID_PERIOD_RANGE, "오류": "요청한 시작·종료 시점 형식을 확인해 주세요."}
+        def code(point):
+            index, count = point
+            return str(index) if count == 1 else f"{index // count}{index % count + 1:02d}"
+        requested_range = [code(a), code(b)]
     result = await _quick_trend_core(
         query=query,
         region=region,
@@ -5374,9 +5540,12 @@ async def quick_trend(
         api_key=api_key,
         start_year=start_year,
         end_year=end_year,
+        period_type=period_type,
+        latest_count_override=latest_count,
+        requested_period_range=requested_range,
     )
     result = _attach_ignored_params(result, ignored_params, "quick_trend")
-    return _attach_shortcut_contract(result, tool="quick_trend", ignored_params=ignored_params)
+    return attach_stat_evidence(_attach_shortcut_contract(result, tool="quick_trend", ignored_params=ignored_params), tool="quick_trend")
 
 
 def _normalize_year_bound(value: Optional[Any], *, field: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
@@ -5428,17 +5597,21 @@ def _explicit_period_metadata(
     start_period: Optional[str],
     end_period: Optional[str],
     times: list[str],
+    period_type: Optional[str] = None,
 ) -> dict[str, Any]:
-    if not start_year:
+    if not start_year and not start_period:
         return {}
     available_period = [times[0], times[-1]] if times else None
     missing_periods: list[str] = []
     if not times:
         missing_periods.append(f"{start_year}~{end_year or 'latest'} 전체 미수록")
     else:
-        if start_period and times[0] > start_period:
+        def ordinal(value):
+            coordinate = _indicator_period_index(value, period_type)
+            return coordinate[0] if coordinate else _normalize_period_bound(value)
+        if start_period and ordinal(times[0]) is not None and ordinal(start_period) is not None and ordinal(times[0]) > ordinal(start_period):
             missing_periods.append(f"{start_period} 이전 미수록")
-        if end_period and times[-1] < end_period:
+        if end_period and ordinal(times[-1]) is not None and ordinal(end_period) is not None and ordinal(times[-1]) < ordinal(end_period):
             missing_periods.append(f"{times[-1]} 이후~{end_period} 미수록")
     return {
         "requested_period": {
@@ -5460,6 +5633,7 @@ async def _quick_trend_core(
     end_year: Optional[str] = None,
     period_type: Optional[str] = None,
     latest_count_override: Optional[int] = None,
+    requested_period_range: Optional[list[str]] = None,
 ) -> dict:
     normalized_start_year, normalized_end_year, period_error = _normalize_explicit_year_range(start_year, end_year)
     if period_error:
@@ -5476,7 +5650,7 @@ async def _quick_trend_core(
             return _missing_api_key_response("quick_trend", query=query, region=region, years=years)
         raise
     if not param:
-        return {"오류": f'"{query}" 사전 매핑 없음'}
+        return {"상태": "failed", "코드": STATUS_STAT_NOT_FOUND, "오류": f'"{query}" 사전 매핑 없음'}
     unsupported_dimensions = _quick_trend_unsupported_dimensions(query, param)
     if unsupported_dimensions:
         return _unsupported_quick_stat_response(
@@ -5536,7 +5710,9 @@ async def _quick_trend_core(
         latest_count_override = window[0]
     latest_count = min(max(latest_count_override, 1), 100) if latest_count_override is not None else _latest_count_for_years(years, period_type)
     start_period = end_period = None
-    if normalized_start_year:
+    if requested_period_range:
+        start_period, end_period = requested_period_range
+    elif normalized_start_year:
         start_period, _ = _period_bounds(normalized_start_year, period_type)
         _, end_period = _period_bounds(normalized_end_year or str(datetime.now().year), period_type)
 
@@ -5549,7 +5725,8 @@ async def _quick_trend_core(
                                                       period_type=period_type, latest_n=latest_count)
 
     data.sort(key=lambda r: str(r.get("PRD_DE") or ""))
-    series = [{"시점": r.get("PRD_DE"), "값": r.get("DT"),
+    series = [{"시점": r.get("PRD_DE"), "값": r.get("DT"), "단위": r.get('UNIT_NM'),
+               "source_unit": r.get('_SOURCE_UNIT_NM', r.get('UNIT_NM')),
                "dimensions": kosis_row_dimensions(r, region_field=_region_field_names(param)[0],
                                                   region_labels=_region_labels_by_code(param))} for r in data]
     times, _ = _values_from_series(series)
@@ -5559,7 +5736,7 @@ async def _quick_trend_core(
     if "오류" in basis:
         return basis
     result = {
-        "통계명": param.description, "지역": region, "단위": param.unit,
+        "통계명": param.description, "지역": region,
         "시계열": series,
         "데이터수": len(data), "통계표": param.tbl_nm,
         "org_id": param.org_id, "tbl_id": param.tbl_id,
@@ -5568,7 +5745,8 @@ async def _quick_trend_core(
         "수록주기": period_type,
         "요청_기간_년": years,
         "요청_시점수": latest_count if not start_period else None,
-        "actual_measure": param.description,
+        "actual_measure": param.measurement_name,
+        "measure_definition": param.description,
         "actual_measure_evidence": "verified_curation_description" if param.verification_status == "verified" else "unverified_curation_description",
         **basis,
     }
@@ -5589,6 +5767,7 @@ async def _quick_trend_core(
             start_period=start_period,
             end_period=end_period,
             times=times,
+            period_type=period_type,
         ))
         result["요청_시작시점"] = start_period
         result["요청_종료시점"] = end_period
@@ -5705,8 +5884,15 @@ async def _quick_region_compare_core(
 
     code_field, name_field = _region_field_names(param)
     regions_by_code = _region_labels_by_code(param)
+    selected_regions = select_native_region_rows(data, param)
+    if selected_regions and '오류' in selected_regions:
+        return selected_regions
+    if selected_regions:
+        data = selected_regions['rows']
+        regions_by_code = {code: _canonical_region(label) or label for code, label in selected_regions['labels'].items()}
     allowed_codes = set(regions_by_code)
     rows = []
+    source_rows = []
     for row in data:
         code = row.get(code_field)
         if code not in allowed_codes:
@@ -5722,11 +5908,17 @@ async def _quick_region_compare_core(
             "지역": region_name,
             "값": _format_number(value),
             "원값": value,
-            "단위": param.unit,
+            "단위": source_unit(row.get('UNIT_NM'))[0],
+            "source_unit": row.get('_SOURCE_UNIT_NM', row.get('UNIT_NM')),
             "시점": row.get("PRD_DE"),
             "통계표": param.tbl_nm,
             "dimensions": kosis_row_dimensions(row, region_field=code_field, region_labels=regions_by_code),
         })
+        source_rows.append(row)
+
+    basis = _curated_series_basis(param, source_rows)
+    if '오류' in basis:
+        return basis
 
     reverse = sort != "asc"
     rows.sort(key=lambda r: r["원값"], reverse=reverse)
@@ -5738,7 +5930,6 @@ async def _quick_region_compare_core(
         "시점": latest_period,
         "used_period": used_period,
         "period_age_years": age,
-        "단위": param.unit,
         "최신값_선택정책": latest_policy,
         "선택_수록주기": period_type,
         "비교_수록주기": list(queried_period_types),
@@ -5746,7 +5937,12 @@ async def _quick_region_compare_core(
         "지역수": len(rows),
         "표": rows,
         "출처": "통계청 KOSIS",
+        **basis,
+        **({'regional_selection': selected_regions['regional_selection']} if selected_regions else {}),
     }
+    if selected_regions and not selected_regions['regional_selection']['complete']:
+        result['warnings'] = ['partial_fulfillment']
+        result['범위_안내'] = '요청 시점의 일부 지역 값을 확인하지 못했습니다. 전체 지역의 순위나 완전한 비교로 해석하지 마세요.'
     if age is not None and age >= DATA_FRESHNESS_WARNING_YEARS:
         result["⚠️ 데이터_신선도"] = (
             f"비교 기준 시점 {used_period} (약 {age:.1f}년 경과) — "
@@ -6211,7 +6407,7 @@ async def analyze_trend(
         "input": _analysis_input_materials(times, values),
         "data_characteristics": _series_characteristics(times, values, unit=series_result.get("단위")),
         # 연평균증가율·총증감은 전문가 질문에 그대로 쓰인다 — 모델이 다시 계산하지 않게 코드가 값과 산식을 준다
-        "증감_계산": _growth_materials(times, values, unit=series_result.get("단위")),
+        "증감_계산": _growth_materials(times, values, unit=series_result.get("단위"), cadence=series_result.get("수록주기")),
         "common_pitfalls": _analysis_common_pitfalls(series_result, values),
         "analysis_materials": {
             "available_methods": valid_methods,
@@ -6262,7 +6458,12 @@ async def analyze_trend(
             f"평균 연 {avg_growth:+.2f}% 변화, "
             f"회귀 R²={r2:.2f} (p={p_value:.3f})."
         )
-    return result
+    if input_rows is not None:
+        result["verification_level"] = "provided_rows"
+        return result
+    result["시계열"] = series_result.get("시계열", [])
+    result["출처"] = series_result.get("출처") or "통계청 KOSIS"
+    return attach_stat_evidence(result, tool="analyze_trend")
 
 
 @mcp.tool()
@@ -7150,6 +7351,7 @@ async def chart_heatmap(
     # 각 지역의 시계열 수집
     all_years: set[str] = set()
     region_data: dict[str, dict[str, float]] = {}
+    region_units: dict[str, str] = {}
     missing_regions: list[dict[str, str]] = []
     for r in regions:
         result = await quick_trend(
@@ -7164,11 +7366,17 @@ async def chart_heatmap(
             missing_regions.append({"지역": r, "사유": str(result.get("오류") or "조회 실패")})
             continue
         times, values = _values_from_series(result.get("시계열", []))
-        if not times:
+        if not times or not result.get('단위'):
             missing_regions.append({"지역": r, "사유": "시계열 데이터 없음"})
             continue
         region_data[r] = dict(zip(times, values))
+        region_units[r] = str(result['단위'])
         all_years.update(times)
+
+    if len(set(region_units.values())) > 1:
+        return _chart_json_response({'status': 'failed', 'capability_state': 'unit_mismatch', 'actual_query_supported': False,
+            'code': 'UNIT_MISMATCH', 'error': '지역별 원자료 단위가 달라 같은 히트맵으로 비교하지 않았습니다.'})
+    actual_unit = next(iter(region_units.values()), '')
 
     if not region_data or not all_years:
         return _chart_json_response({
@@ -7207,7 +7415,7 @@ async def chart_heatmap(
             "region": region_name,
             "period": period,
             "value": value,
-            "unit": param.unit,
+            "unit": region_units[region_name],
             "table_name": param.tbl_nm,
             "source": "통계청 KOSIS",
         }
@@ -7241,7 +7449,7 @@ async def chart_heatmap(
         matrix, valid_rows, sorted_years,
         title=f"{param.description} — 지역 × 시점",
         source=f"KOSIS · {param.tbl_nm}",
-        unit=param.unit,
+        unit=actual_unit,
     )
     return _chart_json_response({
         "상태": "executed",
@@ -7257,7 +7465,7 @@ async def chart_heatmap(
         "org_id": param.org_id,
         "tbl_id": param.tbl_id,
         "table_name": param.tbl_nm,
-        "unit": param.unit,
+        "unit": actual_unit,
         "period_range": sorted_years,
         "rows": rows,
         "row_count": len(rows),
@@ -7299,7 +7507,7 @@ async def chart_distribution(
     annotations: list[tuple[str, float]] = []
     for r in regions:
         stat = await quick_stat(query, r, period, api_key)
-        if "값" in stat:
+        if "값" in stat and stat.get('단위'):
             try:
                 v = float(stat["값"])
                 values.append(v)
@@ -7307,7 +7515,7 @@ async def chart_distribution(
                     "region": str(stat.get("지역") or r),
                     "period": str(stat.get("used_period") or stat.get("시점") or period),
                     "value": v,
-                    "unit": stat.get("단위") or param.unit,
+                    "unit": stat['단위'],
                     "table_name": stat.get("통계표") or param.tbl_nm,
                     "source": stat.get("출처") or "통계청 KOSIS",
                 })
@@ -7333,11 +7541,15 @@ async def chart_distribution(
             "error": "전체 지역의 실제 값을 확인하지 못해 분포 차트를 생성하지 않았습니다.",
         })
 
+    if len({row['unit'] for row in rows}) != 1:
+        return _chart_json_response({'status': 'failed', 'capability_state': 'unit_mismatch', 'actual_query_supported': False,
+            'code': 'UNIT_MISMATCH', 'rows': rows, 'error': '지역별 원자료 단위가 달라 같은 분포로 계산하지 않았습니다.'})
+    actual_unit = rows[0]['unit']
     svg = chart_distribution_svg(
         values,
         title=f"{param.description} — 시도별 분포",
         bins=min(12, len(values)),
-        unit=param.unit,
+        unit=actual_unit,
         source=f"KOSIS · {param.tbl_nm}",
         annotation_labels=annotations if annotations else None,
     )
@@ -7364,7 +7576,7 @@ async def chart_distribution(
         "org_id": param.org_id,
         "tbl_id": param.tbl_id,
         "table_name": param.tbl_nm,
-        "unit": param.unit,
+        "unit": actual_unit,
         "period_range": list(dict.fromkeys(row["period"] for row in rows)),
         "rows": rows,
         "row_count": len(rows),
@@ -7378,7 +7590,7 @@ async def chart_distribution(
             "median": median,
             "min": min(values),
             "max": max(values),
-            "unit": param.unit,
+            "unit": actual_unit,
         },
     }
 
@@ -7608,6 +7820,7 @@ async def chart_dashboard(
 
     # 지역 비교 (top N)
     items: list[tuple[str, float]] = []
+    comparison_rows: list[dict] = []
     if param.region_scheme:
         for r in list(param.region_scheme.keys())[:8]:
             if r == "전국":
@@ -7615,7 +7828,12 @@ async def chart_dashboard(
             stat = await quick_stat(query, r, "latest", api_key)
             if "값" in stat:
                 try:
+                    if not stat.get('단위') or stat['단위'] != series_result.get('단위'):
+                        return _chart_json_response({'status': 'failed', 'capability_state': 'unit_mismatch', 'actual_query_supported': False,
+                            'code': 'UNIT_MISMATCH', 'error': '기준 시계열과 지역 비교의 단위가 달라 같은 대시보드로 표시하지 않았습니다.'})
                     items.append((r, float(stat["값"])))
+                    comparison_rows.append({'series': 'region_compare', 'region': r,
+                        'period': stat.get('시점') or stat.get('used_period'), 'value': float(stat['값']), 'unit': stat['단위']})
                 except (ValueError, TypeError):
                     continue
 
@@ -7652,7 +7870,7 @@ async def chart_dashboard(
         items=items,
         summary=summary,
         forecast=forecast_pts if forecast_pts else None,
-        unit=param.unit,
+        unit=series_result.get('단위') or '',
         source=f"KOSIS · {param.tbl_nm}",
     )
 
@@ -7662,19 +7880,10 @@ async def chart_dashboard(
             "region": used_region,
             "period": period,
             "value": value,
-            "unit": series_result.get("단위") or param.unit,
+            "unit": series_result.get("단위") or '',
         }
         for period, value in timeseries
-    ] + [
-        {
-            "series": "region_compare",
-            "region": region_name,
-            "period": "latest",
-            "value": value,
-            "unit": param.unit,
-        }
-        for region_name, value in items
-    ]
+    ] + comparison_rows
     return _chart_json_response({
         "상태": "executed",
         "status": "executed",
@@ -7688,7 +7897,7 @@ async def chart_dashboard(
         "org_id": series_result.get("org_id") or param.org_id,
         "tbl_id": series_result.get("tbl_id") or param.tbl_id,
         "table_name": series_result.get("통계표") or param.tbl_nm,
-        "unit": series_result.get("단위") or param.unit,
+        "unit": series_result.get("단위") or '',
         "period_range": [times[0], times[-1]],
         "requested_period": {
             "start_year": normalized_start_year,
@@ -7820,6 +8029,67 @@ async def plan_query(query: str, api_key: Optional[str] = None, nabo_api_key: Op
 
 
 @mcp.tool()
+async def explain_statistic(
+    query: str, org_id: Optional[str] = None, tbl_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """[📖] 공식 통계설명 API의 조사규모·표본설계·오차 방법·지수 기준 표시를 조회.
+
+    관측값 조회/표본오차 계산 도구가 아니다. 연도별 설계 적용이나 실현 오차를 추정하지 않는다.
+    표가 지정되면 그 표에 연결된 공식 조사를 새로 확인하며, 없으면 정확한 등록 지표/조사명으로 찾는다.
+    """
+    request = methodology_request(query)
+    empty = {"contract_version": "stat-methodology/v1", "role": "methodology", "question": query,
+             "actual_query_supported": False, "fields": []}
+    if not request:
+        return {**empty, "status": "invalid_request", "explanation": "표본 규모·설계·오차 또는 지수 기준년 등 설명 항목을 지정하세요."}
+    if "causal" in request["facets"]:
+        return {**empty, "status": "context_only", "requested_facets": request["facets"],
+                "explanation": "관측 통계나 조사 설계 설명만으로 정책 효과의 인과성을 증명할 수 없습니다. 별도의 식별 설계와 가정 검토가 필요합니다."}
+    compact = lambda value: re.sub(r"\s+", "", value or "")
+    topic = request["topic"]
+    registered = next((name for name in [*TIER_A_STATS, *SYNONYMS] if compact(name) == compact(topic)), None)
+    seed = _curation_lookup(registered) if registered else None
+    if bool(org_id) != bool(tbl_id):
+        return {**empty, "status": "invalid_request", "explanation": "기관과 통계표 식별자는 함께 지정해야 합니다."}
+    target = (str(org_id), str(tbl_id)) if org_id and tbl_id else None
+    if target and (not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", target[0]) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", target[1])):
+        return {**empty, "status": "invalid_request", "explanation": "통계표 식별자 형식이 올바르지 않습니다."}
+    if not target and seed and seed.verification_status == "verified":
+        target = (seed.org_id, seed.tbl_id)
+    try:
+        key = _resolve_key(api_key)
+        async with httpx.AsyncClient() as client:
+            if not target:
+                if not topic:
+                    return {**empty, "status": "needs_topic", "explanation": "설명할 지표나 공식 조사명을 알려주세요."}
+                rows = await _kosis_call(client, "statisticsSearch.do", {"method": "getList", "apiKey": key,
+                    "searchNm": topic, "format": "json", "jsonVD": "Y", "resultCount": 20, "startCount": 1})
+                surveys = {}
+                for row in rows:
+                    name, org, table = str(row.get("STAT_NM") or ""), str(row.get("ORG_ID") or ""), str(row.get("TBL_ID") or "")
+                    if compact(name) != compact(topic) or not org or not table:
+                        continue
+                    surveys.setdefault((org, row.get("STAT_ID") or name), {"survey_name": name, "org_name": row.get("ORG_NM"), "org_id": org, "table_id": table})
+                if len(surveys) != 1:
+                    return {**empty, "status": "needs_survey_selection" if surveys else "not_found", "requested_facets": request["facets"],
+                        "candidates": list(surveys.values())[:6], "explanation": "요청한 지표에 연결된 공식 조사를 하나로 확정하지 못했습니다. 공식 조사명을 확인해 주세요."}
+                selected = next(iter(surveys.values()))
+                target = (selected["org_id"], selected["table_id"])
+            rows = await _kosis_call(client, "statisticsExplData.do", {"method": "getList", "apiKey": key,
+                "orgId": target[0], "tblId": target[1], "metaItm": "All", "format": "json", "jsonVD": "Y"})
+            units = await _fetch_meta(client, key, target[0], target[1], "UNIT") if "base_year" in request["facets"] else None
+            result = methodology_payload(query, request, target[0], target[1], rows, units)
+            # A caller-supplied table must not reinterpret a newly named survey.
+            if topic and result.get("survey_name") and not (seed and (seed.org_id, seed.tbl_id) == target) and compact(topic) != compact(result["survey_name"]):
+                return {**empty, "status": "ambiguous_source", "explanation": "지정한 표의 공식 조사명과 요청한 조사명을 일치시킬 수 없습니다."}
+            return result
+    except RuntimeError as exc:
+        return {**empty, "status": "service_unavailable", "error_type": type(exc).__name__,
+                "explanation": "통계설명 서비스 조회를 완료하지 못했습니다. 설명자료가 없다는 뜻은 아닙니다."}
+
+
+@mcp.tool()
 async def answer_query(
     query: str,
     region: str = "전국",
@@ -7835,6 +8105,10 @@ async def answer_query(
     start_year/end_year가 있으면 최신 단일값 shortcut 대신 명시 기간 시계열을 반환한다.
     verbose=False를 지정하면 data/metadata/notes 중심의 슬림 응답을 반환한다.
     """
+    request = methodology_request(query)
+    if request and request["role"] == "methodology":
+        # Direct MCP callers share the role boundary; metadata must not become a fabricated observation.
+        return await explain_statistic(query, api_key=api_key)
     primary = await query_primary_series(query, region, start_year, end_year)
     if primary is not None:
         return _finalize_answer_query_response(primary, query=query, region=region, verbose=verbose)
@@ -8075,6 +8349,8 @@ async def stat_time_compare(
     시점을 비교한다.
     """
     explicit_periods = bool(start_period and end_period)
+    if region == "전국" and (query_region := _extract_single_region_from_query(query)):
+        region = query_region
     if explicit_periods:
         try:
             key = _resolve_key(api_key)
@@ -8121,7 +8397,7 @@ async def stat_time_compare(
                 "질문": query,
             }
 
-        period_type = _default_period_type(param)
+        period_type = _requested_trend_period_type(query) or _default_period_type(param)
         start_bounds = _period_bounds(str(start_period or ""), period_type)
         end_bounds = _period_bounds(str(end_period or ""), period_type)
         fetch_start = start_bounds[0] or str(start_period or "")
@@ -8143,8 +8419,9 @@ async def stat_time_compare(
             series_result = fallback
         else:
             series_result = {
-                **_curated_series_basis(param, data), "지역": canonical,
-                "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT"),
+                **_curated_series_basis(param, data), "지역": canonical, "수록주기": period_type,
+                "시계열": [{"시점": r.get("PRD_DE"), "값": r.get("DT"), "단위": r.get('UNIT_NM'),
+                    "source_unit": r.get('_SOURCE_UNIT_NM', r.get('UNIT_NM')),
                     "dimensions": kosis_row_dimensions(r, region_field=_region_field_names(param)[0],
                         region_labels=_region_labels_by_code(param))} for r in data],
             }
@@ -8195,7 +8472,7 @@ async def stat_time_compare(
     start_t, start_v = start
     end_t, end_v = end
     diff = end_v - start_v
-    rate = (diff / abs(start_v) * 100) if start_v else None
+    rate = (diff / start_v * 100) if start_v > 0 else None
     direction = "증가" if diff > 0 else "감소" if diff < 0 else "변화 없음"
     unit = series_result.get("단위", "")
     answer = (
@@ -8221,11 +8498,13 @@ async def stat_time_compare(
             "산식": "(종료값 - 시작값) / 시작값 * 100",
         },
         "표": [
-            {"시점": t, "값": v, "단위": unit, "통계표": series_result.get("통계표")}
+            {"시점": t, "값": v, "단위": unit, "통계표": series_result.get("통계표"),
+             "dimensions": next((row.get("dimensions", {}) for row in series_result.get("시계열", []) if str(row.get("시점")) == t), {})}
             for t, v in zip(times, values)
         ],
         "출처": "통계청 KOSIS",
-        "검증_주의": ["변화율과 증감은 구분해서 해석해야 합니다."],
+        "검증_주의": ["변화율과 증감은 구분해서 해석해야 합니다."]
+            + (["시작값이 0 또는 음수여서 일반 상대 변화율은 계산하지 않았습니다. 원값과 절대 증감을 확인하세요."] if start_v <= 0 else []),
     }, tool="stat_time_compare")
 
 
@@ -8717,6 +8996,7 @@ _INTERNATIONAL_CONTEXT_TERMS = (
 def _candidate_text_for_ranking(candidate: dict[str, Any]) -> str:
     parts = [
         candidate.get("table_name"),
+        candidate.get("survey_name"),
         " ".join(candidate.get("indicator_evidence") or []),
         " ".join(f'{row.get("ITM_NM") or ""} {row.get("required_item") or ""}' for row in
                  (candidate.get("population_compatibility") or {}).get("evidence", [])),
@@ -8813,6 +9093,9 @@ def _annotate_table_candidate_ranking(candidates: list[dict[str, Any]], *, query
     for candidate in candidates:
         indicator_score = _candidate_indicator_score(candidate)
         context = _selection_context_adjustments(candidate, query, indicator)
+        subjects = _discovery_subject_terms(query, indicator)
+        # Official names help find a candidate, not prove a population was selected.
+        candidate["subject_relevance"] = _query_match_quality(" ".join(subjects), _candidate_text_for_ranking(candidate))
         # 항목 증거는 축 이름·지표 점수보다 **위**다. 물은 항목을 나눠 볼 수 있는 표가
         # 먼저 와야 재검색이 뜻을 갖는다. score 에만 반영하면 정렬 키의 9번째라 묻힌다.
         matched_items = candidate.get("matched_items") or []
@@ -8844,6 +9127,7 @@ def _table_candidate_sort_key(candidate: dict[str, Any]) -> tuple:
     return (
         candidate.get("status") != "selected",
         {"exact": 0, "proxy": 1}.get((candidate.get("measure_compatibility") or {}).get("relation"), 2),
+        -float((candidate.get("subject_relevance") or {}).get("coverage_ratio", 0)),
         weak_population_measure,
         -len((candidate.get("population_compatibility") or {}).get("matched_items", [])),
         int(features.get("ranking_penalty") or 0),
@@ -8920,6 +9204,7 @@ def _compact_table_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "measure_compatibility": candidate.get("measure_compatibility"),
         "measure_role_evidence": candidate.get("measure_role_evidence"),
         "population_compatibility": candidate.get("population_compatibility"),
+        "subject_relevance": candidate.get("subject_relevance"),
         "survey_name": candidate.get("survey_name"),
         "axis_summary": candidate.get("axis_summary"),
         "geographic_scope": candidate.get("geographic_scope"),
@@ -11223,6 +11508,9 @@ async def select_table_for_query(
     else:
         effective_indicator, indicator_source = None, "none"
     indicator_raw_input = effective_indicator
+    # Bare aliases are useful search terms, not semantic/value equivalences.
+    if effective_indicator and not measure_of(effective_indicator):
+        effective_indicator = discovery_measure_of(effective_indicator) or effective_indicator
     indicator_normalization = None
     if effective_indicator:
         indicator_normalization = await _normalize_indicator_from_kosis_meta(effective_indicator, api_key=key)
@@ -11238,6 +11526,16 @@ async def select_table_for_query(
         search_kosis(term, limit=limit, use_routing=True, api_key=key)
         for term in search_queries
     ])
+    # Explicit breakdowns need lexical discovery outside a shortcut's fixed
+    # candidate pool. These are bounded additional searches, not value aliases.
+    lexical_dimensions = _normalize_required_dimensions(required_breakdowns or [])[:3]
+    lexical_labels = {'industry': '산업별', 'region': '지역별', 'age': '연령별', 'sex': '성별', 'scale': '규모별', 'size': '규모별'}
+    lexical_queries = list(dict.fromkeys(f'{lexical_labels[dim]} {effective_indicator}' for dim in lexical_dimensions
+                                        if dim in lexical_labels and effective_indicator))
+    if lexical_queries:
+        lexical_searches = await asyncio.gather(*[search_kosis(term, limit=limit, use_routing=False, api_key=key) for term in lexical_queries])
+        search_queries += lexical_queries
+        searches += lexical_searches
     raw_candidates: list[dict[str, Any]] = []
     for term, search in zip(search_queries, searches):
         tier_a = search.get("Tier_A_직접_매핑") or search.get("Tier_A_吏곸젒_留ㅽ븨")
@@ -11268,37 +11566,41 @@ async def select_table_for_query(
     candidates: list[dict[str, Any]] = []
     # Ranking hints from the request are checked against actual metadata labels.
     # Unknown terms remain unverified; these hints never authorize value execution.
-    population_terms = []
-    if measure_of(query_text):
-        for term in _query_tokens_for_matching(query_text):
-            if _compact_text(term) == _compact_text(explicit_indicator or effective_indicator or ""):
-                continue  # The metric's own name is not a population condition.
-            if _compact_text(term) in _compact_text(measure_of(query_text) or ""):
-                continue  # Spaced components such as '사업체 수' are one measure.
-            measurement = measure_of(term)
-            term = term.replace(measurement, "", 1) if measurement else term
-            if term.endswith("별") and any(_axis_matches_dimension(term, dim) for dim in required):
-                continue  # Presentation roles are not population conditions.
-            if len(term) >= 2 and not re.search(r"\d", term):
-                population_terms.append(term)
+    # A caller's whole named metric is a discovery subject, not an extra
+    # population. Keep the existing scope priority/freshness boundary separate.
+    population_query = " ".join(term for term in _query_tokens_for_matching(query_text)
+                                if _compact_text(term) != _compact_text(explicit_indicator or effective_indicator or ""))
+    population_terms = _discovery_subject_terms(population_query, query_text or explicit_indicator or effective_indicator)
     scorer = MetadataCompatibilityScorer(
         required_dimensions=required,
         indicator=effective_indicator,
         reject_if_missing_dimensions=reject_if_missing_dimensions,
         required_items=required_items,
-        measure_request=explicit_indicator or query_text,
+        measure_request=query_text if measure_of(query_text) else f"{query_text} {explicit_indicator or effective_indicator or ''}",
         population_terms=list(dict.fromkeys(population_terms)),
         required_breakdowns=required_breakdowns,
     )
     # 후보 메타데이터는 후보별로 순차 조회하면 KOSIS 왕복이 그대로 쌓인다(실측: 콜드 캐시에서 한 질문 40~56초).
     # 후보끼리는 서로 독립이므로 동시에 받아 온다. 동시 실행 수는 KOSIS 쪽 부담을 고려해 제한한다.
     unique_rows: list[dict[str, Any]] = []
+    unique_indexes: dict[tuple[str, str], int] = {}
     for row in raw_candidates:
         org_id = str(row.get("기관ID") or "")
         tbl_id = str(row.get("통계표ID") or "")
-        if not org_id or not tbl_id or (org_id, tbl_id) in seen:
+        if not org_id or not tbl_id:
+            continue
+        if (org_id, tbl_id) in seen:
+            # The direct-mapping row often precedes a richer verified seed for
+            # the same table. Deduplication must retain its discovery role;
+            # otherwise the neutral title loses the metadata-budget priority.
+            if row.get("candidate_basis") == "verified_curation_table":
+                previous = unique_rows[unique_indexes[(org_id, tbl_id)]]
+                previous["candidate_basis"] = row["candidate_basis"]
+                if row.get("metric_hint"):
+                    previous["metric_hint"] = row["metric_hint"]
             continue
         seen.add((org_id, tbl_id))
+        unique_indexes[(org_id, tbl_id)] = len(unique_rows)
         unique_rows.append(row)
 
     # 메타 조회는 KOSIS 호출량(분당 한도)을 그대로 먹는다. 후보 27개를 다 조회해도 결국 limit 개만 쓴다 —
@@ -11313,6 +11615,14 @@ async def select_table_for_query(
         # A normalized generic ITEM cannot squeeze the original population out
         # of the bounded metadata inspection. This is discovery, not scope proof.
         unique_rows.sort(key=lambda row: (
+            # A verified discovery anchor with a neutral title must fit in the
+            # bounded metadata budget before title-only population hits crowd it out.
+            # This does not bypass the scorer, ITEM/axis checks or query validation.
+            -int(row.get("candidate_basis") == "verified_curation_table"),
+            # Reserve inspection space for unrestricted sources rather than
+            # spending it all on one province's duplicated publications.
+            int(bool(metadata_regional_scope(row.get('통계표명')))
+                and metadata_regional_scope(row.get('통계표명')) not in [canonical_population_label(t) for t in _query_tokens_for_matching(query_text)]),
             -sum(_query_token_matches_text(term, str(row.get("통계표명") or "")) for term in population_terms),
             -_name_hits(row),
         ))
@@ -11427,16 +11737,18 @@ async def select_table_for_query(
         "ranking_criteria": [
             {"order": 1, "field": "status_selected", "applied": True},
             {"order": 2, "field": "measure_compatibility", "applied": True},
-            {"order": 3, "field": "measure_item_evidence", "applied": True},
-            {"order": 4, "field": "population_matched_items", "applied": True},
-            {"order": 5, "field": "ranking_penalty", "applied": True},
-            {"order": 6, "field": "indicator_score_band", "applied": True},
-            {"order": 7, "field": "query_term_coverage", "applied": True},
-            {"order": 8, "field": "latest_period_year", "applied": True},
-            {"order": 9, "field": "indicator_score", "applied": True},
-            {"order": 10, "field": "cadence_diversity", "applied": True},
-            {"order": 11, "field": "item_count", "applied": True},
-            {"order": 12, "field": "score", "applied": True},
+            {"order": 3, "field": "subject_relevance", "applied": True},
+            {"order": 4, "field": "measure_item_evidence", "applied": True},
+            {"order": 5, "field": "population_matched_items", "applied": True},
+            {"order": 6, "field": "ranking_penalty", "applied": True},
+            {"order": 7, "field": "matched_item_count", "applied": True},
+            {"order": 8, "field": "indicator_score_band", "applied": True},
+            {"order": 9, "field": "query_term_coverage", "applied": True},
+            {"order": 10, "field": "latest_period_year", "applied": True},
+            {"order": 11, "field": "indicator_score", "applied": True},
+            {"order": 12, "field": "cadence_diversity", "applied": True},
+            {"order": 13, "field": "item_count", "applied": True},
+            {"order": 14, "field": "score", "applied": True},
         ],
         "warnings": warnings,
         "mcp_output_contract": _mcp_tool_output_contract(
@@ -12361,6 +12673,16 @@ async def _query_table_core(
         ),
     }
     result.update({key: value for key, value in nature.items() if value is not None})
+    result['coordinate_axes'] = axis_order
+    if aggregation == 'none':
+        from kosis_analysis.geography import project_metadata_coordinates
+        regional_coordinates = project_metadata_coordinates(org_id, tbl_id, axes, normalized_rows)
+        if regional_coordinates:
+            result['regional_coordinates'] = regional_coordinates
+    apply_curated_coordinate_unit(result, axis_order, TIER_A_STATS, axes)
+    apply_official_coordinate_unit(result, axis_order, axes)
+    apply_classification_measure(result, axes)
+    apply_curated_coordinate_measure(result, axis_order, TIER_A_STATS, axes)
     return result
 
 
@@ -12413,6 +12735,7 @@ async def compute_indicator(
     match_keys: Optional[list[str]] = None,
     scale_factor: Optional[float] = None,
     decimals: int = 4,
+    cadence: Optional[str] = None,
 ) -> dict:
     """[🧮] 허용된 산식 enum만 사용해 query_table rows에 산술을 수행한다.
 
@@ -12438,6 +12761,7 @@ async def compute_indicator(
         match_keys: per_capita/ratio/share의 분자/분모 매칭 축. 미지정 시 group_by 규칙 따름.
         scale_factor: per_capita/ratio 결과에 곱할 단위 스케일 (예: 1000). share는 무시.
         decimals: 결과 반올림 자릿수.
+        cadence: CAGR 연환산용 Y/M/Q 주기. 월/분기는 달력 경과 연수 계산에 필수.
     """
     original_operation = operation
     operation_alias_used = None
@@ -12510,6 +12834,7 @@ async def compute_indicator(
         group_by=group_by,
         scale_factor=scale_factor,
         decimals=int(decimals) if decimals is not None else 4,
+        cadence=cadence,
     )
     markers = list(outcome.markers)
     if outcome.unmatched:
@@ -12785,11 +13110,15 @@ async def explore_table(
         "통계표명": table_name,
         "통계표명_영문": table_name_eng,
         "수록기간": period_summary,
+        # Keep all actual cadences, not only the freshest summary row. This is
+        # discovery metadata, never proof that a requested observation exists.
+        "periods": TableMetadataProfile.from_rows(org_id, tbl_id, {}, name_rows, item_rows, period_rows, source_rows).periods_summary(),
         "used_period": used_period,
         "period_age_years": period_age,
         "period_metadata_inconsistencies": period_metadata_inconsistencies,
         "출처": contact,
         "분류축": classifications,
+        "axis_branches": metadata_branches(TableMetadataProfile.from_rows(org_id, tbl_id, {}, name_rows, item_rows, period_rows, source_rows).axes),
         "메타_완성도": metadata_coverage,
         "출처_KOSIS_API": "statisticsData.do?method=getMeta&type=TBL/ITM/PRD/SOURCE",
         "direct_kosis_search": {

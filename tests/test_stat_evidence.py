@@ -11,6 +11,30 @@ from kosis_curation import TIER_A_STATS
 from kosis_analysis.evidence import attach_stat_evidence, build_stat_evidence, kosis_row_dimensions
 
 
+@pytest.mark.parametrize("tool", ["quick_stat", "answer_query", "query_table", "quick_trend"])
+def test_citation_uses_returned_table_identity_not_generic_homepage(tool):
+    envelope = build_stat_evidence({"status": "executed", "source": "KOSIS", "org_id": "301",
+                                    "tbl_id": "DT_200Y101", "value": "2.2", "unit": "%", "period": "2024"}, tool=tool)
+    assert envelope["evidence"]["source"]["url"] == "https://kosis.kr/statHtml/statHtml.do?orgId=301&tblId=DT_200Y101"
+
+
+def test_citation_retains_explicit_source_and_does_not_invent_another_provider():
+    base = {"status": "executed", "value": "12", "unit": "%", "period": "2024"}
+    explicit = build_stat_evidence({**base, "source": "KOSIS", "org_id": "301", "tbl_id": "DT_OTHER",
+                                    "source_url": "https://example.org/releases/2024"}, tool="query_table")
+    assert explicit["evidence"]["source"]["url"] == "https://example.org/releases/2024"
+    incomplete = build_stat_evidence({**base, "source": "KOSIS", "org_id": "301"}, tool="query_table")
+    assert incomplete["evidence"]["source"]["url"] == "https://kosis.kr"
+    other = build_stat_evidence({**base, "source": "NABO", "org_id": "301", "tbl_id": "DT_OTHER"}, tool="query_table")
+    assert other["evidence"]["source"]["url"] is None
+
+
+def test_citation_encodes_identity_as_parameters_not_executable_url_parts():
+    envelope = build_stat_evidence({"status": "executed", "source": "KOSIS", "org_id": "301",
+                                    "tbl_id": "DT_A&B#1", "value": "12", "unit": "%", "period": "2024"}, tool="query_table")
+    assert envelope["evidence"]["source"]["url"] == "https://kosis.kr/statHtml/statHtml.do?orgId=301&tblId=DT_A%26B%231"
+
+
 def test_raw_kosis_scope_is_retained_and_regions_are_derived_from_returned_codes():
     dimensions = kosis_row_dimensions({"C1": "IM_I", "C1_NM": "숙박 및 음식점업", "C2": "SEOUL", "C2_NM": "서울특별시",
                                       "C3": "SMALL", "C3_NM": "소상공인", "ITM_ID": "T1", "ITM_NM": "기업수"},

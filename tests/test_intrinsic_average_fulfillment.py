@@ -93,3 +93,25 @@ def test_per_capita_metric_does_not_hide_an_additional_mean(query):
 
 def test_unverified_per_capita_identity_does_not_fulfill_average():
     assert not Engine._intrinsic_average_fulfilled(per_capita_payload(tbl_id='OTHER'), '1인당 온실가스 배출량')
+
+
+@pytest.mark.parametrize('answer_type', ['tier_a_region_comparison', 'tier_a_top_n'])
+def test_executed_metric_name_is_intrinsic_across_regional_consumers(answer_type):
+    result = fertility_payload(답변유형=answer_type)
+    question = '2025년 시도별 합계출산율'
+    assert Engine._fulfillment_gap(result, question, {'intents': []}) is None
+    assert Engine._intent_execution_warnings(result, question, {'intents': []}) == []
+    for extra in [' 합계', ' 더하여 알려줘']:
+        assert 'aggregation' in Engine._fulfillment_gap(result, question+extra, {'intents': []})['dropped_dimensions']
+    assert 'aggregation' in Engine._fulfillment_gap(fertility_payload(답변유형=answer_type, tbl_id='OTHER'), question, {'intents': []})['dropped_dimensions']
+
+
+@pytest.mark.parametrize('text', ['32.4 천명당 건', '43.4천명당 건', '123456명당 발생건수', '123456 명/년', '123456 명／년', '123456 명 per year'])
+def test_readable_amount_conversion_never_reinterprets_a_denominator(text):
+    assert Engine._polish_answer_text(text) == text
+
+
+def test_absolute_quantity_humanization_remains_available_and_idempotent():
+    text = Engine._polish_answer_text('1583108건, 43.4천명')
+    assert '약 158만 건' in text and '약 4만 명' in text
+    assert Engine._polish_answer_text(text) == text

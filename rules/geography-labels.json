@@ -1,0 +1,29 @@
+{
+  "axisPattern": "행정구역|지역|시도|시군구|지자체|읍면동",
+  "provincePattern": "(?:특별시|광역시|특별자치시|특별자치도|도)$",
+  "municipalityPattern": "(?:시|군|구)$",
+  "localityPattern": "(?:읍|면|동)$",
+  "grainLabels": {"province": "시도별", "municipality": "시군구별", "locality": "읍면동별", "city": "시별", "county": "군별", "district": "구별"},
+  "requests": [
+    {"grain": "province", "pattern": "시[·・/\\s]*도별|광역\\s*자치단체별|(?:광역시|특별시|특별자치시|특별자치도)별|(?<![가-힣])도별(?:로)?(?=\\s|$|[?!.])"},
+    {"grain": "municipality", "pattern": "시[·・/\\s]*군[·・/\\s]*구별|군[·・/\\s]*구별|기초\\s*(?:지자체|자치단체)별"},
+    {"grain": "locality", "pattern": "읍[·・/\\s]*면[·・/\\s]*동별"},
+    {"grain": "city", "pattern": "(?<![가-힣])시별(?:로)?(?=\\s|$|[?!.])"},
+    {"grain": "county", "pattern": "(?<![가-힣])군별(?:로)?(?=\\s|$|[?!.])"},
+    {"grain": "district", "pattern": "(?<![가-힣])구별(?:로)?(?=\\s|$|[?!.])"}
+  ],
+  "cases": [
+    {"label": "서울특별시", "kind": "province"},
+    {"label": "서울", "kind": "province"},
+    {"label": "경기도", "kind": "province"},
+    {"label": "세종특별자치시", "kind": "province"},
+    {"label": "새 통합특별시", "kind": "province"},
+    {"label": "수원시", "kind": "city"},
+    {"label": "수원시 장안구", "kind": "district"},
+    {"label": "홍천군", "kind": "county"},
+    {"label": "정자동", "kind": "locality"},
+    {"label": "전국", "kind": "national"},
+    {"label": "새 상위 지역", "kind": "unknown"},
+    {"label": "기타지역", "kind": "unknown"}
+  ]
+}

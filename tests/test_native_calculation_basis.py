@@ -15,9 +15,12 @@ def test_proxy_identity_uses_actual_item_and_keeps_curated_scope():
 
 def test_scalar_and_series_share_unit_precedence_and_do_not_mix_units():
     assert server._effective_kosis_unit("100만달러", "천달러") == ("100만달러", "")
-    assert server._effective_kosis_unit("명 건", "명") == ("명", "")
+    assert server._effective_kosis_unit("명 건", "명") == ("명 건", "")
     assert server._effective_kosis_unit("2020＝100", "지수") == ("지수", "2020＝100")
-    assert server._effective_kosis_unit("건", "천명당 건") == ("천명당 건", "")
+    assert server._effective_kosis_unit("건", "천명당 건") == ("건", "")
+    assert server._effective_kosis_unit("명", "천명") == ("명", "")
+    assert server._effective_kosis_unit("명 가임여자 1명당 명", "명") == ("명 가임여자 1명당 명", "")
+    assert server._effective_kosis_unit(None, "명") == ("", "")
     param = TIER_A_STATS["수출액"]
     assert server._curated_series_basis(param, [{"UNIT_NM": "100만달러"}, {"UNIT_NM": "천달러"}])["코드"] == "UNIT_MISMATCH"
 

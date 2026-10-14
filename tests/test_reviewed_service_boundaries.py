@@ -62,7 +62,7 @@ def test_native_trend_retains_month_count_instead_of_interpreting_it_as_years(mo
 
     async def fetch(*args, **kwargs):
         calls.append(kwargs)
-        return [{"PRD_DE": "202608", "DT": "2.1"}]
+        return [{"PRD_DE": "202608", "DT": "2.1", "UNIT_NM": "%"}]
 
     monkeypatch.setattr(s, "_fetch_series", fetch)
     result = asyncio.run(s._quick_trend_core("실업률 최근 12개월", api_key="dummy", years=5))

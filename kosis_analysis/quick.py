@@ -18,7 +18,7 @@ from kosis_curation import (
 )
 from kosis_analysis.metadata import _compact_text
 from kosis_analysis.text_match import _QUERY_STOP_TERMS, _query_tokens_for_matching
-from kosis_analysis.rules import INDUSTRY_LABELS
+from kosis_analysis.rules import INDUSTRY_LABELS, normalize_measurement_basis_phrases
 
 STATUS_UNVERIFIED_FORMULA = "UNVERIFIED_FORMULA"
 
@@ -183,7 +183,7 @@ def _synonyms_of(key: str) -> tuple[str, ...]:
     return tuple(alias for alias, canonical in SYNONYMS.items() if canonical == key)
 
 
-def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> tuple[list[str], set[str]]:
+def _covered(query: str, param: Optional[QuickStatParam], matched_key: str, execution_terms: tuple[str, ...] = ()) -> tuple[list[str], set[str]]:
     """덮인 말을 두 갈래로 돌려준다 — (부분 문자열로 볼 것, 등가로 볼 것).
 
     지표 이름은 **부분 문자열**로 본다. KOSIS 는 측정어를 붙여 쓰고(`사업체수`) 사용자는 띄어 쓰므로
@@ -194,7 +194,7 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
     tokens: set[str] = set()
 
     def add_text(value: Any) -> None:
-        compacted = _compact_text(str(value or ""))
+        compacted = _compact_text(normalize_measurement_basis_phrases(str(value or "")))
         if compacted:
             texts.append(compacted)
 
@@ -235,6 +235,7 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
     add_tokens(*_LATEST_PERIOD_TERMS)
     add_tokens(*_CONVERSATION_FILLERS)
     add_tokens(*_QUERY_STOP_TERMS)
+    add_tokens(*execution_terms)
     if requested_series_window(query) is not None:
         add_tokens("지난")
     # Period grouping is a temporal constraint, not an unknown population.
@@ -253,6 +254,7 @@ def _covered(query: str, param: Optional[QuickStatParam], matched_key: str) -> t
 def leftover_gate_terms(
     query: str,
     param: Optional[QuickStatParam] = None,
+    execution_terms: tuple[str, ...] = (),
 ) -> list[str]:
     """관문 판정 — 호출자는 이것만 부르면 된다.
 
@@ -264,7 +266,7 @@ def leftover_gate_terms(
     from kosis_curation import DEFAULT_ROUTER
 
     matched_key = DEFAULT_ROUTER.match_direct_stat_key(query) or ""
-    terms = leftover_qualifier_terms(query, param, matched_key)
+    terms = leftover_qualifier_terms(query, param, matched_key, execution_terms)
     if terms and LEFTOVER_GATE_MODE != GATE_ENFORCE:
         _LOG.warning("[leftover] query=%r key=%r terms=%r", query, matched_key, terms)
         return []
@@ -275,6 +277,7 @@ def leftover_qualifier_terms(
     query: str,
     param: Optional[QuickStatParam] = None,
     matched_key: str = "",
+    execution_terms: tuple[str, ...] = (),
 ) -> list[str]:
     """질문에서 지표·지역·시점·잡말을 덜어 내고 **남는 내용어**. 남으면 그 값으로 답하면 안 된다.
 
@@ -286,7 +289,7 @@ def leftover_qualifier_terms(
     """
     if not query:
         return []
-    texts, tokens = _covered(query, param, matched_key)
+    texts, tokens = _covered(query, param, matched_key, execution_terms)
     # 이미 다른 감지기가 잡은 차원은 두 번 세지 않는다.
     detected = set(_quick_stat_unsupported_dimensions(query, param))
 
@@ -295,7 +298,8 @@ def leftover_qualifier_terms(
             return True
         if term in tokens:
             return True
-        return any(term in text for text in texts)
+        equivalent = normalize_measurement_basis_phrases(term)
+        return any(equivalent in text for text in texts)
 
     leftover: list[str] = []
     for token in _query_tokens_for_matching(query):

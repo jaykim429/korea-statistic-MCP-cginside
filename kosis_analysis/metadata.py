@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass, field
 from itertools import product
 from typing import Any, Optional
 
 from kosis_analysis.periods import _api_period_de
-from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation, measure_basis_compatible, survey_allows_question
+from kosis_analysis.branches import metadata_branches
+from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation, measure_basis_compatible, survey_allows_question, survey_population
 
 STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
 STATUS_DENOMINATOR_REQUIRED = "DENOMINATOR_REQUIRED"
@@ -183,6 +185,8 @@ def _dimension_coverage(
             for obj_id, axis in axes.items()
             if _axis_matches_dimension(str(axis.get("OBJ_NM") or ""), dim)
         ]
+        hits += [{"OBJ_ID": b['axis_id'], "OBJ_NM": axes[b['axis_id']].get('OBJ_NM'), "branch": b}
+                 for b in metadata_branches(axes) if b['dimension'] == ('gender' if dim == 'sex' else 'size' if dim == 'scale' else dim)]
         if hits:
             matched.append(dim)
             evidence[dim] = hits
@@ -246,6 +250,14 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
                 for code, meta in items.items() if measure_of(meta.get("label"))]
     unknown = [str(meta.get("label")) for meta in items.values()
                if meta.get("label") and not measure_of(meta.get("label"))]
+    if not evidence:
+        # Official metric-role axes participate in discovery; only fresh row
+        # coordinates can promote these candidates to execution evidence.
+        from kosis_analysis.rules import is_measurement_axis
+        evidence.extend({'source': 'ITM_measurement_axis', 'axis_id': axis_id, 'code': code,
+            'name': meta['label'], 'measure': measure_of(meta['label']), 'unit': meta['unit']}
+            for axis_id, axis in axes.items() if axis_id != 'ITEM' and is_measurement_axis(axis.get('OBJ_NM'))
+            for code, meta in (axis.get('items') or {}).items() if meta.get('unit') and measure_of(meta.get('label')))
     if not evidence and definition:
         evidence.append({**definition, "unit": definition["units"][0]})
     # Title-only evidence is explicitly weaker and never replaces contradictory complete ITEM evidence.
@@ -499,6 +511,7 @@ class MetadataCompatibilityResult:
             "matched_dimensions": self.matched_dimensions,
             "missing_dimensions": self.missing_dimensions,
             "axis_evidence": self.axis_evidence,
+            "axis_branches": metadata_branches(self.profile.axes),
             "indicator_evidence": self.indicator_evidence,
             "measure_compatibility": self.measure_compatibility,
             "measure_role_evidence": self.profile.measure_definition,
@@ -583,7 +596,9 @@ class MetadataCompatibilityScorer:
                        for axis_id, axis in profile.axes.items()
                        if axis_id != "ITEM" and axis_id not in used
                        and len(axis.get("items") or {}) > 1
-                       and _axis_matches_dimension(str(axis.get("OBJ_NM") or ""), remaining[0]))
+                       and (_axis_matches_dimension(str(axis.get("OBJ_NM") or ""), remaining[0])
+                            or any(b['axis_id'] == axis_id and b['dimension'] == ('gender' if remaining[0] == 'sex' else 'size' if remaining[0] == 'scale' else remaining[0])
+                                   for b in metadata_branches(profile.axes))))
         if not assign(variable, set()):
             for dim in variable:
                 if dim in matched:
@@ -601,6 +616,24 @@ class MetadataCompatibilityScorer:
             axis_evidence[dim] = embedded
         matched_items, missing_items, item_evidence = profile.item_coverage(self.required_items)
         population_matched, population_missing, population_evidence = profile.item_coverage(self.population_terms)
+        # Exact registered official survey scope supplements ITEM metadata only
+        # for that same term. Additional populations remain unverified.
+        scoped_population = survey_population(profile.survey_name)
+        # A fixed population is also proved by an exact registered official
+        # survey, not only by an axis ITEM. Never claim a filter code was resolved.
+        # Additional required labels remain missing and breakdown axes stay strict.
+        for term in list(missing_items):
+            if scoped_population and canonical_population_label(term) == scoped_population:
+                missing_items.remove(term)
+                matched_items.append(term)
+                item_evidence.append({"source": "registered_survey_scope", "survey_name": profile.survey_name,
+                                      "ITM_NM": scoped_population, "required_item": term})
+        for term in list(population_missing):
+            if scoped_population and canonical_population_label(term) == scoped_population:
+                population_missing.remove(term)
+                population_matched.append(term)
+                population_evidence.append({"source": "registered_survey_scope", "survey_name": profile.survey_name,
+                                            "ITM_NM": scoped_population, "required_item": term})
         # 항목 증거는 축 이름 증거보다 **위**다. 축 이름은 표준화돼 있지 않아 정상적으로 새고,
         # 항목 라벨은 그 표가 실제로 나눠 볼 수 있는 것을 그대로 말한다.
         score = (
@@ -1021,6 +1054,8 @@ def _normalize_stat_value(value: Any) -> dict[str, Any]:
             "missing_reason": reason,
             "symbol": symbol,
         }
+    if not math.isfinite(number):
+        return {'value': None, 'value_raw': raw, 'value_numeric': None, 'missing_reason': 'non_finite'}
     normalized = int(number) if number.is_integer() else number
     return {
         "value": normalized,

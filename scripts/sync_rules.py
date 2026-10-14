@@ -25,7 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 SOURCE = HERE.parent / "server" / "utils" / "stat" / "rules"
 DEST = HERE / "rules"
-FILES = ("total-label.json", "item-label-cases.json", "industry-labels.json", "measure-labels.json", "population-labels.json")
+FILES = ("total-label.json", "item-label-cases.json", "industry-labels.json", "measure-labels.json", "population-labels.json", "methodology-labels.json", "geography-labels.json", "unit-labels.json", "branch-labels.json")
 
 
 def main() -> int:
