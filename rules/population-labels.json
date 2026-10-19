@@ -71,6 +71,21 @@
     {"parent": "중소기업", "children": ["소기업", "중기업"]},
     {"parent": "소기업", "children": ["소상공인"]}
   ],
+  "surveySubjectGrammar": {
+    "pattern": "^([0-9A-Za-z가-힣]{1,80}산업)(?:실태조사|조사|현황)$",
+    "neutralSubjects": ["전국산업", "전산업", "전체산업"],
+    "cases": [
+      {"survey": "「나노융합산업조사」", "subject": "나노융합산업"},
+      {"survey": "임의신산업실태조사", "subject": "임의신산업"},
+      {"survey": "2차전지산업현황", "subject": "2차전지산업"},
+      {"survey": "전국산업조사", "subject": null},
+      {"survey": "전산업조사", "subject": null},
+      {"survey": "산업조사", "subject": null},
+      {"survey": "나노융합산업 관련 조사", "subject": null},
+      {"survey": "나노융합산업조사 참고문", "subject": null},
+      {"survey": "나노융합산업및다른산업조사", "subject": null}
+    ]
+  },
   "scopedSurveys": [
     {"name": "온라인쇼핑동향조사", "population": "온라인쇼핑"},
     {"name": "소상공인실태조사", "population": "소상공인"},

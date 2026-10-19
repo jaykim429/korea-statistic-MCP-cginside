@@ -74,6 +74,15 @@ def survey_population(survey: str | None) -> str | None:
     return next((entry["population"] for entry in _POPULATIONS["scopedSurveys"] if entry["name"] == normalized), None)
 
 
+def survey_subject(survey: str | None) -> str | None:
+    """Named official subject only; not reviewed exclusions or population completeness."""
+    normalized = re.sub(r'''[\s「」『』"']''', '', str(survey or ''))
+    grammar = _POPULATIONS['surveySubjectGrammar']
+    match = re.fullmatch(grammar['pattern'], normalized)
+    subject = match[1] if match else None
+    return subject if subject and not re.search(r'별|및', subject) and subject not in grammar['neutralSubjects'] else None
+
+
 def population_scope_requested(question: str | None, phrase: str | None) -> bool:
     """Same scope-operator contract as TS; never deletes a requested condition."""
     subject = re.sub(r'\s+', '', str(phrase or ''))
