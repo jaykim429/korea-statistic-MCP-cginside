@@ -33,6 +33,11 @@ with (_RULES_DIR / "measure-labels.json").open(encoding="utf-8") as _f:
 with (_RULES_DIR / "population-labels.json").open(encoding="utf-8") as _f:
     _POPULATIONS = json.load(_f)
 
+_SCOPE_REQUEST = _POPULATIONS['requestScope']
+_NON_POSITIVE_SCOPE_TAIL = re.compile(
+    r'^[\s」』),]*(?:(?:' + '|'.join(re.escape(particle) for particle in _SCOPE_REQUEST['particles'])
+    + r')\s*)?(?:' + '|'.join('(?:' + pattern + ')' for pattern in _SCOPE_REQUEST['nonPositiveSuffixPatterns']) + ')')
+
 with (_RULES_DIR / "geography-labels.json").open(encoding="utf-8") as _f:
     GEOGRAPHY_RULES = json.load(_f)
 with (_RULES_DIR / "unit-labels.json").open(encoding="utf-8") as _f:
@@ -69,13 +74,23 @@ def survey_population(survey: str | None) -> str | None:
     return next((entry["population"] for entry in _POPULATIONS["scopedSurveys"] if entry["name"] == normalized), None)
 
 
+def population_scope_requested(question: str | None, phrase: str | None) -> bool:
+    """Same scope-operator contract as TS; never deletes a requested condition."""
+    subject = re.sub(r'\s+', '', str(phrase or ''))
+    if not subject:
+        return False
+    text = str(question or '')
+    compact = re.sub(r'\s+', '', text)
+    if subject not in compact or any(prefix + subject in compact for prefix in _SCOPE_REQUEST['negativePrefixes']):
+        return False
+    matches = list(re.finditer(r'\s*'.join(re.escape(char) for char in subject), text))
+    return bool(matches) and all(not _NON_POSITIVE_SCOPE_TAIL.match(text[match.end():]) for match in matches)
+
 def survey_allows_question(question: str | None, survey: str | None) -> bool:
     population = survey_population(survey)
     if not population:
         return True
-    compact = re.sub(r"\s+", "", str(question or ""))
-    return population in compact and f"비{population}" not in compact and not re.search(
-        re.escape(population) + r"(?:을|를|이|가)?(?:제외|이외|아닌|말고)", compact)
+    return population_scope_requested(question, population)
 
 
 def intrinsic_table_scopes(table_name: str | None) -> list[dict[str, str]]:
