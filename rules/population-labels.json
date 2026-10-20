@@ -8,7 +8,7 @@
     "negativePrefixes": ["비"],
     "particles": ["에서", "으로", "을", "를", "이", "가", "은", "는", "의", "만", "도"],
     "nonPositiveSuffixPatterns": [
-      "제외|이외|아닌|말고|아니라|아니고|대신|빼(?:고|면|서)|뺀|없이",
+      "제외|이외|아닌|말고|아니라|아니고|대신|빼(?:고|면|서)|빼놓고|제하고|뺀|없이",
       "포함|비롯",
       "외(?:에|의)?(?=$|[\\s」』),?？])",
       "등(?=$|[\\s」』),?？])"
@@ -23,6 +23,8 @@
       {"phrase":"소상공인","question":"소상공인도 제외한 사업체 수","requested":false},
       {"phrase":"소상공인","question":"소상공인을 빼면 사업체 수","requested":false},
       {"phrase":"소상공인","question":"소상공인을 빼서 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 빼놓고 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 제하고 사업체 수","requested":false},
       {"phrase":"소상공인","question":"소상공인만 사업체 수","requested":true},
       {"phrase":"소상공인","question":"소상공인도 사업체 수","requested":true},
       {"phrase":"소상공인","question":"소상공인 이외 사업체 수","requested":false},
@@ -49,6 +51,8 @@
       {"phrase":"임의신산업","question":"임의신산업도 제외한 매출액","requested":false},
       {"phrase":"임의신산업","question":"임의신산업을 빼면 매출액","requested":false},
       {"phrase":"임의신산업","question":"임의신산업을 빼서 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업을 빼놓고 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업을 제하고 매출액","requested":false},
       {"phrase":"온라인쇼핑","question":"온라인쇼핑 없이 거래액","requested":false},
       {"phrase":"등록취업자","question":"등록취업자 대신 취업자 수","requested":false},
       {"phrase":"위생용품","question":"위생용품을 뺀 무역수지","requested":false},
@@ -62,14 +66,60 @@
     {"id": "sector-mining", "label": "광업 부문", "dimension": "industry", "tablePhrases": ["광업부문"], "requestPhrases": ["광업"], "excludes": []}
   ],
   "tablePopulationHeads": [
-    {"head": "가구", "neutralPrefixes": ["일반", "전체", "총", "총계"]}
+    {"head": "가구", "neutralPrefixes": ["일반", "전체", "총", "총계"]},
+    {"head": "기업", "neutralPrefixes": ["전체", "총", "총계", "활동"], "requireHeadForSinglePrefix": true},
+    {"head": "기업체", "neutralPrefixes": ["전체", "총", "총계", "활동"], "requireHeadForSinglePrefix": true},
+    {"head": "사업체", "neutralPrefixes": ["전체", "총", "총계", "활동"], "requireHeadForSinglePrefix": true}
   ],
+  "tableMetricHeading": {
+    "measureSuffixes": ["액", "량"],
+    "additionalHeads": ["무역수지", "시장규모", "국내판매액"],
+    "surveySuffixes": ["산업현황", "산업실태조사", "실태조사"],
+    "neutralPrefixes": ["전체", "전국", "총", "총계", "전산업", "전체산업", "연간", "월간", "분기", "연평균", "월평균"],
+    "cases": [
+      {"title":"위생용품 생산·수출·수입액 무역수지, 시장규모","prefix":"위생용품"},
+      {"title":"의료기기 생산액 및 수출액","prefix":"의료기기"},
+      {"title":"반도체 수출액","prefix":"반도체"},
+      {"title":"지역별 2차전지 생산량, 판매액","prefix":"2차전지"},
+      {"title":"당근 생산량","prefix":"당근"},
+      {"title":"여성기업 매출액","prefix":"여성기업"},
+      {"title":"수출액 및 수입액","prefix":null},
+      {"title":"국내판매액","prefix":null},
+      {"title":"전체 생산액·수출액","prefix":null},
+      {"title":"산업별 수출액","prefix":null},
+      {"title":"지역별 산업별 생산액","prefix":null},
+      {"title":"기업체당 매출액","prefix":null},
+      {"title":"1인당 소비량","prefix":null},
+      {"title":"연간 수출액","prefix":null},
+      {"title":"지역별 생산액 현황","prefix":null},
+      {"title":"여성 매출액 및 남성 생산량","prefix":null},
+      {"title":"생활수준 및 소비량","prefix":null},
+      {"title":"생명표","prefix":null},
+      {"title":"경제활동별 GDP 및 GNI(원계열, 명목, 분기 및 연간)","prefix":null},
+      {"title":"소비자물가지수","prefix":null},
+      {"title":"미등록 대상 수탁거래 현황","prefix":null}
+    ]
+  },
   "hierarchies": [
     {"parent": "임금근로자", "children": ["상용근로자", "임시근로자", "일용근로자"]},
     {"parent": "연금", "children": ["국민연금", "공무원연금", "군인연금", "사학연금"]},
     {"parent": "기업", "children": ["중소기업", "대기업"]},
     {"parent": "중소기업", "children": ["소기업", "중기업"]},
     {"parent": "소기업", "children": ["소상공인"]}
+  ],
+  "sourcePopulationFrames": [
+    {
+      "id": "labour-establishments-2024",
+      "surveyNames": ["사업체노동실태현황"],
+      "orgIds": ["118"],
+      "periodStart": "2024",
+      "periodEnd": "2024",
+      "coverage": "restricted",
+      "definition": "전국사업체조사 원자료에서 일부 사업체를 제외한 고용노동부 가공통계",
+      "exclusions": ["고정 사업장이 없는 사업체", "자영업자·무급가족종사자만 있는 사업체", "공공행정·국방·사회보장행정", "공무원 재직기관"],
+      "references": ["https://kosis.kr/civilComplaint/qnaDetail.do?boardIdx=25843"],
+      "reviewedAt": "2026-10-15"
+    }
   ],
   "surveySubjectGrammar": {
     "pattern": "^([0-9A-Za-z가-힣]{1,80}산업)(?:실태조사|조사|현황)$",

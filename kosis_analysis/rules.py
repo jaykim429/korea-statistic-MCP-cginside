@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,40 @@ with (_RULES_DIR / "geography-labels.json").open(encoding="utf-8") as _f:
     GEOGRAPHY_RULES = json.load(_f)
 with (_RULES_DIR / "unit-labels.json").open(encoding="utf-8") as _f:
     UNIT_RULES = json.load(_f)
+
+HEADING_RULES = _MEASURES['sourceCountHeading']
+
+
+def source_count_heading(title: str, item_label: str) -> dict | None:
+    match = re.search(HEADING_RULES['headingPattern'], title)
+    if not match or measurement_normalizer(match[1]):
+        return None
+    family = measure_of(match[1])
+    pattern = '|'.join(r'\s*'.join(re.escape(char) for char in noun) for noun in sorted(_MEASURES['nouns'], key=len, reverse=True))
+    nouns = {measure_of(value) for value in re.findall(pattern, match[1])}
+    if not family or family not in _MEASURES['countNouns'] or len(nouns) != 1 or not re.sub(r'\s+', '', match[1]).endswith(family):
+        return None
+    members = [re.sub(r'\s+', '', value) for value in re.split(HEADING_RULES['memberSeparatorPattern'], match[2]) if value.strip()]
+    member = re.sub(r'\s+', '', item_label)
+    if len(members) < 2 or len(set(members)) != len(members) or measure_of(item_label):
+        return None
+    rate = re.fullmatch(HEADING_RULES['rateSuffixPattern'], member)
+    kind = 'rate' if rate and (rate[1] in members or member in members) else 'count' if not rate and member in members else None
+    return {'family': family, 'member': item_label, 'kind': kind,
+            'measure': f'{family} · {item_label}' if kind == 'count' else item_label} if kind else None
+
+
+def count_measure_unit_matches(measure: str, unit: str) -> bool:
+    unit = re.sub(r'\s+', '', unit)
+    if measure in _MEASURES['personCounts']:
+        return bool(re.fullmatch(r'(?:천|만|백만|억)?명', unit))
+    rule = next((rule for rule in HEADING_RULES['countUnitPatterns'] if re.search(rule['measurePattern'], measure)), None)
+    return bool(re.fullmatch(rule['unitPattern'] if rule else UNIT_RULES['countUnitPattern'], unit))
+
+
+def source_heading_subjects(heading: dict) -> list[str]:
+    compose = heading['kind'] == 'count' and any(re.fullmatch(rule['measurePattern'],heading['family']) and heading['member'] in rule['members'] for rule in HEADING_RULES['memberSubjectRules'])
+    return [heading['member'], heading['member'] + heading['family'][:-1], heading['member'] + heading['family']] if compose else [heading['member']]
 
 
 def regional_kind(label: Any) -> str:
@@ -95,6 +130,7 @@ def population_scope_requested(question: str | None, phrase: str | None) -> bool
     matches = list(re.finditer(r'\s*'.join(re.escape(char) for char in subject), text))
     return bool(matches) and all(not _NON_POSITIVE_SCOPE_TAIL.match(text[match.end():]) for match in matches)
 
+
 def survey_allows_question(question: str | None, survey: str | None) -> bool:
     population = survey_population(survey)
     if not population:
@@ -102,7 +138,56 @@ def survey_allows_question(question: str | None, survey: str | None) -> bool:
     return population_scope_requested(question, population)
 
 
-def intrinsic_table_scopes(table_name: str | None) -> list[dict[str, str]]:
+def source_population_frame(org_id: str | None, survey_name: str | None, periods: list[str]) -> dict | None:
+    """Reviewed survey universes bind identity and every observed year, not requested filters."""
+    if not org_id or not survey_name or not periods or any(not re.fullmatch(r'(?:19|20)\d{2}(?:\d{2})?', str(p)) for p in periods):
+        return None
+    key = re.sub(r'[\s「」『』"\']', '', survey_name)
+    matches = [frame for frame in _POPULATIONS.get('sourcePopulationFrames', [])
+               if org_id in frame['orgIds'] and any(re.sub(r'[\s「」『』"\']', '', n) == key for n in frame['surveyNames'])
+               and all(frame['periodStart'] <= p[:4] <= frame['periodEnd'] for p in periods)]
+    if len(matches) != 1:
+        return None
+    frame = matches[0]
+    return {'id': frame['id'], 'coverage': frame['coverage'], 'survey_name': survey_name,
+            'definition': frame['definition'], 'exclusions': frame['exclusions'],
+            'references': frame['references'], 'reviewed_at': frame['reviewedAt']}
+
+
+@lru_cache(maxsize=1)
+def _metric_scope_patterns():
+    """Same closed source grammar as TS; not measure identity or a product list."""
+    grammar = _POPULATIONS['tableMetricHeading']
+    heads = [re.escape(head) for head in grammar['additionalHeads']]
+    for suffix in grammar['measureSuffixes']:
+        stems = '|'.join(re.escape(stem) for stem in sorted(
+            [noun[:-len(suffix)] for noun in _MEASURES['nouns'] if noun.endswith(suffix)], key=len, reverse=True))
+        heads.append(rf'(?:(?:{stems})[·,])*(?:{stems}){re.escape(suffix)}')
+    head = '(?:' + '|'.join(heads) + ')'
+    listing = rf'{head}(?:(?:[·,]|및)*{head})*'
+    return re.compile(rf'^{listing}$'), re.compile(rf'^([0-9A-Za-z가-힣]+?){listing}$')
+
+
+def _metric_heading_scope(table_name: str, survey_name: str | None) -> list[dict[str, str]]:
+    compact = re.sub(r'\s+', '', re.sub(r'^(?:[0-9A-Za-z가-힣]+별[\s/]+)+', '', table_name.strip()))
+    if len(compact) > 512:
+        return []
+    whole, scoped = _metric_scope_patterns()
+    if whole.fullmatch(compact):
+        return []
+    match = scoped.search(compact)
+    prefix = match.group(1) if match else ''
+    if (not prefix or prefix in _POPULATIONS['tableMetricHeading']['neutralPrefixes'] or re.search(r'별|및', prefix)
+            or re.search(r'(?:여부|유무)$', prefix) or re.search(_MEASURES['perUnitNormalizerPattern'], prefix)
+            or any(noun.lower() in prefix.lower() for noun in _MEASURES['nouns'])):
+        return []
+    survey = re.sub(r'''[\s「」『』"']''', '', str(survey_name or ''))
+    if not any(survey == prefix + suffix for suffix in _POPULATIONS['tableMetricHeading']['surveySuffixes']):
+        return []
+    return [{'id': f'table-metric:{prefix}', 'label': f'{prefix} 범위', 'prefix': prefix}]
+
+
+def intrinsic_table_scopes(table_name: str | None, survey_name: str | None = None) -> list[dict[str, str]]:
     """Official fixed table universes, not query echoes or selected row filters."""
     compact = re.sub(r"\s+", "", str(table_name or ""))
     registered = [{"id": rule["id"], "label": rule["label"], **({"dimension": rule["dimension"]} if rule.get("dimension") else {})}
@@ -114,8 +199,13 @@ def intrinsic_table_scopes(table_name: str | None) -> list[dict[str, str]]:
         match = re.search(r"(?:^|별)([^/·,:()별]*?)" + re.escape(rule["head"]) + r"수(?:$|[(/·,:])", compact)
         prefix = match.group(1) if match else ""
         if prefix and prefix not in rule["neutralPrefixes"]:
-            inferred.append({"id": f"table-population:{rule['head']}:{prefix}", "label": f"{prefix} {rule['head']}", "prefix": prefix})
-    return registered + inferred
+            inferred.append({"id": f"table-population:{rule['head']}:{prefix}", "label": f"{prefix} {rule['head']}",
+                             "prefix": prefix + rule['head'] if rule.get('requireHeadForSinglePrefix') and len(prefix) == 1 else prefix})
+    metric_scopes = _metric_heading_scope(str(table_name or ''), survey_name)
+    subject = survey_subject(survey_name)
+    subjects = [{'id': f'survey-subject:{subject}', 'label': f'{subject} 조사 범위',
+                 'prefix': subject, 'dimension': 'survey-subject'}] if subject and not metric_scopes else []
+    return registered + inferred + metric_scopes + subjects
 
 
 def measure_of(text: Any) -> str | None:

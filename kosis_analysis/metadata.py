@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from kosis_analysis.periods import _api_period_de
 from kosis_analysis.branches import metadata_branches
+from kosis_analysis.rules import source_count_heading, source_heading_subjects
 from kosis_analysis.rules import is_total_label, canonical_population_label, measure_of, measure_relation, measure_basis_compatible, survey_allows_question, survey_population
 
 STATUS_INVALID_FILTER_CODE = "INVALID_FILTER_CODE"
@@ -115,6 +116,7 @@ def _normalize_required_dimensions(dimensions: list[str]) -> list[str]:
 def _item_coverage(
     axes: dict[str, dict[str, Any]],
     required_items: list[str],
+    table_name: str | None = None,
 ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
     """요청한 항목을 이 표가 **실제로 나눠 볼 수 있는가** — 축 이름은 보지 않는다.
 
@@ -147,7 +149,9 @@ def _item_coverage(
             for obj_id, axis in axes.items()
             for itm_id, meta in (axis.get("items") or {}).items()
             if not is_total_label(meta.get("label"))
-            and canonical_population_label(meta.get("label")) == want
+            and (canonical_population_label(meta.get("label")) == want
+                 or obj_id == 'ITEM' and (heading := source_count_heading(table_name or '', str(meta.get('label') or '')))
+                 and want in {canonical_population_label(subject) for subject in source_heading_subjects(heading)})
         ]
         if hits:
             matched.append(term)
@@ -385,7 +389,7 @@ class TableMetadataProfile:
         self,
         required_items: list[str],
     ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-        return _item_coverage(self.axes, required_items)
+        return _item_coverage(self.axes, required_items, self.table_name)
 
     def embedded_dimension_evidence(self, dimension: str, indicator: Optional[str]) -> list[dict[str, Any]]:
         """Detect dimensions fixed inside table/item names instead of exposed as axes."""

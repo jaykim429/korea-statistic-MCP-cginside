@@ -31,6 +31,32 @@
   "discoveryAliases": {"수출액": ["수출"], "수입액": ["수입"], "매출액": ["매출"]},
   "unitScopedEquivalences": [{"measures": ["발전량", "생산량"], "units": ["Wh", "kWh", "MWh", "GWh", "TWh"]}],
   "personCounts": ["출생아수", "사망자수", "종사자수", "근로자수", "취업자수", "실업자수", "자영업자수", "임금근로자수", "인구수", "인구", "인구이동", "총이동자", "이동자", "비이동자", "이동자수", "학생수", "교원수", "재적학생수", "수급자", "가입자", "가입자수", "의사수"],
+  "sourceCountHeading": {
+    "headingPattern": "([^()（）]+)[(（]([^()（）]+)[)）]",
+    "memberSeparatorPattern": "[/·,、]",
+    "rateSuffixPattern": "^(.*)(?:률|율)$",
+    "implicitTotalMemberRules": [{"measurePattern":"^(?:사업체|기업체|기업|업체)수$","members":["활동"]}],
+    "memberSubjectRules": [{"measurePattern":"^(?:사업체|기업체|기업|업체)수$","members":["활동","신생","소멸"]}],
+    "countUnitPatterns": [
+      {"measurePattern": "^(?:사업체|기업체|기업|업체)수$", "unitPattern": "^(?:천|만|백만|억)?(?:개|개소)$"},
+      {"measurePattern": "건수$", "unitPattern": "^(?:천|만|백만|억)?건$"},
+      {"measurePattern": "등록대수$", "unitPattern": "^(?:천|만|백만|억)?대$"},
+      {"measurePattern": "가구수$", "unitPattern": "^(?:천|만|백만|억)?가구$"}
+    ],
+    "cases": [
+      {"title":"산업별 기업 규모별 기업수(활동/신생/소멸)","item":"활동","result":{"family":"기업수","member":"활동","kind":"count","measure":"기업수 · 활동"}},
+      {"title":"기업수(활동/신생/소멸)","item":"신생률","result":{"family":"기업수","member":"신생률","kind":"rate","measure":"신생률"}},
+      {"title":"기업수(활동/신생률/소멸률)","item":"신생률","result":{"family":"기업수","member":"신생률","kind":"rate","measure":"신생률"}},
+      {"title":"지역별 사업체수（신규·정상·폐쇄）","item":"정상","result":{"family":"사업체수","member":"정상","kind":"count","measure":"사업체수 · 정상"}},
+      {"title":"가구수(자가,임차)","item":"자가","result":{"family":"가구수","member":"자가","kind":"count","measure":"가구수 · 자가"}},
+      {"title":"기업수 관련 현황","item":"활동","result":null},
+      {"title":"기업수(활동/신생)","item":"수탁거래 현황","result":null},
+      {"title":"기업수 및 종사자수(활동/신생)","item":"활동","result":null},
+      {"title":"기업당 기업수(활동/신생)","item":"활동","result":null},
+      {"title":"기업수(활동/활동)","item":"활동","result":null},
+      {"title":"기업수(활동/신생)","item":"활동(별도 기준)","result":null}
+    ]
+  },
   "cases": [
     {"input": "GDP 성장률", "measure": "GDP성장률", "canonical": "경제성장률"},
     {"input": "gdp 성장률", "measure": "GDP성장률", "canonical": "경제성장률"},
