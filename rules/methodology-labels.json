@@ -1,14 +1,36 @@
 {
   "contractVersion": "stat-methodology/v1",
-  "fieldLabels": {"statsNm":"공식 조사명","josaUnit":"조사 단위와 대상 규모","enumSampleMng":"전수 및 표본 관리","sampleFrame":"표본추출틀","sampleExtrMthd":"표본추출방법","sampleSclCfml":"표본규모 산출식","sampleAprtMthd":"표본배분방법","estEqua":"추정산식","wgtAjmt":"가중치 조정","dataCollectMth":"자료 수집방법","writingSystem":"조사체계","examinTrgetPd":"조사 기준시점","dataUserNote":"자료 이용 유의사항","origIndex":"원지수","indexBase":"지수 기준 표시"},
+  "fieldLabels": {"statsNm":"공식 조사명","josaUnit":"조사 단위와 대상 규모","enumSampleMng":"전수 및 표본 관리","sampleFrame":"표본추출틀","sampleExtrMthd":"표본추출방법","sampleSclCfml":"표본규모 산출식","sampleAprtMthd":"표본배분방법","estEqua":"추정산식","wgtAjmt":"가중치 조정","dataCollectMth":"자료 수집방법","writingSystem":"조사체계","examinTrgetPd":"조사 기준시점","dataUserNote":"자료 이용 유의사항","mainTermExpl":"주요 용어해설","examinHistory":"조사연혁","origIndex":"원지수","indexBase":"지수 기준 표시"},
   "facets": [
     {"id":"sample_size","label":"표본 규모","pattern":"표본(?:\\s*(?:규모|크기|수|가구\\s*수|기업체\\s*수))","fields":["josaUnit","sampleExtrMthd"],"coveragePattern":"\\d"},
     {"id":"sample_error","label":"표본오차","pattern":"표본\\s*오차|표준\\s*오차|상대\\s*표준\\s*오차|오차\\s*한계|신뢰\\s*구간","fields":["sampleSclCfml","sampleAprtMthd","estEqua"],"partialOnly":true},
     {"id":"sample_design","label":"표본 설계","pattern":"표본\\s*(?:설계|추출(?:\\s*방법)?|배분(?:\\s*방법)?|프레임)|표집|추출\\s*방법","fields":["sampleFrame","sampleExtrMthd","sampleSclCfml","sampleAprtMthd","enumSampleMng"]},
     {"id":"base_year","label":"지수 기준년","pattern":"기준\\s*(?:년도|년(?!도)|연도|시점)(?!별)","fields":["indexBase","origIndex","dataUserNote"],"coveragePattern":"(?:19|20)\\d{2}\\s*(?:년)?\\s*=\\s*100(?:\\.0)?"},
     {"id":"survey_method","label":"조사 방법","pattern":"조사\\s*(?:방법|방식|설계|체계)|자료\\s*수집\\s*방법","fields":["dataCollectMth","writingSystem","enumSampleMng","sampleExtrMthd"]},
+    {"id":"term_definitions","label":"공식 용어해설","pattern":"주요\\s*용어\\s*(?:해설|설명)|용어\\s*정의","fields":["mainTermExpl"]},
+    {"id":"survey_history","label":"조사연혁","pattern":"조사\\s*연혁|(?:조사|통계)\\s*개편\\s*(?:이력|내역)","fields":["examinHistory"]},
+    {"id":"usage_notes","label":"자료 이용 유의사항","pattern":"자료\\s*이용\\s*(?:시\\s*)?(?:유의사항|주의사항)","fields":["dataUserNote"]},
     {"id":"causal","label":"인과 해석","pattern":"인과|정책\\s*효과.*(?:말할|단정|증명|확인|판단)","fields":[]}
   ],
   "topicStripPatterns": ["(?:19|20)\\d{2}\\s*년", "이\\s*통계로|그\\s*통계로|해당\\s*통계의|이\\s*통계의|그\\s*통계의", "(?:엑셀|excel|xlsx|csv|보고서|리포트|PDF|pdf|hwpx|문서|파일)(?:\\s*(?:형식|파일))?(?:으)?로\\s*(?:만들어|작성해|생성해|정리해)\\s*(?:줘|주세요)", "알려\\s*줘|보여\\s*줘|알려주세요|설명해\\s*줘|설명해|알려|보여|어떻게|언제|얼마|몇\\s*(?:개|명|가구)|어느|무엇|뭐야", "(?:가|이|는|은|을|를|의|와|과|도|에|야|요)(?=\\s|[?!.]|$)"],
-  "valueActionPattern":"(?:값|수치|추이|증감률|증가율|최근\\s*\\d+\\s*년|전년\\s*대비|월별\\s*추이)|(?:률|율|액|수)(?:도|을|를)?\\s*(?:알려|보여)|실질\\s*기준으로.*(?:알려|보여)|명목\\s*기준으로.*(?:알려|보여)"
+  "valueActionPattern":"(?:값|수치|추이|증감률|증가율|최근\\s*\\d+\\s*년|전년\\s*대비|월별\\s*추이)|(?:률|율|액|수)(?:도|을|를)?\\s*(?:알려|보여)|실질\\s*기준으로.*(?:알려|보여)|명목\\s*기준으로.*(?:알려|보여)",
+  "requestCases": [
+    {"question":"소비자물가조사 주요 용어해설 알려줘","topic":"소비자물가조사","facets":["term_definitions"],"role":"methodology"},
+    {"question":"전국사업체조사 용어 정의 알려줘","topic":"전국사업체조사","facets":["term_definitions"],"role":"methodology"},
+    {"question":"임의조사 주요 용어 설명 알려줘","topic":"임의조사","facets":["term_definitions"],"role":"methodology"},
+    {"question":"소비자물가조사 조사연혁 알려줘","topic":"소비자물가조사","facets":["survey_history"],"role":"methodology"},
+    {"question":"2020년 전국사업체조사 조사 개편 이력 알려줘","topic":"전국사업체조사","facets":["survey_history"],"requestedYears":["2020"],"role":"methodology"},
+    {"question":"임의조사 통계개편내역 알려줘","topic":"임의조사","facets":["survey_history"],"role":"methodology"},
+    {"question":"소비자물가조사 자료 이용시 유의사항 알려줘","topic":"소비자물가조사","facets":["usage_notes"],"role":"methodology"},
+    {"question":"임의조사 자료 이용 주의사항 알려줘","topic":"임의조사","facets":["usage_notes"],"role":"methodology"},
+    {"question":"소비자물가조사 조사연혁과 월별 추이 알려줘","facets":["survey_history"],"role":"mixed"},
+    {"question":"전국사업체조사 주요 용어해설과 사업체 수 알려줘","facets":["term_definitions"],"role":"mixed"},
+    {"question":"소비자물가조사 조사연혁 엑셀로 만들어줘","topic":"소비자물가조사","facets":["survey_history"],"role":"methodology"},
+    {"question":"소비자물가지수 값 알려줘","facets":[]},
+    {"question":"2020년 기준 소비자물가지수 월별 추이 알려줘","facets":[]},
+    {"question":"사업체 수와 기업체 수 비교해줘","facets":[]},
+    {"question":"인천 지역별 사업체 수 알려줘","facets":[]},
+    {"question":"사용자 설정 변경 이력 알려줘","facets":[]},
+    {"question":"경제활동인구조사 표본규모 알려줘","topic":"경제활동인구조사","facets":["sample_size"],"role":"methodology"}
+  ]
 }

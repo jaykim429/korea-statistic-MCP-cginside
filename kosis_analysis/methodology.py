@@ -24,7 +24,9 @@ def request_for(question: str) -> dict[str, Any] | None:
         return None
     if all(name == "base_year" for name in facets) and re.search(r"^(?:이|그|앞선|방금|이전)\s*(?:값|수치|답변)", bounded.strip()):
         return None
-    metadata_ask = re.search(r"표본|표집|오차|신뢰구간|조사\s*(?:방법|방식|설계|체계)|자료\s*수집|인과", bounded)
+    # Non-base facets explicitly name metadata. Share their vocabulary with TS
+    # rather than maintaining another hard-coded, incomplete allow-list.
+    metadata_ask = any(name != "base_year" for name in facets)
     metadata_ask = metadata_ask or re.search(r"기준\s*(?:년(?:도)?|연도|시점).*(?:언제|무엇|뭐|알려|설명|어떻게|왜)|(?:언제|무엇|뭐).*기준\s*(?:년(?:도)?|연도|시점)", bounded)
     if not metadata_ask:
         return None
@@ -100,7 +102,11 @@ def methodology_payload(question: str, request: dict, org_id: str, tbl_id: str, 
     if "sample_error" in missing:
         warnings.append("표본 설계·추정 방법과 실현된 표본오차는 다릅니다. 이 설명자료만으로 모든 지표에 공통인 오차율을 만들지 않았습니다. 원하는 지표·연도·집계 범위를 정한 뒤 해당 결과의 오차자료를 확인해야 합니다.")
     if request["requestedYears"]:
-        warnings.append("요청한 " + ", ".join(request["requestedYears"]) + "년의 설계·규모 적용 여부는 현재 설명자료에서 별도로 확인하지 못했습니다.")
+        warnings.append("요청한 " + ", ".join(request["requestedYears"]) + "년 각각에 이 설명의 정의·설계·규모가 적용되는지는 별도로 검증하지 못했습니다.")
+    if "term_definitions" in request["facets"]:
+        warnings.append("용어해설은 이 조사에 연결된 정의입니다. 다른 조사·시점에서 같은 명칭을 사용해도 동일한 집계 기준이라고 보증하지 않습니다.")
+    if any(name in request["facets"] for name in ("survey_history", "usage_notes")):
+        warnings.append("조사연혁·이용 유의사항을 조회한 것이며, 시점 간 비교 가능성을 보증하지 않습니다. 개편 기록이 없거나 비어 있어도 안전하다는 뜻은 아닙니다. 공식 연결계열·정의·모집단·분류·기준의 적용 기간을 별도로 확인해야 합니다.")
     if "base_year" in missing and re.search(r"왜|이유", question):
         warnings.append("지수 기준 표시만으로 기준년 선택·변경의 이유까지 증명하지 않았습니다.")
     return {**base, "status": "explained" if not missing and not request["requestedYears"] else "partial",
