@@ -34,6 +34,31 @@ def test_region_identity_resolves_current_metadata_not_old_codes_or_name_substri
         with pytest.raises(RuntimeError): resolve_native_region_code(param, code, scope)
 
 
+@pytest.mark.parametrize('code,label', [('OPAQUE_TOTAL','계'), ('NEW_NATION','총계'), ('NO_NUMERIC_PREFIX','합계')])
+def test_official_geographic_total_is_axis_bounded_not_a_code_or_population_alias(code,label):
+    param=replace(TIER_A_STATS['실업률'],region_scheme={'전국':'OLD','서울':'S','부산':'B'})
+    metadata=[{'OBJ_ID':'R','OBJ_NM':'시도별','ITM_ID':c,'ITM_NM':n} for c,n in [(code,label),('S_NEW','서울특별시'),('B_NEW','부산광역시')]]
+    scope=native_region_scope(param,metadata)
+    assert resolve_native_region_code(param,'OLD',scope)==code
+
+
+@pytest.mark.parametrize('mutation',['missing_member','duplicate_total','unknown_branch','municipality','nested_total','unverified','old','other_source','another_population'])
+def test_generic_total_never_excuses_missing_or_ambiguous_source_scope(mutation):
+    param=replace(TIER_A_STATS['실업률'],region_scheme={'전국':'OLD','서울':'S','부산':'B'})
+    metadata=[{'OBJ_ID':'R','OBJ_NM':'시도별','ITM_ID':c,'ITM_NM':n} for c,n in [('TOTAL','계'),('S_NEW','서울특별시'),('B_NEW','부산광역시')]]
+    if mutation=='missing_member': metadata.pop()
+    if mutation=='duplicate_total': metadata.append({**metadata[0],'ITM_ID':'TOTAL2'})
+    if mutation=='unknown_branch': metadata.append({**metadata[0],'ITM_ID':'CHINA','ITM_NM':'중국'})
+    if mutation=='municipality': metadata[1]['ITM_NM']='서울시 중구'
+    if mutation=='nested_total': metadata[0]['UP_ITM_ID']='S_NEW'
+    if mutation=='unverified': param=replace(param,verification_status='unverified')
+    if mutation=='old': param=replace(param,replacement_status='deprecated')
+    if mutation=='another_population': metadata.append({**metadata[0],'ITM_ID':'WOMEN','ITM_NM':'여성'})
+    scope=native_region_scope(param,metadata)
+    if mutation=='other_source': scope['table_id']='OTHER'
+    with pytest.raises(RuntimeError): resolve_native_region_code(param,'OLD',scope)
+
+
 @pytest.mark.parametrize('mutation', ['axis_role', 'axis_order', 'table', 'org', 'duplicate', 'dangling', 'cycle'])
 def test_invalid_metadata_cannot_authorize_a_region_code_or_hierarchy(mutation):
     param, metadata, _, _ = sample()

@@ -127,6 +127,10 @@ def _observations(payload: dict[str, Any]) -> list[dict[str, Any]]:
         normalized.append(item)
     if normalized:
         return normalized
+    # A requested region echo on a completed empty fetch is navigation, not an
+    # observed coordinate. Never label it verified_in_rows via scalar fallback.
+    if str(_first_present(payload, 'status', '상태') or '').lower() == 'no_data' or payload.get('capability_state') == 'no_data':
+        return []
     scalar = _normalize_observation(payload)
     return [scalar] if scalar else []
 
@@ -231,8 +235,10 @@ def _markers(payload: dict[str, Any]) -> set[str]:
     return {str(marker).lower() for marker in signals.get("markers_present") or []}
 
 
-def _failure(payload: dict[str, Any], execution_status: str) -> tuple[Optional[str], bool]:
+def _failure(payload: dict[str, Any], execution_status: str, observations: Optional[list[dict[str, Any]]] = None) -> tuple[Optional[str], bool]:
     if execution_status == "no_data":
+        if observations and all(row.get("value") is None and row.get("observation_state") == "suppressed" for row in observations):
+            return "observations_withheld", False
         return "no_rows", False
     if execution_status != "failed":
         return None, False
@@ -339,7 +345,7 @@ def build_stat_evidence(
     table = _table(payload)
     source = _source(payload, tool)
     execution_status = _execution_status(payload, observations)
-    failure_class, retryable = _failure(payload, execution_status)
+    failure_class, retryable = _failure(payload, execution_status, observations)
     missing_fields = _missing_evidence_fields(execution_status, observations, source, table)
     unit_binding = payload.get('unit_coordinate_binding')
     if (payload.get('actual_measure_evidence') == 'official_heading_item_coordinate' and not isinstance(unit_binding, dict)

@@ -53,7 +53,10 @@ def test_curated_seed_is_only_a_candidate_and_counts_surviving_rows(monkeypatch)
     assert unknown["result_count"] == 0
     assert unknown["결과"] == []
     sales = asyncio.run(s._search_kosis_keywords("소상공인 매출액", ["소상공인 매출액"], 8, api_key="dummy"))
-    assert any(row["통계표ID"] == "DT_3ME0100" for row in sales["결과"])
+    # A verified sales-table lead must not be hidden behind a population-only
+    # count shortcut. Its curated industry/scale coordinates are NOT imported.
+    assert sales["결과"][0]["통계표ID"] == "DT_BR_C001"
+    assert len(sales["결과"]) <= 2
     assert all("filters" not in row and "value" not in row for row in sales["결과"])
 
 

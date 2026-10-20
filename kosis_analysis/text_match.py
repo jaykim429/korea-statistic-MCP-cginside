@@ -10,7 +10,7 @@ import re
 from typing import Any, Optional
 
 from kosis_analysis.metadata import _compact_text
-from kosis_analysis.rules import measure_discovery_aliases, discovery_measure_of
+from kosis_analysis.rules import measure_discovery_aliases, discovery_measure_of, measure_relation, measure_basis_compatible
 
 
 _QUERY_STOP_TERMS = {
@@ -24,10 +24,23 @@ _QUERY_STOP_TERMS = {
 
 def _content_search_query(query: Any) -> str:
     """검색어용 질의: 명령형·일반어를 뺀 내용어만 남긴다("아동복지 관련 중소기업 통계" → "아동복지 중소기업")."""
-    tokens = _query_tokens_for_matching(query)
-    # 연도·기간 표현("2020년부터", "2023년까지", "최근5년")은 검색어가 아니다 — 넣으면 KOSIS 검색이 엉뚱한 표를 낸다(실측 V5)
-    tokens = [t for t in tokens if not re.search(r"\d", t) and t not in ("부터", "까지", "사이", "동안", "이후", "이전", "기간")]
+    # Search-only cleanup, never an execution-period/population approval. Keep
+    # bare tenure/cohort durations and numeric identifiers; remove only closed
+    # calendar/window grammar. Both "최근5년" and "최근 5년" are search windows.
+    search_text = re.sub(r"(?<![0-9A-Za-z가-힣])(?:최근|지난|직전|과거)\s*\d+\s*(?:년|개월|분기)(?:간)?(?![0-9A-Za-z가-힣])", " ", str(query or ""))
+    tokens = _query_tokens_for_matching(search_text)
+    tokens = [t for t in tokens if not _discovery_temporal_token(t)
+              and t not in ("부터", "까지", "사이", "동안", "이후", "이전", "기간")]
     return " ".join(tokens)
+
+
+def _discovery_temporal_token(token: str) -> bool:
+    """Explicit calendar tokens, not digit-bearing subjects or opaque codes."""
+    year = r"(?:19|20)\d{2}년(?:도)?"
+    subyear = r"(?:(?:0?[1-9]|1[0-2])월|제?[1-4]분기)"
+    suffix = r"(?:부터|까지|이후|이전|현재|기준)?"
+    calendar = rf"(?:{year}(?:{subyear})?|{subyear}){suffix}"
+    return bool(re.fullmatch(rf"(?:{calendar}){{1,2}}", token))
 
 
 # 사용자가 붙여 쓰는 합성어를 끊어 내기 위한 측정 명사. 긴 토큰이 표명에 그대로 없을 때만 쓴다
@@ -40,8 +53,7 @@ _MEASURE_NOUNS: tuple[str, ...] = (
 )
 # 흔한 표기 흔들림 — 표명 어휘와 맞춰야 내용어 필터가 정상 동작한다(실측: "실업율" 결과 0건)
 _TOKEN_TYPO_FIXES: tuple[tuple[str, str], ...] = (
-    ("실업율", "실업률"), ("고용율", "고용률"), ("출산율", "출산률"), ("증가율", "증가률"),
-    ("사업채", "사업체"), ("종사자수", "종사자수"), ("물가상승율", "물가상승률"),
+    ("사업채", "사업체"),
 )
 
 
@@ -50,9 +62,12 @@ def _normalize_typo_token(token: str) -> str:
     for wrong, right in _TOKEN_TYPO_FIXES:
         if token == wrong:
             return right
-    # 일반 규칙: 받침 있는 한자어 뒤의 '율'은 표명에서 '률'로 쓰인다(실업율→실업률, 고용율→고용률)
-    if len(token) >= 3 and token.endswith("율"):
-        return token[:-1] + "률"
+    # 한글 맞춤법 제11항 붙임1: 모음/ㄴ 받침 뒤는 율, 그 밖은 률.
+    # Correct 출산율/증가율 must not be corrupted. Do not guess the
+    # pronunciation of non-Hangul stems from their spelling.
+    if len(token) >= 2 and token.endswith(("율", "률")) and "가" <= token[-2] <= "힣":
+        final_consonant = (ord(token[-2]) - ord("가")) % 28
+        return token[:-1] + ("율" if final_consonant in (0, 4) else "률")
     return token
 
 
@@ -106,6 +121,50 @@ def _discovery_subject_terms(query: Any, indicator: Any = None) -> list[str]:
         if term and term not in ("합계", "총", "전국", "연간", "월간", "분기", "기간", "부터", "까지"):
             subjects.append(term)
     return list(dict.fromkeys(subjects))
+
+
+def _curated_discovery_leads(query: str, entries: dict[str, Any], limit: int = 2) -> list[dict[str, Any]]:
+    """Index verified table identities separately from fixed-coordinate mappings.
+
+    A measure-only lead may contain the requested subgroup on another axis; a
+    subject-only lead may contain other ITEMs. Neither proves executable scope.
+    Keep both discovery roles within the existing two-table seed budget.
+    """
+    asked = discovery_measure_of(query)
+    subjects = _discovery_subject_terms(query)
+    compact_query = _compact_text(query)
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, param in sorted(entries.items()):
+        if param.verification_status != "verified" or param.replacement_status != "current":
+            continue
+        description = param.measurement_name
+        measured = discovery_measure_of(description)
+        relation = measure_relation(asked, measured, (param.unit,) if param.unit else ())
+        measure_match = relation in ("exact", "proxy") and measure_basis_compatible(query, description)
+        subject_match = any(_query_token_matches_text(term, key.replace("_", " ") + " " + description) for term in subjects)
+        literal_match = any(len(_compact_text(text)) >= 4 and _compact_text(text) in compact_query
+                            for text in (key.replace("_", ""), description))
+        if not (measure_match or subject_match or literal_match):
+            continue
+        identity = (param.org_id, param.tbl_id)
+        rank = (not measure_match, not subject_match, not literal_match, key)
+        previous = indexed.get(identity)
+        if previous is not None and previous["rank"] <= rank:
+            continue
+        indexed[identity] = {"rank": rank, "measure_match": measure_match, "subject_match": subject_match,
+                             "param": param, "measure": measured}
+    ranked = sorted(indexed.values(), key=lambda row: row["rank"])
+    chosen = ranked[:max(0, limit)]
+    # Do not spend both slots on cross-population measures when a verified
+    # subject table is available. This is navigation diversity, not value proof.
+    if limit >= 2 and chosen and not any(row["subject_match"] for row in chosen):
+        subject_lead = next((row for row in ranked if row["subject_match"]), None)
+        if subject_lead is not None:
+            chosen = [chosen[0], subject_lead, *chosen[1:-1]]
+    return [{"통계표명": row["param"].tbl_nm, "통계표ID": row["param"].tbl_id, "기관ID": row["param"].org_id,
+             "검색어": query, "candidate_basis": "verified_curation_table", "metric_hint": row["measure"] or row["param"].measurement_name,
+             "curation_discovery_roles": {"measure_match": row["measure_match"], "subject_match": row["subject_match"]},
+             "match_quality": _query_match_quality(query, row["param"].measurement_name)} for row in chosen]
 
 
 def _query_token_matches_text(token: str, text: Any) -> bool:
