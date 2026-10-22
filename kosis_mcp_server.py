@@ -2991,13 +2991,19 @@ class NaturalLanguageAnswerEngine:
 
     def _is_sme_employee_average_question(self, query: str) -> bool:
         q = self._norm(query)
-        return (
-            "중소기업" in q
-            and any(term in q for term in ("종사자", "고용"))
-            # Joint lookup / comparison does not request division by businesses.
-            # Only an explicit mean or per-enterprise cue owns this operation.
-            and any(term in q for term in ("사업체당", "기업당", "평균"))
-        )
+        if "중소기업" not in q:
+            return False
+        # Bind the operation to headcount, not to any employee-related noun in
+        # the sentence (e.g. average wage/age/tenure). An unresolved expression
+        # falls through to normal lookup; it does not authorize this division.
+        headcount = r"(?:종사자수|고용인원|고용자수)"
+        continuation = r"(?=$|[은는을를이가와과]|알려|보여|비교|구해)"
+        return bool(re.search(
+            rf"(?:평균{headcount}|{headcount}(?:의)?평균|"
+            rf"(?:사업체당|기업당)(?:평균)?(?:{headcount}|종사자가몇명(?:인지)?))"
+            rf"{continuation}",
+            q,
+        ))
 
     def _is_region_compare_question(self, query: str) -> bool:
         q = self._norm(query)

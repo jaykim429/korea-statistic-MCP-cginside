@@ -15,16 +15,29 @@ COMPARISONS = [
     '중소기업 고용과 대기업 고용을 함께 보여줘',
     '중소기업 종사자 수 알려줘',
 ]
+OTHER_AVERAGES = [
+    '중소기업 종사자 평균 임금',
+    '중소기업 종사자 평균 연령',
+    '중소기업 종사자 평균 근속연수',
+    '중소기업 종사자 수와 평균 임금 알려줘',
+    '중소기업 평균 임금과 고용 인원 알려줘',
+    '중소기업 사업체당 종사자 평균 임금',
+    '중소기업 기업당 고용 인원의 평균 연령',
+    '중소기업 종사자 수의 평균 임금 알려줘',
+]
 AVERAGES = [
     '중소기업 사업체당 종사자 수 알려줘',
     '중소기업 기업당 고용 인원 알려줘',
     '중소기업 평균 종사자 수 알려줘',
     '중소기업 사업체당 평균 종사자 수와 기업 수 함께 알려줘',
     '중소기업 사업체당 종사자 수를 비교해줘',
+    '중소기업 평균 고용 인원 알려줘',
+    '중소기업 종사자 수의 평균을 알려줘',
+    '중소기업 기업당 종사자가 몇 명인지 알려줘',
 ]
 
 
-@pytest.mark.parametrize('question', COMPARISONS)
+@pytest.mark.parametrize('question', COMPARISONS + OTHER_AVERAGES)
 def test_comparison_or_joint_lookup_does_not_imply_employee_average(question):
     assert not Engine('dummy')._is_sme_employee_average_question(question)
 
@@ -34,7 +47,7 @@ def test_explicit_average_and_per_enterprise_requests_still_select_average(quest
     assert Engine('dummy')._is_sme_employee_average_question(question)
 
 
-@pytest.mark.parametrize('question', COMPARISONS)
+@pytest.mark.parametrize('question', COMPARISONS + OTHER_AVERAGES)
 def test_real_planner_does_not_turn_comparison_into_an_average(question):
     engine = Engine('dummy')
     plan = AnswerPlanner(engine).build(question, '전국', engine._route_payload(question))
@@ -48,7 +61,7 @@ def test_real_planner_retains_explicit_average_route(question):
     assert plan.action == 'sme_employee_average'
 
 
-@pytest.mark.parametrize('question', COMPARISONS[:2])
+@pytest.mark.parametrize('question', COMPARISONS[:2] + OTHER_AVERAGES)
 def test_dispatch_never_executes_unrequested_employee_average(monkeypatch, question):
     engine = Engine('dummy')
 
