@@ -2994,7 +2994,9 @@ class NaturalLanguageAnswerEngine:
         return (
             "중소기업" in q
             and any(term in q for term in ("종사자", "고용"))
-            and any(term in q for term in ("사업체당", "기업당", "평균", "함께", "비교"))
+            # Joint lookup / comparison does not request division by businesses.
+            # Only an explicit mean or per-enterprise cue owns this operation.
+            and any(term in q for term in ("사업체당", "기업당", "평균"))
         )
 
     def _is_region_compare_question(self, query: str) -> bool:
