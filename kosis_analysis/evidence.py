@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from urllib.parse import urlencode
-from .rules import intrinsic_table_scopes
+from .rules import intrinsic_table_scopes, source_population_frame
 from .units import is_ambiguous_unit, bound_unit_coordinates
 
 
@@ -127,6 +127,10 @@ def _observations(payload: dict[str, Any]) -> list[dict[str, Any]]:
         normalized.append(item)
     if normalized:
         return normalized
+    # A requested region echo on a completed empty fetch is navigation, not an
+    # observed coordinate. Never label it verified_in_rows via scalar fallback.
+    if str(_first_present(payload, 'status', '상태') or '').lower() == 'no_data' or payload.get('capability_state') == 'no_data':
+        return []
     scalar = _normalize_observation(payload)
     return [scalar] if scalar else []
 
@@ -231,8 +235,10 @@ def _markers(payload: dict[str, Any]) -> set[str]:
     return {str(marker).lower() for marker in signals.get("markers_present") or []}
 
 
-def _failure(payload: dict[str, Any], execution_status: str) -> tuple[Optional[str], bool]:
+def _failure(payload: dict[str, Any], execution_status: str, observations: Optional[list[dict[str, Any]]] = None) -> tuple[Optional[str], bool]:
     if execution_status == "no_data":
+        if observations and all(row.get("value") is None and row.get("observation_state") == "suppressed" for row in observations):
+            return "observations_withheld", False
         return "no_rows", False
     if execution_status != "failed":
         return None, False
@@ -339,11 +345,14 @@ def build_stat_evidence(
     table = _table(payload)
     source = _source(payload, tool)
     execution_status = _execution_status(payload, observations)
-    failure_class, retryable = _failure(payload, execution_status)
+    failure_class, retryable = _failure(payload, execution_status, observations)
     missing_fields = _missing_evidence_fields(execution_status, observations, source, table)
     unit_binding = payload.get('unit_coordinate_binding')
-    if unit_binding is not None and (payload.get('aggregation', 'none') != 'none'
-            or not bound_unit_coordinates(unit_binding, observations, table.get('org_id'), table.get('table_id'))):
+    if (payload.get('actual_measure_evidence') == 'official_heading_item_coordinate' and not isinstance(unit_binding, dict)
+            or unit_binding is not None and (not isinstance(unit_binding, dict) or payload.get('aggregation', 'none') != 'none'
+            or unit_binding.get('contract_version') == 'stat-unit-coordinates/v3' and (unit_binding.get('table_name') != table.get('name')
+                or payload.get('actual_measure') != unit_binding.get('measure_name') or payload.get('actual_measure_evidence') != 'official_heading_item_coordinate')
+            or not bound_unit_coordinates(unit_binding, observations, table.get('org_id'), table.get('table_id')))):
         if 'unit' not in missing_fields:
             missing_fields.append('unit')
 
@@ -392,15 +401,22 @@ def build_stat_evidence(
     regional_coordinates = payload.get('regional_coordinates') if tool in {'query_table', 'answer_query', 'quick_stat', 'quick_trend', 'quick_region_compare'} and payload.get('aggregation', 'none') == 'none' else None
     if not regional_coordinates and execution_status == 'executed' and 'KOSIS' in str(source.get('label') or '').upper() and not source.get('native_identity'):
         regional_coordinates = native_regional_coordinates(payload, observations, table, tool, TIER_A_STATS)
+    source_constraints = intrinsic_table_scopes(table["name"], payload.get("survey_name"))
     evidence = {
         "observations": observations,
         "source": source,
         "table": table,
         # Completeness/execution is not a claim to cover the user's entire population.
         # Request-independent constraints survive even when all row axes say 'total'.
-        "source_scope": {"contract_version": "stat-source-scope/v1", "basis": "official_table_title",
+        "source_scope": {"contract_version": "stat-source-scope/v1", "basis":
+                         "official_title_and_survey" if any(scope['id'].startswith('table-metric:') for scope in source_constraints)
+                         else "official_survey_subject" if any(scope['id'].startswith('survey-subject:') for scope in source_constraints) else "official_table_title",
                          "org_id": table["org_id"], "table_id": table["table_id"],
-                         "constraints": intrinsic_table_scopes(table["name"])},
+                         "constraints": source_constraints,
+                         "population_frame": source_population_frame(table["org_id"], payload.get("survey_name"),
+                                                                      [str(row.get("period") or "") for row in observations])
+                         if execution_status == 'executed' and 'KOSIS' in str(source.get('label') or '').upper()
+                         and not source.get('native_identity') else None},
         "actual_measure": actual_measure,
         "actual_measure_evidence": actual_measure_evidence,
         "measure_definition": payload.get("measure_definition"),

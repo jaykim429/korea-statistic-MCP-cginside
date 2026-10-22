@@ -3,14 +3,103 @@
     ["서울", "서울특별시"], ["부산", "부산광역시"], ["대구", "대구광역시"], ["인천", "인천광역시"], ["광주", "광주광역시"], ["대전", "대전광역시"], ["울산", "울산광역시"], ["세종", "세종특별자치시"],
     ["경기", "경기도"], ["강원", "강원도", "강원특별자치도"], ["충북", "충청북도"], ["충남", "충청남도"], ["전북", "전라북도", "전북특별자치도"], ["전남", "전라남도"], ["경북", "경상북도"], ["경남", "경상남도"], ["제주", "제주도", "제주특별자치도"]],
   "compoundLabels": ["고용원없는"],
+  "requestScope": {
+    "_doc": "출처 범위를 긍정 요청했는지 판별하는 공통 어휘. 제외/대체/범위 확대 표현을 삭제하거나 집합 계산으로 해석하지 않는다. subject의 독립 단어 경계와 다른 한정어 검증은 소비자가 유지한다.",
+    "negativePrefixes": ["비"],
+    "particles": ["에서", "으로", "을", "를", "이", "가", "은", "는", "의", "만", "도"],
+    "nonPositiveSuffixPatterns": [
+      "제외|이외|아닌|말고|아니라|아니고|대신|빼(?:고|면|서)|빼놓고|제하고|뺀|없이",
+      "포함|비롯",
+      "외(?:에|의)?(?=$|[\\s」』),?？])",
+      "등(?=$|[\\s」』),?？])"
+    ],
+    "cases": [
+      {"phrase":"소상공인","question":"소상공인 사업체 수","requested":true},
+      {"phrase":"소상공인","question":"소 상 공 인의 사업체 수","requested":true},
+      {"phrase":"소상공인","question":"중소기업 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"비소상공인 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 제외한 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인만 제외한 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인도 제외한 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 빼면 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 빼서 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 빼놓고 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 제하고 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인만 사업체 수","requested":true},
+      {"phrase":"소상공인","question":"소상공인도 사업체 수","requested":true},
+      {"phrase":"소상공인","question":"소상공인 이외 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인이 아닌 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인 말고 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인이 아니라 전체 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인이 아니고 전체 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인대신 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 빼고 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을뺀 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인 없이 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 포함한 전체 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인을 비롯한 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인 외 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인 외의 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인 등 사업체 수","requested":false},
+      {"phrase":"소상공인","question":"소상공인 등급별 사업체 수","requested":true},
+      {"phrase":"소상공인","question":"소상공인 외국인 종사자 수","requested":true},
+      {"phrase":"소상공인","question":"소상공인 사업체 수와 소상공인 제외 사업체 수","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업 매출액","requested":true},
+      {"phrase":"임의신산업","question":"임의신산업을 빼고 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업에서 제외한 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업만 제외한 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업도 제외한 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업을 빼면 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업을 빼서 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업을 빼놓고 매출액","requested":false},
+      {"phrase":"임의신산업","question":"임의신산업을 제하고 매출액","requested":false},
+      {"phrase":"온라인쇼핑","question":"온라인쇼핑 없이 거래액","requested":false},
+      {"phrase":"등록취업자","question":"등록취업자 대신 취업자 수","requested":false},
+      {"phrase":"위생용품","question":"위생용품을 뺀 무역수지","requested":false},
+      {"phrase":"지식재산권","question":"지식재산권 없이 무역수지","requested":false},
+      {"phrase":"","question":"사업체 수","requested":false}
+    ]
+  },
   "intrinsicTableScopes": [
     {"id": "employment-registered", "label": "등록취업자", "tablePhrases": ["등록취업자"], "requestPhrases": ["등록취업자"], "excludes": []},
     {"id": "sector-manufacturing", "label": "제조업 부문", "dimension": "industry", "tablePhrases": ["제조업부문"], "requestPhrases": ["제조업"], "excludes": []},
     {"id": "sector-mining", "label": "광업 부문", "dimension": "industry", "tablePhrases": ["광업부문"], "requestPhrases": ["광업"], "excludes": []}
   ],
   "tablePopulationHeads": [
-    {"head": "가구", "neutralPrefixes": ["일반", "전체", "총", "총계"]}
+    {"head": "가구", "neutralPrefixes": ["일반", "전체", "총", "총계"]},
+    {"head": "기업", "neutralPrefixes": ["전체", "총", "총계", "활동"], "requireHeadForSinglePrefix": true},
+    {"head": "기업체", "neutralPrefixes": ["전체", "총", "총계", "활동"], "requireHeadForSinglePrefix": true},
+    {"head": "사업체", "neutralPrefixes": ["전체", "총", "총계", "활동"], "requireHeadForSinglePrefix": true}
   ],
+  "tableMetricHeading": {
+    "measureSuffixes": ["액", "량"],
+    "additionalHeads": ["무역수지", "시장규모", "국내판매액"],
+    "surveySuffixes": ["산업현황", "산업실태조사", "실태조사"],
+    "neutralPrefixes": ["전체", "전국", "총", "총계", "전산업", "전체산업", "연간", "월간", "분기", "연평균", "월평균"],
+    "cases": [
+      {"title":"위생용품 생산·수출·수입액 무역수지, 시장규모","prefix":"위생용품"},
+      {"title":"의료기기 생산액 및 수출액","prefix":"의료기기"},
+      {"title":"반도체 수출액","prefix":"반도체"},
+      {"title":"지역별 2차전지 생산량, 판매액","prefix":"2차전지"},
+      {"title":"당근 생산량","prefix":"당근"},
+      {"title":"여성기업 매출액","prefix":"여성기업"},
+      {"title":"수출액 및 수입액","prefix":null},
+      {"title":"국내판매액","prefix":null},
+      {"title":"전체 생산액·수출액","prefix":null},
+      {"title":"산업별 수출액","prefix":null},
+      {"title":"지역별 산업별 생산액","prefix":null},
+      {"title":"기업체당 매출액","prefix":null},
+      {"title":"1인당 소비량","prefix":null},
+      {"title":"연간 수출액","prefix":null},
+      {"title":"지역별 생산액 현황","prefix":null},
+      {"title":"여성 매출액 및 남성 생산량","prefix":null},
+      {"title":"생활수준 및 소비량","prefix":null},
+      {"title":"생명표","prefix":null},
+      {"title":"경제활동별 GDP 및 GNI(원계열, 명목, 분기 및 연간)","prefix":null},
+      {"title":"소비자물가지수","prefix":null},
+      {"title":"미등록 대상 수탁거래 현황","prefix":null}
+    ]
+  },
   "hierarchies": [
     {"parent": "임금근로자", "children": ["상용근로자", "임시근로자", "일용근로자"]},
     {"parent": "연금", "children": ["국민연금", "공무원연금", "군인연금", "사학연금"]},
@@ -18,6 +107,35 @@
     {"parent": "중소기업", "children": ["소기업", "중기업"]},
     {"parent": "소기업", "children": ["소상공인"]}
   ],
+  "sourcePopulationFrames": [
+    {
+      "id": "labour-establishments-2024",
+      "surveyNames": ["사업체노동실태현황"],
+      "orgIds": ["118"],
+      "periodStart": "2024",
+      "periodEnd": "2024",
+      "coverage": "restricted",
+      "definition": "전국사업체조사 원자료에서 일부 사업체를 제외한 고용노동부 가공통계",
+      "exclusions": ["고정 사업장이 없는 사업체", "자영업자·무급가족종사자만 있는 사업체", "공공행정·국방·사회보장행정", "공무원 재직기관"],
+      "references": ["https://kosis.kr/civilComplaint/qnaDetail.do?boardIdx=25843"],
+      "reviewedAt": "2026-10-15"
+    }
+  ],
+  "surveySubjectGrammar": {
+    "pattern": "^([0-9A-Za-z가-힣]{1,80}산업)(?:실태조사|조사|현황)$",
+    "neutralSubjects": ["전국산업", "전산업", "전체산업"],
+    "cases": [
+      {"survey": "「나노융합산업조사」", "subject": "나노융합산업"},
+      {"survey": "임의신산업실태조사", "subject": "임의신산업"},
+      {"survey": "2차전지산업현황", "subject": "2차전지산업"},
+      {"survey": "전국산업조사", "subject": null},
+      {"survey": "전산업조사", "subject": null},
+      {"survey": "산업조사", "subject": null},
+      {"survey": "나노융합산업 관련 조사", "subject": null},
+      {"survey": "나노융합산업조사 참고문", "subject": null},
+      {"survey": "나노융합산업및다른산업조사", "subject": null}
+    ]
+  },
   "scopedSurveys": [
     {"name": "온라인쇼핑동향조사", "population": "온라인쇼핑"},
     {"name": "소상공인실태조사", "population": "소상공인"},

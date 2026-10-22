@@ -63,6 +63,7 @@ from kosis_analysis.ranking import ranked_comparison
 from kosis_analysis.primary_series import query_primary_series
 from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure, apply_classification_measure
 from kosis_analysis.methodology import request_for as methodology_request, methodology_payload
+from kosis_analysis.request_transition import execution_question
 from kosis_analysis.metadata import (
     MetadataCompatibilityScorer,
     TableMetadataProfile,
@@ -83,6 +84,7 @@ from kosis_analysis.metadata import (
 from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases, discovery_measure_of
 from kosis_analysis.text_match import (
     _content_search_query,
+    _curated_discovery_leads,
     _discovery_subject_terms,
     _match_quality_rank,
     _normalize_typo_query,
@@ -543,13 +545,20 @@ def _finalize_answer_query_response(
 
 def _native_answer_context(payload: dict[str, Any]) -> dict[str, Any]:
     """Legacy answer prose must not discard the executed canonical row/unit owner."""
-    return {key: payload[key] for key in (
+    context = {key: payload[key] for key in (
         'rows', 'unit_coordinate_binding', 'actual_measure', 'actual_measure_evidence',
         'measure_definition', 'measure_role_evidence', 'curation_measure_binding',
         'measure_basis', 'aggregation', 'source_url', 'regional_coordinates',
         'regional_selection', 'warnings', '범위_안내',
         'ranking',
     ) if payload.get(key) not in (None, '', [])}
+    if payload.get('status') == 'no_data':
+        context.update({key: payload[key] for key in (
+            'status', '상태', 'code', '코드', 'capability_state', 'actual_query_supported',
+            'verification_level', 'answer', 'requested_period', 'available_period',
+            'period_selection_mode', 'missing_periods',
+        ) if key in payload})
+    return context
 
 
 def _mcp_tool_output_contract(
@@ -2982,11 +2991,19 @@ class NaturalLanguageAnswerEngine:
 
     def _is_sme_employee_average_question(self, query: str) -> bool:
         q = self._norm(query)
-        return (
-            "중소기업" in q
-            and any(term in q for term in ("종사자", "고용"))
-            and any(term in q for term in ("사업체당", "기업당", "평균", "함께", "비교"))
-        )
+        if "중소기업" not in q:
+            return False
+        # Bind the operation to headcount, not to any employee-related noun in
+        # the sentence (e.g. average wage/age/tenure). An unresolved expression
+        # falls through to normal lookup; it does not authorize this division.
+        headcount = r"(?:종사자수|고용인원|고용자수)"
+        continuation = r"(?=$|[은는을를이가와과]|알려|보여|비교|구해)"
+        return bool(re.search(
+            rf"(?:평균{headcount}|{headcount}(?:의)?평균|"
+            rf"(?:사업체당|기업당)(?:평균)?(?:{headcount}|종사자가몇명(?:인지)?))"
+            rf"{continuation}",
+            q,
+        ))
 
     def _is_region_compare_question(self, query: str) -> bool:
         q = self._norm(query)
@@ -5024,6 +5041,7 @@ async def quick_stat(
         예: {"industry": "제조업"}. 실제 슬라이싱에는 사용하지 않고,
         응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
     """
+    query = execution_question(query)
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return attach_stat_evidence(
@@ -5510,6 +5528,7 @@ async def quick_trend(
     extra_params는 quick_stat과 동일하게 실제 슬라이싱에 사용하지 않고
     응답의 `⚠️ 무시된_파라미터` 필드에 노출합니다.
     """
+    query = execution_question(query)
     resolved_source = _resolve_tool_source_system(query, source_system)
     if resolved_source and resolved_source != "KOSIS":
         return _unsupported_source_response("quick_trend", query, resolved_source)
@@ -5781,6 +5800,13 @@ async def _quick_trend_core(
             f"시계열 최신 시점 {used_period} (약 {age:.1f}년 경과) — "
             "최신 데이터가 아닐 수 있음"
         )
+    if not data:
+        result.update({
+            "status": "no_data", "상태": "no_data", "code": "NO_DATA", "코드": "NO_DATA",
+            "capability_state": "no_data", "actual_query_supported": False,
+            "verification_level": "no_data",
+            "answer": "이 통계표의 요청한 지역·기간에서 조회된 관측 행이 없습니다. 다른 시점이나 집계 기준의 값으로 대신하지 않았습니다.",
+        })
     return result
 
 
@@ -8033,16 +8059,17 @@ async def explain_statistic(
     query: str, org_id: Optional[str] = None, tbl_id: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> dict:
-    """[📖] 공식 통계설명 API의 조사규모·표본설계·오차 방법·지수 기준 표시를 조회.
+    """[📖] 공식 통계설명 API의 조사규모·표본설계·오차 방법·지수 기준·용어해설·조사연혁·이용 유의사항을 조회.
 
     관측값 조회/표본오차 계산 도구가 아니다. 연도별 설계 적용이나 실현 오차를 추정하지 않는다.
+    설명 항목을 서로 섞지 않으며, 연혁의 개편 기록 유무만으로 시계열 비교를 승인하거나 차단하지 않는다.
     표가 지정되면 그 표에 연결된 공식 조사를 새로 확인하며, 없으면 정확한 등록 지표/조사명으로 찾는다.
     """
     request = methodology_request(query)
     empty = {"contract_version": "stat-methodology/v1", "role": "methodology", "question": query,
              "actual_query_supported": False, "fields": []}
     if not request:
-        return {**empty, "status": "invalid_request", "explanation": "표본 규모·설계·오차 또는 지수 기준년 등 설명 항목을 지정하세요."}
+        return {**empty, "status": "invalid_request", "explanation": "표본 규모·설계·오차, 지수 기준년, 주요 용어해설, 조사연혁 또는 자료 이용 유의사항을 지정하세요."}
     if "causal" in request["facets"]:
         return {**empty, "status": "context_only", "requested_facets": request["facets"],
                 "explanation": "관측 통계나 조사 설계 설명만으로 정책 효과의 인과성을 증명할 수 없습니다. 별도의 식별 설계와 가정 검토가 필요합니다."}
@@ -8105,6 +8132,7 @@ async def answer_query(
     start_year/end_year가 있으면 최신 단일값 shortcut 대신 명시 기간 시계열을 반환한다.
     verbose=False를 지정하면 data/metadata/notes 중심의 슬림 응답을 반환한다.
     """
+    query = execution_question(query)
     request = methodology_request(query)
     if request and request["role"] == "methodology":
         # Direct MCP callers share the role boundary; metadata must not become a fabricated observation.
@@ -8762,29 +8790,7 @@ async def _search_kosis_keywords(
         deduped_rows.append(row)
     # Curation supplies table candidates, not permission to execute its total.
     # Facets must still pass the ordinary metadata/ITEM/axis validation below.
-    compact_query = re.sub(r"\s+", "", query)
-    seeds = []
-    seeded = set()
-    for stat_key, param in sorted(TIER_A_STATS.items(), key=lambda entry: 0 if entry[0].replace("_", "") in compact_query else 1):
-        if param.verification_status != "verified" or param.replacement_status != "current":
-            continue
-        terms = [stat_key.replace("_", ""), param.description]
-        metric_match = any(len(re.sub(r"\s+", "", term)) >= 4 and re.sub(r"\s+", "", term) in compact_query for term in terms)
-        population = stat_key.rsplit("_", 1)[0] if "_" in stat_key else ""
-        population_match = population in ("소상공인", "중소기업") and population in compact_query
-        if not metric_match and not population_match:
-            continue
-        identity = (param.org_id, param.tbl_id)
-        if identity in seeded:
-            continue
-        seeded.add(identity)
-        seeds.append(_catalog_candidate_with_query_status({
-            "통계표명": param.tbl_nm, "통계표ID": param.tbl_id, "기관ID": param.org_id,
-            "검색어": query, "candidate_basis": "verified_curation_table", "metric_hint": param.description,
-            "match_quality": _query_match_quality(query, param.description),
-        }))
-        if len(seeds) >= 2:
-            break
+    seeds = [_catalog_candidate_with_query_status(row) for row in _curated_discovery_leads(query, TIER_A_STATS)]
     seed_ids = {(row["기관ID"], row["통계표ID"]) for row in seeds}
     result_rows = (seeds + [row for row in deduped_rows if (row.get("기관ID"), row.get("통계표ID")) not in seed_ids])[:limit]
     search_markers = [marker for marker in search_markers if marker != "search_empty"]
@@ -11522,6 +11528,14 @@ async def select_table_for_query(
         if isinstance(term, str) and term.strip()
     ]
     search_queries = list(dict.fromkeys(search_queries))
+    # Focused natural-language search can return only a rate/survival title
+    # while the requested count is an ITEM in a parent count-family table.
+    # Broaden discovery by one known count family; retain original measure,
+    # populations/dimensions/period and every execution gate.
+    parent_count = measure_of(indicator_raw_input)
+    if parent_count and parent_count.endswith('수') and parent_count != re.sub(r'\s+', '', indicator_raw_input or ''):
+        if parent_count not in search_queries:
+            search_queries.append(parent_count)
     searches = await asyncio.gather(*[
         search_kosis(term, limit=limit, use_routing=True, api_key=key)
         for term in search_queries

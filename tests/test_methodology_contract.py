@@ -1,7 +1,57 @@
 import asyncio
 import pytest
 import kosis_mcp_server as server
-from kosis_analysis.methodology import request_for, explanation_fields, methodology_payload
+from kosis_analysis.methodology import RULES, request_for, explanation_fields, methodology_payload
+
+
+@pytest.mark.parametrize('fixture', RULES['requestCases'], ids=lambda fixture: fixture['question'])
+def test_official_reference_requests_share_roles_with_the_application(fixture):
+    result = request_for(fixture['question'])
+    if not fixture['facets']:
+        assert result is None
+    else:
+        assert result['facets'] == fixture['facets']
+        assert result['role'] == fixture['role']
+        assert result['requestedYears'] == fixture.get('requestedYears', [])
+        if 'topic' in fixture:
+            assert result['topic'] == fixture['topic']
+
+
+@pytest.mark.parametrize('facet,field,query', [
+    ('term_definitions', 'mainTermExpl', '임의조사 주요 용어해설 알려줘'),
+    ('survey_history', 'examinHistory', '임의조사 조사연혁 알려줘'),
+    ('usage_notes', 'dataUserNote', '임의조사 자료 이용시 유의사항 알려줘'),
+])
+def test_new_official_fields_are_not_numeric_or_continuity_approval(facet, field, query):
+    rows = [{'statsNm': '임의조사'}, {field: '<p>2023년: 정의 변경</p>'}]
+    result = methodology_payload(query, request_for(query), 'ORG_RANDOM', 'TABLE_RANDOM', rows)
+    assert result['status'] == 'explained'
+    assert result['actual_query_supported'] is False and result['role'] == 'methodology'
+    assert result['covered_facets'] == [facet]
+    assert result['fields'] == [{'key': field, 'label': RULES['fieldLabels'][field], 'text': '2023년: 정의 변경'}]
+    assert not any(key in result for key in ['data', 'continuity_safe', 'comparable', 'actual_value'])
+    assert any('다른 조사' in warning for warning in result['warnings']) if facet == 'term_definitions' else any('보증' in warning for warning in result['warnings'])
+
+
+@pytest.mark.parametrize('value', ['', '첨부파일 있음', '해당없음'])
+def test_absent_history_is_not_a_safety_guarantee(value):
+    query = '임의조사 조사연혁 알려줘'
+    result = methodology_payload(query, request_for(query), 'X', 'Y', [{'statsNm': '임의조사'}, {'examinHistory': value}, {'dataUserNote': '2023년 기준 변경'}])
+    assert result['status'] == 'partial'
+    assert result['covered_facets'] == [] and result['missing_facets'] == ['survey_history']
+    assert not any(field['key'] == 'examinHistory' for field in result['fields'])
+    assert any('보증' in warning for warning in result['warnings'])
+
+
+def test_explanation_fields_never_merge_history_definitions_or_units():
+    query = '2023년 임의조사 주요 용어해설과 조사연혁 알려줘'
+    rows = [{'statsNm': '임의조사'}, {'mainTermExpl': '기업체: 법적 단위'},
+            {'examinHistory': '2023년: 모집단 변경'}, {'dataUserNote': '사업체와 기업체는 다름'}]
+    result = methodology_payload(query, request_for(query), 'X', 'Y', rows)
+    assert result['status'] == 'partial' and result['requested_years'] == ['2023']
+    assert {field['key']: field['text'] for field in result['fields']} == {
+        'mainTermExpl': '기업체: 법적 단위', 'examinHistory': '2023년: 모집단 변경'}
+    assert any('2023' in warning for warning in result['warnings'])
 
 
 @pytest.mark.parametrize('query,topic,facets', [
@@ -57,14 +107,16 @@ def test_duplicate_survey_names_are_deduplicated_but_conflicting_sources_and_att
     assert not result['fields'] and result['missing_facets'] == ['sample_error']
 
 
-def test_direct_answer_query_routes_methods_without_any_value_query(monkeypatch):
+@pytest.mark.parametrize('query', ['경제활동인구조사 표본 규모가 얼마야?', '임의조사 주요 용어해설 알려줘',
+                                  '임의조사 조사연혁 알려줘', '임의조사 자료 이용시 유의사항 알려줘'])
+def test_direct_answer_query_routes_methods_without_any_value_query(monkeypatch, query):
     async def explain(query, **kwargs):
         return {'role': 'methodology', 'actual_query_supported': False}
     async def no_value(*args, **kwargs):
         raise AssertionError('metadata was routed into a numerical series query')
     monkeypatch.setattr(server, 'explain_statistic', explain)
     monkeypatch.setattr(server, 'query_primary_series', no_value)
-    assert asyncio.run(server.answer_query('경제활동인구조사 표본 규모가 얼마야?'))['role'] == 'methodology'
+    assert asyncio.run(server.answer_query(query))['role'] == 'methodology'
 
 
 def test_survey_discovery_is_exact_not_a_numeric_or_title_rank_guess(monkeypatch):

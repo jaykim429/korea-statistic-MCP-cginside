@@ -2,6 +2,7 @@
   "percentPattern": "%|퍼센트|백분율",
   "numeratorPattern": "원|달러|USD|KRW|엔|유로|개|명|건|가구|개소",
   "alternativeSeparatorPattern": "[\\s,]+",
+  "compactCountPercentPattern": "^((?:천|만|백만|억)?(?:개소|개|명|건|가구|호|대))(%p?)$",
   "alternativeForbiddenPattern": "[/()\\[\\]=]",
   "alternativeUnitPattern": "^(?:%p?|퍼센트|백분율|(?:천|만|백만|억|십억|100만)?(?:원|달러|USD|KRW|엔|유로|개|명|건|가구|호|개소|대))$",
   "countUnitPattern": "^(?:천|만|백만|억)?(?:명|건|개|호|가구|개소|대)$",
@@ -9,6 +10,9 @@
   "unitSuffixPattern": "[（(]([^（）()]+)[）)]\\s*$",
   "perPopulationPattern": "^인구\\s*((?:천|만|10만|십만|백만|100만))\\s*명당\\s*\\S",
   "cases": [
+    {"source": "개%", "unit": "개", "ambiguous": true, "alternative": true},
+    {"source": "개%", "unit": "%", "ambiguous": true, "alternative": true},
+    {"source": "개%", "unit": "천개", "ambiguous": true, "alternative": false},
     {"source": "백만원 %p", "unit": "백만원", "ambiguous": true, "alternative": true},
     {"source": "백만원, %p", "unit": "백만원", "ambiguous": true, "alternative": true},
     {"source": "백만원 %p", "unit": "%p", "ambiguous": true, "alternative": true},

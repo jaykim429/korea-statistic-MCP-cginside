@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from .curated_identity import curated_required_coordinates
-from .rules import canonical_population_label, UNIT_RULES
+from .rules import canonical_population_label, UNIT_RULES, source_count_heading, count_measure_unit_matches
 
 
 def is_ambiguous_unit(unit):
@@ -15,6 +15,9 @@ def flat_unit_alternatives(source):
     text = str(source or '').strip()
     if re.search(UNIT_RULES['alternativeForbiddenPattern'], text):
         return []
+    compact = re.fullmatch(UNIT_RULES['compactCountPercentPattern'], text)
+    if compact:
+        return [compact[1], compact[2]]
     tokens = re.split(UNIT_RULES['alternativeSeparatorPattern'], text)
     return tokens if len(tokens) >= 2 and all(re.fullmatch(UNIT_RULES['alternativeUnitPattern'], token, re.I) for token in tokens) else []
 
@@ -48,6 +51,26 @@ def official_coordinate_unit(source, dimensions):
     return None
 
 
+def official_heading_item_unit(source, dimensions, title):
+    item = dimensions.get('ITEM') or {}
+    heading = source_count_heading(title, str(item.get('label') or ''))
+    if not heading:
+        return None
+    alternatives = flat_unit_alternatives(source)
+    available = alternatives or [str(source or '').strip()]
+    declarations = [dim['unit'] for dim in dimensions.values() if isinstance(dim,dict) and dim.get('unit')]
+    candidates = [unit for unit in available if (count_measure_unit_matches(heading['family'], unit) if heading['kind']=='count' else unit=='%')
+                  and all(value == unit or (len(flat_unit_alternatives(value))==len(available) and set(flat_unit_alternatives(value))==set(available)) for value in declarations)]
+    if len(candidates) != 1:
+        return None
+    unit = candidates[0]
+    for dim in dimensions.values():
+        declared = dim.get('unit') if isinstance(dim, dict) else None
+        if declared and declared != unit and (len(flat_unit_alternatives(declared)) != len(available) or set(flat_unit_alternatives(declared)) != set(available)):
+            return None
+    return unit
+
+
 def apply_official_coordinate_unit(payload, axis_order, axis_codebook):
     """Resolve only when every current coordinate is corroborated by official metadata."""
     rows, metadata = payload.get('rows') or [], payload.get('metadata_source') or {}
@@ -60,6 +83,7 @@ def apply_official_coordinate_unit(payload, axis_order, axis_codebook):
     selected = {axis: {} for axis in axis_order}
     declared_units = {axis: {} for axis in axis_order}
     resolutions = []
+    headings = []
     for row in rows:
         dimensions = row.get('dimensions')
         if not isinstance(dimensions, dict) or set(dimensions) != set(axis_order):
@@ -79,10 +103,19 @@ def apply_official_coordinate_unit(payload, axis_order, axis_codebook):
             selected[axis][code], declared_units[axis][code] = label, unit
         source = str(row.get('source_unit', row.get('unit')) or '')
         unit = official_coordinate_unit(source, dimensions)
+        heading = source_count_heading(str(payload.get('table_name') or ''), str(dimensions['ITEM'].get('label') or ''))
+        if not payload.get('actual_measure') and not payload.get('measure_role_evidence'):
+            heading_unit = official_heading_item_unit(source, dimensions, str(payload.get('table_name') or ''))
+            if heading_unit and (not unit or unit == heading_unit):
+                unit = heading_unit
+                headings.append(heading)
         if not unit:
             return
         resolutions.append((source, unit))
     if len({unit for _, unit in resolutions}) != 1:
+        return
+    heading = headings[0] if headings else None
+    if heading and (len(headings) != len(rows) or len(selected['ITEM']) != 1 or any(value != heading for value in headings)):
         return
     unit = resolutions[0][1]
     for row, (source, _) in zip(rows, resolutions):
@@ -90,14 +123,18 @@ def apply_official_coordinate_unit(payload, axis_order, axis_codebook):
         if re.fullmatch(UNIT_RULES['indexBasePattern'], source):
             row['index_base'] = source
     payload['unit_coordinate_binding'] = {
-        'contract_version': 'stat-unit-coordinates/v2', 'basis': 'official_coordinate_metadata',
+        'contract_version': 'stat-unit-coordinates/v3' if heading else 'stat-unit-coordinates/v2',
+        'basis': 'official_heading_item_metadata' if heading else 'official_coordinate_metadata',
         'org_id': payload['org_id'], 'table_id': payload['tbl_id'], 'unit': unit,
         'metadata_fetched_at': metadata['fetched_at'], 'metadata_tool': 'explore_table',
         'references': ['https://kosis.kr/statHtml/statHtml.do?' + urlencode({'orgId': payload['org_id'], 'tblId': payload['tbl_id']})],
         'required_coordinates': {axis: sorted(labels) for axis, labels in selected.items()},
         'coordinate_labels': selected, 'coordinate_units': declared_units,
         'source_units': sorted({source for source, _ in resolutions}), 'all_observations_matched': True,
+        **({'table_name': payload['table_name'], 'measure_name': heading['measure']} if heading else {}),
     }
+    if heading:
+        payload.update(actual_measure=heading['measure'], actual_measure_evidence='official_heading_item_coordinate')
 
 
 def reviewed_unit_alternative(source_unit, selected_unit):
@@ -105,7 +142,7 @@ def reviewed_unit_alternative(source_unit, selected_unit):
     source = str(source_unit or '').strip()
     if not is_ambiguous_unit(source) or re.search(UNIT_RULES['alternativeForbiddenPattern'], source):
         return False
-    tokens = re.split(UNIT_RULES['alternativeSeparatorPattern'], source)
+    tokens = flat_unit_alternatives(source)
     return len(tokens) >= 2 and selected_unit in tokens and all(re.fullmatch(UNIT_RULES['alternativeUnitPattern'], unit, re.I) for unit in tokens)
 
 def apply_curated_coordinate_unit(payload, axis_order, registry, axis_codebook):
@@ -190,9 +227,20 @@ def bound_unit_coordinates(binding, rows, org_id, table_id):
     if not isinstance(binding, dict) or not rows:
         return None
     official = binding.get('contract_version') == 'stat-unit-coordinates/v2' and binding.get('basis') == 'official_coordinate_metadata'
+    heading = binding.get('contract_version') == 'stat-unit-coordinates/v3' and binding.get('basis') == 'official_heading_item_metadata'
+    official = official or heading
     reviewed = binding.get('contract_version') == 'stat-unit-coordinates/v1' and binding.get('basis') == 'verified_curation_coordinates'
     if not official and not reviewed:
         return None
+    if heading:
+        items = {str((row.get('dimensions', {}).get('ITEM') or {}).get('code') or '') for row in rows if isinstance(row, dict)}
+        if len(items) != 1 or not binding.get('table_name'):
+            return None
+        for row in rows:
+            dimensions = row.get('dimensions') or {}
+            role = source_count_heading(binding['table_name'], str((dimensions.get('ITEM') or {}).get('label') or ''))
+            if not role or role['measure'] != binding.get('measure_name') or official_heading_item_unit(row.get('source_unit', ''), dimensions, binding['table_name']) != binding.get('unit'):
+                return None
     if not org_id or not table_id or (binding.get('org_id'), binding.get('table_id')) != (org_id, table_id) or binding.get('all_observations_matched') is not True:
         return None
     unit, constraints, labels = binding.get('unit'), binding.get('required_coordinates'), binding.get('coordinate_labels')
@@ -235,7 +283,7 @@ def bound_unit_coordinates(binding, rows, org_id, table_id):
                 return None
             if reviewed and coordinate.get('unit') and coordinate['unit'] != unit:
                 return None
-        if official and official_coordinate_unit(row.get('source_unit', ''), dimensions) != unit:
+        if official and not heading and official_coordinate_unit(row.get('source_unit', ''), dimensions) != unit:
             return None
     if any({row['dimensions'][axis]['code'] for row in rows} != set(codes) for axis, codes in constraints.items()):
         return None

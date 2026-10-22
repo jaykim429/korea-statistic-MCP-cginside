@@ -11,7 +11,7 @@ import re
 from .evidence import kosis_row_dimensions
 from .geography import classify_nodes, project_metadata_coordinates, regional_frontier
 from .metadata import _build_axis_codebook, _normalize_stat_value
-from .rules import GEOGRAPHY_RULES, canonical_population_label, regional_kind
+from .rules import GEOGRAPHY_RULES, canonical_population_label, regional_kind, is_total_label_strict
 
 
 def native_region_scope(param, metadata):
@@ -59,6 +59,21 @@ def resolve_native_region_code(param, code, scope):
         raise RuntimeError('[REGION_COORDINATE_UNRESOLVED] 요청 지역 코드가 현재 공식 분류에 없습니다.')
     matches = [node['code'] for node in scope['nodes']
                if canonical_population_label(node['label']) == canonical_population_label(expected)]
+    # A generic total is meaningful only inside this fresh geographic axis and
+    # the current reviewed national codebook. Never make 계 a population alias
+    # or trust a code such as 00 in isolation. All reviewed provincial members
+    # must be uniquely present; mixed/foreign/unknown branches remain unresolved.
+    if not matches and expected == '전국' and param.verification_status == 'verified' and param.replacement_status == 'current':
+        nodes = scope['nodes']
+        provincial = [name for name in param.region_scheme if regional_kind(name) == 'province']
+        totals = [node for node in nodes if not node.get('parent') and is_total_label_strict(node['label'])]
+        members_match = len(provincial) >= 2 and all(sum(
+            canonical_population_label(node['label']) == canonical_population_label(name)
+            for node in nodes) == 1 for name in provincial)
+        geographic_only = all(regional_kind(node['label']) == 'province' or node in totals for node in nodes)
+        same_source = (scope.get('org_id'), scope.get('table_id')) == (param.org_id, param.tbl_id)
+        if same_source and members_match and geographic_only and len(totals) == 1:
+            matches = [totals[0]['code']]
     if len(matches) != 1:
         raise RuntimeError('[REGION_COORDINATE_UNRESOLVED] 요청 지역을 현재 공식 코드·라벨에 유일하게 연결할 수 없습니다.')
     return matches[0]
