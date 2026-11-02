@@ -46,7 +46,8 @@
     {"basis": "전분기비", "pattern": "전분기|직전분기|지난분기"},
     {"basis": "전년비", "pattern": "(?:전년|작년|지난해)(?:대비|비|보다)|연간"},
     {"basis": "전년누계비", "pattern": "누계|누적|연초대비|올해들어"},
-    {"basis": "연평균", "pattern": "연평균"}
+    {"basis": "연평균", "pattern": "연평균"},
+    {"basis": "분기", "pattern": "(?<![동전])분기"}
   ],
   "changeMeasures": ["상승률", "등락률", "하락률", "증가율", "감소율", "성장률", "증감률", "변동률", "변화율", "전년동월비", "전년동기비", "전년동분기비", "전년비", "전년누계비", "전월비", "전분기비"],
   "changeMeasureCases": [
@@ -74,6 +75,8 @@
     {"askedText": "올해 누적 소비자물가 상승률", "actualText": "전년누계비(%)", "units": ["%"], "relation": "exact"},
     {"askedText": "올해 누적 소비자물가 상승률", "actualText": "전년동월비(%)", "units": ["%"], "relation": "incompatible"},
     {"askedText": "소비자물가 상승률 연평균", "actualText": "전년비", "units": ["%"], "relation": "incompatible"},
+    {"askedText": "분기 물가 상승률", "actualText": "전년동월비", "units": ["%"], "relation": "incompatible"},
+    {"askedText": "소비자물가 상승률 전년 동분기 대비", "actualText": "전년동분기비", "units": ["%"], "relation": "exact"},
     {"askedText": "최근 12개월간 소비자물가 상승률", "actualText": "전월비", "units": ["%"], "relation": "incompatible"},
     {"askedText": "전월세 가격 상승률", "actualText": "전월비", "units": ["%"], "relation": "incompatible"},
     {"askedText": "임금 상승률 전월 대비", "actualText": "임금상승률", "units": ["%"], "relation": "incompatible"},
