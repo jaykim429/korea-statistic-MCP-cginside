@@ -17,7 +17,8 @@
     {"dimensions": {"ITEM": {"label": "매출액(백만원)"}}, "unit": null},
     {"dimensions": {"ITEM": {"label": "전년동월비"}}, "unit": null},
     {"dimensions": {"ITEM": {"label": "전년동월비(%)"}, "C1": {"label": "금액(백만원)"}}, "unit": null},
-    {"dimensions": {"ITEM": {"label": "총지수"}, "C1": {"label": "전년동월비(%)"}}, "unit": null}
+    {"dimensions": {"ITEM": {"label": "총지수"}, "C1": {"label": "전년동월비(%)"}}, "unit": null},
+    {"dimensions": {"ITEM": {"label": "전년동월비(%)"}, "C1": {"label": "지수(2020=100)"}}, "unit": null}
   ],
   "perPopulationPattern": "^인구\\s*((?:천|만|10만|십만|백만|100만))\\s*명당\\s*\\S",
   "cases": [

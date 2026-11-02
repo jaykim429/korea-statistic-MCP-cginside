@@ -19,7 +19,7 @@ import pytest
 import kosis_mcp_server as server
 from kosis_analysis.measure_roles import apply_title_total_measure
 from kosis_analysis.metadata import _build_axis_codebook, _measure_compatibility
-from kosis_analysis.rules import measure_of, measure_relation, title_total_measure, _MEASURES, UNIT_RULES
+from kosis_analysis.rules import is_change_measure, measure_of, measure_relation, title_total_measure, _MEASURES, UNIT_RULES
 from kosis_analysis.units import official_coordinate_unit
 from kosis_curation import TIER_A_STATS, DEFAULT_ROUTER
 
@@ -167,6 +167,23 @@ def test_index_change_questions_do_not_take_the_published_rate_shortcut(question
     assert not server.NaturalLanguageAnswerEngine._asks_curated_rate_itself(question, TIER_A_STATS["소비자물가지수"])
 
 
+@pytest.mark.parametrize("case", _MEASURES["changeMeasureCases"], ids=lambda case: case["text"])
+def test_shared_change_measure_contract(case):
+    assert is_change_measure(case["text"]) is case["change"]
+
+
+@pytest.mark.parametrize("question", [
+    # 비교 기준이 다르면 공표 전년동월비 키가 답이 아니다(리뷰 F1).
+    "소비자물가 상승률 전월 대비", "전월 대비 소비자물가 상승률", "소비자물가 월간 상승률",
+    "연간 소비자물가 상승률", "소비자물가 상승률 전분기 대비",
+    # 변화어가 남으면 비율 자체가 아니다.
+    "소비자물가 상승률 증감", "소비자물가 상승률 변화", "소비자물가 상승률 작년과 차이",
+    "소비자물가 상승률 %p", "소비자물가 상승률 몇 포인트",
+])
+def test_basis_or_change_words_block_the_published_rate_shortcut(question):
+    assert not server.NaturalLanguageAnswerEngine._asks_curated_rate_itself(question, TIER_A_STATS["소비자물가상승률"])
+
+
 def test_change_of_a_rate_still_goes_to_calculation():
     param = TIER_A_STATS["소비자물가상승률"]
     assert server.NaturalLanguageAnswerEngine._asks_curated_rate_itself("소비자물가 상승률 알려줘", param)
@@ -248,6 +265,9 @@ def test_title_binding_baseline():
     lambda p: ({"actual_measure": "계"}, farm_axes()),
     # 합산 결과는 관측 행이 아니다.
     lambda p: ({"aggregation": "sum_by_group"}, farm_axes()),
+    # 다른 분류 축의 부분 집단(경영주 30대)은 농가수 전체가 아니다(리뷰 F4).
+    lambda p: ({"rows": [{**p["rows"][0], "dimensions": {**p["rows"][0]["dimensions"],
+                                                         "C2": {"code": "3", "label": "30대", "unit": None}}}]}, farm_axes()),
 ])
 def test_title_binding_refuses_every_ambiguous_case(mutate):
     payload = title_payload()

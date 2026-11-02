@@ -37,8 +37,9 @@ def item_caption_unit(dimensions):
         if axis == 'ITEM' or not isinstance(dim, dict):
             continue
         other = re.search(UNIT_RULES['unitSuffixPattern'], str(dim.get('label') or ''))
-        if other and re.fullmatch(UNIT_RULES['alternativeUnitPattern'], other.group(1).strip(), re.I):
-            return None
+        if other and (re.fullmatch(UNIT_RULES['alternativeUnitPattern'], other.group(1).strip(), re.I)
+                      or re.fullmatch(UNIT_RULES['indexBasePattern'], other.group(1).strip())):
+            return None  # 「지수(2020=100)」 also declares its own unit.
     return caption
 
 

@@ -110,7 +110,7 @@ def apply_title_total_measure(payload: dict, axes: dict) -> None:
     sole root total, a non-ITEM axis is a measurement axis, a CMMT definition exists,
     or the observed unit is not a count unit for that measure.
     """
-    from kosis_analysis.rules import count_measure_unit_matches, is_total_label, title_total_measure
+    from kosis_analysis.rules import count_measure_unit_matches, is_total_label, regional_kind, title_total_measure
     from kosis_analysis.units import is_ambiguous_unit
     rows = payload.get('rows') or []
     if (not rows or payload.get('aggregation', 'none') != 'none' or payload.get('actual_measure')
@@ -140,6 +140,11 @@ def apply_title_total_measure(payload: dict, axes: dict) -> None:
         if not unit or is_ambiguous_unit(unit) or not count_measure_unit_matches(measure, unit):
             return
         if any(isinstance(dim, dict) and measure_of(dim.get('label')) for axis, dim in dimensions.items() if axis != 'ITEM'):
+            return
+        # Every other coordinate is the whole universe: a total or a place. 「30대(경영주연령별)」
+        # is a sub-population of 농가, not 농가수 itself.
+        if any(not isinstance(dim, dict) or not (is_total_label(dim.get('label')) or regional_kind(dim.get('label')) != 'unknown')
+               for axis, dim in dimensions.items() if axis != 'ITEM'):
             return
         units.add(unit)
     payload.update(actual_measure=measure, actual_measure_evidence='official_title_total_item',

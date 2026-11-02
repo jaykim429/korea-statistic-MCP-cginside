@@ -2969,7 +2969,7 @@ class NaturalLanguageAnswerEngine:
 
     # Union of the STAT_GROWTH_RATE intent words and _is_growth_question's own list.
     _GROWTH_TERMS = ("늘", "증가", "감소", "변화율", "전년대비", "전월대비", "회복", "상승률", "하락률",
-                     "올랐", "떨어졌", "내렸")
+                     "올랐", "떨어졌", "내렸", "증감", "변화", "차이", "%p", "포인트")
 
     def _is_growth_question(self, query: str, route_payload: dict[str, Any]) -> bool:
         if "STAT_GROWTH_RATE" in route_payload.get("intents", []):

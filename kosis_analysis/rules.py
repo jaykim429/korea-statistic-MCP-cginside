@@ -317,17 +317,43 @@ def measure_basis_compatible(question: str, actual: str) -> bool:
     return measurement_normalizer(actual, source_definition=True) == measurement_normalizer(question)
 
 
+def comparison_bases(context: str | None) -> set[str]:
+    """Comparison bases the request names (전월 대비 → 전월비, 연간 → 전년비 …). Same contract as TS."""
+    compact = re.sub(r"\s+", "", str(context or ""))
+    return {entry["basis"] for entry in _MEASURES["comparisonBases"] if re.search(entry["pattern"], compact)}
+
+
+def is_change_measure(text: Any) -> bool:
+    """A rate of change (상승률·전년동월비·증감률 …) never answers a request without a measure."""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return any(measure in compact for measure in _MEASURES["changeMeasures"])
+
+
+def _basis_conflict(asked: str, actual: str, context: str | None) -> bool:
+    """A generic rate request that names its comparison basis accepts only that basis."""
+    if context is None or not any(asked in rule["asked"] for rule in _MEASURES["contextScopedEquivalences"]):
+        return False
+    bases = comparison_bases(context)
+    return bool(bases) and bases != {actual}
+
+
 def context_scoped_equivalent(asked: str | None, actual: str | None, units: tuple[str, ...] = (), context: str | None = None) -> bool:
     """A generic rate word accepts a specific comparison basis only in the registered subject context.
 
     「소비자물가 상승률」 is the 전년동월비 of a price index. The same 전년동월비 on an
     employment series is that series' growth rate, so the request text must carry the
     price context. One direction only: a specific basis is never another specific basis.
+    A named basis (「전월 대비」) selects exactly that basis; without one, 전월비·전년누계비
+    are never the headline rate.
     """
     compact = re.sub(r"\s+", "", str(context or ""))
-    return bool(compact) and any(
+    if not compact:
+        return False
+    bases = comparison_bases(context)
+    return any(
         asked in rule["asked"] and actual in rule["actual"] and re.search(rule["contextPattern"], compact)
         and all(unit.strip() in rule["units"] for unit in units)
+        and (bases == {actual} if bases else actual not in rule["basisRequired"])
         for rule in _MEASURES["contextScopedEquivalences"])
 
 
@@ -336,6 +362,8 @@ def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ..
     actual = _MEASURES["equivalentMeasures"].get(actual, actual)
     if not asked or not actual:
         return "unknown"
+    if _basis_conflict(asked, actual, context):
+        return "incompatible"
     if asked == actual:
         return "exact"
     if units and any(asked in rule["measures"] and actual in rule["measures"]
