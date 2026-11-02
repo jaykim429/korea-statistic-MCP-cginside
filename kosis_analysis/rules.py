@@ -66,6 +66,27 @@ def source_count_heading(title: str, item_label: str) -> dict | None:
             'measure': f'{family} · {item_label}' if kind == 'count' else item_label} if kind else None
 
 
+def title_total_measure(title: Any) -> str | None:
+    """The count measure a table title names by itself; a breakdown paren may list only regional grains.
+
+    Same contract as the TS adapter. A qualified title (전업농가수, 농가수(전업)), two
+    measures, or a measure that is not a registered count noun yields None.
+    """
+    rule = _MEASURES['titleTotalMeasure']
+    match = re.fullmatch(rule['titlePattern'], str(title or ''))
+    if not match:
+        return None
+    head = re.sub(r'\s+', '', match[1])
+    measure = measure_of(head)
+    if not measure or head != measure or measure not in _MEASURES['countNouns']:
+        return None
+    if match[2] is not None:
+        members = [re.sub(r'\s+', '', value) for value in re.split(rule['memberSeparatorPattern'], match[2]) if value.strip()]
+        if not members or any(member not in rule['breakdownMembers'] for member in members):
+            return None
+    return measure
+
+
 def count_measure_unit_matches(measure: str, unit: str) -> bool:
     unit = re.sub(r'\s+', '', unit)
     if measure in _MEASURES['personCounts']:
@@ -296,7 +317,21 @@ def measure_basis_compatible(question: str, actual: str) -> bool:
     return measurement_normalizer(actual, source_definition=True) == measurement_normalizer(question)
 
 
-def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ...] = ()) -> str:
+def context_scoped_equivalent(asked: str | None, actual: str | None, units: tuple[str, ...] = (), context: str | None = None) -> bool:
+    """A generic rate word accepts a specific comparison basis only in the registered subject context.
+
+    「소비자물가 상승률」 is the 전년동월비 of a price index. The same 전년동월비 on an
+    employment series is that series' growth rate, so the request text must carry the
+    price context. One direction only: a specific basis is never another specific basis.
+    """
+    compact = re.sub(r"\s+", "", str(context or ""))
+    return bool(compact) and any(
+        asked in rule["asked"] and actual in rule["actual"] and re.search(rule["contextPattern"], compact)
+        and all(unit.strip() in rule["units"] for unit in units)
+        for rule in _MEASURES["contextScopedEquivalences"])
+
+
+def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ...] = (), context: str | None = None) -> str:
     asked = _MEASURES["equivalentMeasures"].get(asked, asked)
     actual = _MEASURES["equivalentMeasures"].get(actual, actual)
     if not asked or not actual:
@@ -306,6 +341,8 @@ def measure_relation(asked: str | None, actual: str | None, units: tuple[str, ..
     if units and any(asked in rule["measures"] and actual in rule["measures"]
                      and all(unit.strip() in rule["units"] for unit in units)
                      for rule in _MEASURES["unitScopedEquivalences"]):
+        return "exact"
+    if context_scoped_equivalent(asked, actual, units, context):
         return "exact"
     if any(asked in group and actual in group for group in _MEASURES["proxyGroups"]):
         return "proxy"

@@ -271,7 +271,7 @@ def _measure_compatibility(table_name: Optional[str], axes: dict[str, dict[str, 
             if measure:
                 evidence.append({"source": "table_name", "name": part, "measure": measure})
     measures = [entry["measure"] for entry in evidence]
-    relations = [measure_relation(asked, entry["measure"], (str(entry["unit"]),) if entry.get("unit") else ())
+    relations = [measure_relation(asked, entry["measure"], (str(entry["unit"]),) if entry.get("unit") else (), context=request)
                  if measure_basis_compatible(request or "", str(entry.get("name") or "")) else "incompatible"
                  for entry in evidence]
     relation = "unknown"

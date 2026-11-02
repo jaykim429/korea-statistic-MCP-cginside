@@ -8,6 +8,17 @@
   "countUnitPattern": "^(?:천|만|백만|억)?(?:명|건|개|호|가구|개소|대)$",
   "indexBasePattern": "^\\d{4}\\s*[=＝]\\s*100$",
   "unitSuffixPattern": "[（(]([^（）()]+)[）)]\\s*$",
+  "labelOnlyUnitPattern": "^%p?$",
+  "labelOnlyUnitCases": [
+    {"dimensions": {"ITEM": {"label": "전년동월비(%)"}, "I": {"label": "총지수"}}, "unit": "%"},
+    {"dimensions": {"ITEM": {"label": "증감(%p)"}}, "unit": "%p"},
+    {"dimensions": {"ITEM": {"label": "전년동월비(%)", "unit": "%"}}, "unit": "%"},
+    {"dimensions": {"ITEM": {"label": "전년동월비(%)", "unit": "원"}}, "unit": null},
+    {"dimensions": {"ITEM": {"label": "매출액(백만원)"}}, "unit": null},
+    {"dimensions": {"ITEM": {"label": "전년동월비"}}, "unit": null},
+    {"dimensions": {"ITEM": {"label": "전년동월비(%)"}, "C1": {"label": "금액(백만원)"}}, "unit": null},
+    {"dimensions": {"ITEM": {"label": "총지수"}, "C1": {"label": "전년동월비(%)"}}, "unit": null}
+  ],
   "perPopulationPattern": "^인구\\s*((?:천|만|10만|십만|백만|100만))\\s*명당\\s*\\S",
   "cases": [
     {"source": "개%", "unit": "개", "ambiguous": true, "alternative": true},

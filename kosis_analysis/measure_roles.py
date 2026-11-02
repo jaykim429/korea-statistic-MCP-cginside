@@ -99,3 +99,52 @@ def apply_classification_measure(payload: dict, axes: dict) -> None:
             'org_id': payload['org_id'], 'tbl_id': payload['tbl_id'], 'axis_id': axis_id, 'axis_name': axis_name,
             'measure': selected['label'], 'items': [selected], 'item_codes': sorted(item_codes),
             'all_observations_matched': True})
+
+
+def apply_title_total_measure(payload: dict, axes: dict) -> None:
+    """Bind the table title's single count measure to the total row of a classification ITEM.
+
+    「농가수(시도/시/군/구)」 puts the measure only in the title; ITEM is 영농형태별
+    (계·논벼·과수…). The total row of that classification measures the title's
+    농가수. Never when any ITEM is itself a measure, the selected ITEM is not the
+    sole root total, a non-ITEM axis is a measurement axis, a CMMT definition exists,
+    or the observed unit is not a count unit for that measure.
+    """
+    from kosis_analysis.rules import count_measure_unit_matches, is_total_label, title_total_measure
+    from kosis_analysis.units import is_ambiguous_unit
+    rows = payload.get('rows') or []
+    if (not rows or payload.get('aggregation', 'none') != 'none' or payload.get('actual_measure')
+            or payload.get('measure_role_evidence')):
+        return
+    org_id, tbl_id, title = payload.get('org_id'), payload.get('tbl_id'), payload.get('table_name')
+    measure = title_total_measure(title)
+    items = ((axes or {}).get('ITEM') or {}).get('items') or {}
+    if not org_id or not tbl_id or not measure or not items or len(items) > 1000:
+        return
+    if any(measure_of(meta.get('label')) for meta in items.values()):
+        return  # A measure-like ITEM makes ITEM the measurement axis.
+    if any(is_measurement_axis(axis.get('OBJ_NM')) for axis_id, axis in axes.items() if axis_id != 'ITEM'):
+        return
+    totals = [code for code, meta in items.items() if is_total_label(meta.get('label')) and not meta.get('parent')]
+    if len(totals) != 1:
+        return
+    total = totals[0]
+    total_label = items[total].get('label')
+    units = set()
+    for row in rows:
+        dimensions = row.get('dimensions') if isinstance(row.get('dimensions'), dict) else {}
+        item = dimensions.get('ITEM') if isinstance(dimensions.get('ITEM'), dict) else {}
+        if str(item.get('code') or '') != total or item.get('label') != total_label:
+            return  # A non-total row is a member of the classification, not the title measure.
+        unit = str(row.get('unit') or '').strip()
+        if not unit or is_ambiguous_unit(unit) or not count_measure_unit_matches(measure, unit):
+            return
+        if any(isinstance(dim, dict) and measure_of(dim.get('label')) for axis, dim in dimensions.items() if axis != 'ITEM'):
+            return
+        units.add(unit)
+    payload.update(actual_measure=measure, actual_measure_evidence='official_title_total_item',
+        measure_role_evidence={'contract_version': 'kosis-title-measure/v1', 'source': 'TBL',
+            'org_id': org_id, 'tbl_id': tbl_id, 'table_name': title, 'measure': measure,
+            'item_axis': 'ITEM', 'item_code': total, 'item_label': total_label,
+            'item_labels': [meta.get('label') for meta in items.values()],
+            'units': sorted(units), 'all_observations_matched': True})

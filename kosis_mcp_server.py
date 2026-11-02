@@ -61,7 +61,7 @@ from kosis_analysis.native_units import needs_unit_metadata, normalize_native_un
 from kosis_analysis.native_regions import native_region_scope, resolve_native_region_code, bind_native_regions, native_region_payload, select_native_region_rows
 from kosis_analysis.ranking import ranked_comparison
 from kosis_analysis.primary_series import query_primary_series
-from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure, apply_classification_measure
+from kosis_analysis.measure_roles import annotation_measure, apply_annotation_measure, apply_classification_measure, apply_title_total_measure
 from kosis_analysis.methodology import request_for as methodology_request, methodology_payload
 from kosis_analysis.request_transition import execution_question
 from kosis_analysis.metadata import (
@@ -2967,11 +2967,42 @@ class NaturalLanguageAnswerEngine:
             return query
         return "latest"
 
+    # Union of the STAT_GROWTH_RATE intent words and _is_growth_question's own list.
+    _GROWTH_TERMS = ("늘", "증가", "감소", "변화율", "전년대비", "전월대비", "회복", "상승률", "하락률",
+                     "올랐", "떨어졌", "내렸")
+
     def _is_growth_question(self, query: str, route_payload: dict[str, Any]) -> bool:
         if "STAT_GROWTH_RATE" in route_payload.get("intents", []):
             return True
         q = self._norm(query)
         return any(term in q for term in ("전년대비", "전월대비", "증가율", "감소율", "변화율", "얼마나늘", "얼마나줄", "상승률", "하락률", "올랐", "떨어졌"))
+
+    @classmethod
+    def _asks_curated_rate_itself(cls, query: str, param: Optional[QuickStatParam]) -> bool:
+        """「임금상승률 알려줘」 asks the published rate, not the change of that rate.
+
+        Only when the curated series itself is the asked rate (same measure, % unit) and
+        no other change word remains once that rate noun is removed. Otherwise the
+        level-to-rate calculation path keeps its current behavior.
+        """
+        if param is None or param.verification_status != "verified" or param.unit.strip() != "%":
+            return False
+        asked = measure_of(query)
+        actual = measure_of(param.measurement_name)
+        if not asked or not re.search(r"(?:률|율)$", asked) or measure_relation(asked, actual, ("%",), context=query) != "exact":
+            return False
+        rest = cls._norm(query).replace(asked, "", 1)
+        return not any(term in rest for term in cls._GROWTH_TERMS)
+
+    @classmethod
+    def _curated_rate_fulfilled(cls, result: dict[str, Any], query: str) -> bool:
+        """The executed curated series is the asked published rate; no change calculation was requested."""
+        if result.get("상태") != "executed" or result.get("답변유형") != "tier_a_value":
+            return False
+        param = TIER_A_STATS.get(str((result.get("route") or {}).get("direct_stat_key") or ""))
+        if param is None or str(result.get("org_id") or "") != param.org_id or str(result.get("tbl_id") or "") != param.tbl_id:
+            return False
+        return cls._asks_curated_rate_itself(query, param)
 
     @staticmethod
     def _growth_period_count(query: str) -> int:
@@ -3518,7 +3549,9 @@ class NaturalLanguageAnswerEngine:
             explicit_start_year = explicit_start_year or query_start_year
             explicit_end_year = explicit_end_year or query_end_year
 
-        if self._is_growth_question(query, route_payload):
+        # A curated published rate is its own value; re-differencing it would report
+        # the change of the rate as the rate (실측: 「임금상승률 알려줘」 → +55.00%).
+        if self._is_growth_question(query, route_payload) and not self._asks_curated_rate_itself(query, gate_param):
             period_count = self._growth_period_count(query)
             start_p, end_p = explicit_start_year, explicit_end_year
             if start_p and end_p:
@@ -4684,6 +4717,8 @@ class NaturalLanguageAnswerEngine:
         for intent_label, fulfilling_types in cls._INTENT_FULFILLMENT.items():
             if intent_label == "STAT_AVERAGE" and cls._intrinsic_average_fulfilled(result, query):
                 continue
+            if intent_label == "STAT_GROWTH_RATE" and cls._curated_rate_fulfilled(result, query):
+                continue
             if intent_label in intents and answer_type not in fulfilling_types:
                 warnings.append(
                     f"의도 {intent_label} 감지됐으나 응답 유형은 {answer_type or '미지정'} — "
@@ -4781,6 +4816,8 @@ class NaturalLanguageAnswerEngine:
         reasons: list[str] = []
         for intent_label, fulfilling_types in cls._INTENT_FULFILLMENT.items():
             if intent_label == "STAT_AVERAGE" and cls._intrinsic_average_fulfilled(result, query):
+                continue
+            if intent_label == "STAT_GROWTH_RATE" and cls._curated_rate_fulfilled(result, query):
                 continue
             if intent_label not in intents or answer_type in fulfilling_types:
                 continue
@@ -12697,6 +12734,8 @@ async def _query_table_core(
     apply_official_coordinate_unit(result, axis_order, axes)
     apply_classification_measure(result, axes)
     apply_curated_coordinate_measure(result, axis_order, TIER_A_STATS, axes)
+    # Last: every ITEM/axis/curation/CMMT authority above wins over the title.
+    apply_title_total_measure(result, axes)
     return result
 
 

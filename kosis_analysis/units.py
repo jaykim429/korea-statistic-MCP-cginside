@@ -22,6 +22,26 @@ def flat_unit_alternatives(source):
     return tokens if len(tokens) >= 2 and all(re.fullmatch(UNIT_RULES['alternativeUnitPattern'], token, re.I) for token in tokens) else []
 
 
+def item_caption_unit(dimensions):
+    """「전년동월비(%)」: KOSIS printed the percent unit only in the ITEM caption.
+
+    Only a trailing percent caption on ITEM counts, and only when no other selected
+    coordinate carries its own unit caption. Never a request word or a table title.
+    """
+    item = dimensions.get('ITEM')
+    match = re.search(UNIT_RULES['unitSuffixPattern'], str(item.get('label') or '')) if isinstance(item, dict) else None
+    caption = match.group(1).strip() if match else ''
+    if not re.fullmatch(UNIT_RULES['labelOnlyUnitPattern'], caption):
+        return None
+    for axis, dim in dimensions.items():
+        if axis == 'ITEM' or not isinstance(dim, dict):
+            continue
+        other = re.search(UNIT_RULES['unitSuffixPattern'], str(dim.get('label') or ''))
+        if other and re.fullmatch(UNIT_RULES['alternativeUnitPattern'], other.group(1).strip(), re.I):
+            return None
+    return caption
+
+
 def official_coordinate_unit(source, dimensions):
     """Unit-only source interpretation, not proof of metric or population."""
     source = str(source or '').strip()
@@ -30,6 +50,11 @@ def official_coordinate_unit(source, dimensions):
         return '지수'
     units = {dim['unit'] for dim in coordinates if dim.get('unit')}
     if not source:
+        caption = item_caption_unit(dimensions)
+        if caption and any(unit != caption for unit in units):
+            return None  # A declared unit that contradicts the official caption is not a unit.
+        if caption:
+            return caption
         return next(iter(units)) if len(units) == 1 and not is_ambiguous_unit(next(iter(units))) else None
     alternatives = flat_unit_alternatives(source)
     if alternatives:
