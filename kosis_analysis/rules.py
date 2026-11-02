@@ -100,6 +100,11 @@ def source_heading_subjects(heading: dict) -> list[str]:
     return [heading['member'], heading['member'] + heading['family'][:-1], heading['member'] + heading['family']] if compose else [heading['member']]
 
 
+def is_country_axis(name: Any) -> bool:
+    """An official country axis (「국가」). Same contract as the TS adapter."""
+    return bool(re.fullmatch(GEOGRAPHY_RULES['countryAxisPattern'], re.sub(r'\s+', '', str(name or ''))))
+
+
 def regional_kind(label: Any) -> str:
     name = re.sub(r'\s+', '', str(label or ''))
     if name == '전국':

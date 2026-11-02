@@ -1,5 +1,11 @@
 {
   "axisPattern": "행정구역|지역|시도|시군구|지자체|읍면동",
+  "countryAxisPattern": "^(?:국가|국가별|나라|나라별|국가및지역|국가·지역|국가지역)$",
+  "domesticCountryLabels": ["대한민국", "한국", "우리나라"],
+  "countryAxisCases": [
+    {"axis": "국가", "country": true}, {"axis": "국가별", "country": true}, {"axis": "국가·지역", "country": true},
+    {"axis": "행정구역별", "country": false}, {"axis": "시도별", "country": false}, {"axis": "지수종류", "country": false}
+  ],
   "provincePattern": "(?:특별시|광역시|특별자치시|특별자치도|도)$",
   "municipalityPattern": "(?:시|군|구)$",
   "localityPattern": "(?:읍|면|동)$",

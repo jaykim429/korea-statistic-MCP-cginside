@@ -19,7 +19,7 @@ import pytest
 import kosis_mcp_server as server
 from kosis_analysis.measure_roles import apply_title_total_measure
 from kosis_analysis.metadata import _build_axis_codebook, _measure_compatibility
-from kosis_analysis.rules import is_change_measure, measure_of, measure_relation, title_total_measure, _MEASURES, UNIT_RULES
+from kosis_analysis.rules import GEOGRAPHY_RULES, is_change_measure, is_country_axis, measure_of, measure_relation, title_total_measure, _MEASURES, UNIT_RULES
 from kosis_analysis.units import official_coordinate_unit
 from kosis_curation import TIER_A_STATS, DEFAULT_ROUTER
 
@@ -298,3 +298,16 @@ def test_mixed_total_and_member_rows_do_not_bind():
                                            "A": {"code": "000", "label": "전국", "unit": None}}})
     apply_title_total_measure(payload, farm_axes())
     assert "actual_measure" not in payload
+
+
+# ---------------------------------------------------------------- 검토 5차 G1b 외국 좌표
+
+@pytest.mark.parametrize("case", GEOGRAPHY_RULES["countryAxisCases"], ids=lambda case: case["axis"])
+def test_shared_country_axis_contract(case):
+    assert is_country_axis(case["axis"]) is case["country"]
+
+
+def test_query_table_names_its_axes_so_a_foreign_coordinate_is_visible(monkeypatch):
+    install(monkeypatch, "INH_1EA1045", data_rows("INH_1EA1045", itmId="T00", objL1="37"))
+    result = query("INH_1EA1045", {"ITEM": ["T00"], "A": ["37"]})
+    assert result["stat_evidence"]["evidence"]["coordinate_axis_names"] == {"ITEM": "항목", "A": "행정구역별"}

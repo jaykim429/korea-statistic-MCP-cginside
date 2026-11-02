@@ -429,6 +429,8 @@ def build_stat_evidence(
         "data_nature": payload.get("data_nature"),
         "data_quality_note": payload.get("data_quality_note"),
         "period": _period_contract(payload, observations),
+        **({"coordinate_axis_names": payload["coordinate_axis_names"]}
+           if isinstance(payload.get("coordinate_axis_names"), dict) and payload.get("aggregation", "none") == "none" else {}),
         **({"series_context": series_context} if series_context else {}),
         **({"geography": geography} if geography else {}),
         **({"regional_coordinates": regional_coordinates} if regional_coordinates else {}),

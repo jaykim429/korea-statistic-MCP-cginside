@@ -12729,6 +12729,8 @@ async def _query_table_core(
     }
     result.update({key: value for key, value in nature.items() if value is not None})
     result['coordinate_axes'] = axis_order
+    # Official axis names (「국가」, 「행정구역별」) let a client see a foreign coordinate without guessing labels.
+    result['coordinate_axis_names'] = {axis: str((axes.get(axis) or {}).get('OBJ_NM') or '') for axis in axis_order}
     if aggregation == 'none':
         from kosis_analysis.geography import project_metadata_coordinates
         regional_coordinates = project_metadata_coordinates(org_id, tbl_id, axes, normalized_rows)
