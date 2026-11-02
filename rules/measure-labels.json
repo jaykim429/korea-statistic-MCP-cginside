@@ -49,6 +49,31 @@
     {"basis": "연평균", "pattern": "연평균"},
     {"basis": "분기", "pattern": "(?<![동전])분기"}
   ],
+  "rateBasisItemLabel": {
+    "bases": ["전년동월비", "전년동기비", "전년동분기비", "전년비", "전월비", "전년누계비"],
+    "tableCadencePrefixPattern": "^\\s*(?:월별|연간|연도별|분기별|반기별)\\s+",
+    "tableTrailingParenPattern": "\\s*[(（][^()（）]*[)）]\\s*$",
+    "priceTablePattern": "물가|가격",
+    "priceRateRenames": {"등락률": "상승률"},
+    "note": "ITEM 이 비교 기준 이름뿐이면(「전년동월비(%)」) 답의 이름표가 무엇을 쟀는지 말하지 않는다. 표시 이름은 「<대상>(<기준>)」 이다. 대상은 MCP 가 확인한 지표 정의(괄호 안에 같은 기준이 있어야 한다)에서, 없으면 표 이름에서 주기 머리말·끝 괄호를 떼어 얻는다. 표 이름의 등락률은 물가·가격 표에서만 상승률로 적는다. 대상에 기준 이름이 이미 있거나, 항목 괄호가 행 단위와 다르거나, 근거가 없으면 원래 항목 이름을 둔다 — 대상을 지어내지 않는다.",
+    "cases": [
+      {"item": "전년동월비(%)", "unit": "%", "definition": "소비자물가 상승률 (전년동월비, 총지수)", "table": "월별 소비자물가 등락률", "label": "소비자물가 상승률(전년동월비)"},
+      {"item": "전년동월비(%)", "unit": "%", "definition": null, "table": "월별 소비자물가 등락률", "label": "소비자물가 상승률(전년동월비)"},
+      {"item": "전월비", "unit": "%", "definition": null, "table": "월별 소비자물가 등락률", "label": "소비자물가 상승률(전월비)"},
+      {"item": "전년누계비(%)", "unit": "%", "definition": null, "table": "월별 소비자물가 등락률", "label": "소비자물가 상승률(전년누계비)"},
+      {"item": "전월비", "unit": "%", "definition": "소비자물가 상승률 (전년동월비, 총지수)", "table": "월별 소비자물가 등락률", "label": "소비자물가 상승률(전월비)"},
+      {"item": "전년동월비(%)", "unit": "%", "definition": null, "table": "월별 생산자물가 등락률(2020=100)", "label": "생산자물가 상승률(전년동월비)"},
+      {"item": "전년동월비(%)", "unit": "%", "definition": null, "table": "월별 산업생산 등락률", "label": "산업생산 등락률(전년동월비)"},
+      {"item": "전년비(%)", "unit": "%", "definition": null, "table": "연간 수출입 증감률", "label": "수출입 증감률(전년비)"},
+      {"item": "전년동월비(%)", "unit": "", "definition": null, "table": "월별 소비자물가 등락률", "label": null},
+      {"item": "전년동월비(%)", "unit": "%", "definition": null, "table": null, "label": null},
+      {"item": "전년동월비(%)", "unit": "%", "definition": null, "table": "소비자물가 전년동월비", "label": null},
+      {"item": "전년동월비(%)", "unit": "%", "definition": "전년동월비 (총지수)", "table": null, "label": null},
+      {"item": "지수", "unit": "2020=100", "definition": null, "table": "월별 소비자물가지수", "label": null},
+      {"item": "전분기비(%)", "unit": "%", "definition": null, "table": "분기별 국내총생산", "label": null},
+      {"item": "농가수", "unit": "가구", "definition": null, "table": "농가수(시도/시/군/구)", "label": null}
+    ]
+  },
   "changeMeasures": ["상승률", "등락률", "하락률", "증가율", "감소율", "성장률", "증감률", "변동률", "변화율", "전년동월비", "전년동기비", "전년동분기비", "전년비", "전년누계비", "전월비", "전분기비"],
   "changeMeasureCases": [
     {"text": "전년동월비(%)", "change": true},
