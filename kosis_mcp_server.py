@@ -81,7 +81,7 @@ from kosis_analysis.metadata import (
     _suggest_axis_codes,
     _validate_query_table_filters,
 )
-from kosis_analysis.rules import canonical_population_label, canonical_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases, discovery_measure_of
+from kosis_analysis.rules import canonical_population_label, canonical_measure, is_change_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases, discovery_measure_of
 from kosis_analysis.text_match import (
     _content_search_query,
     _curated_discovery_leads,
@@ -3552,6 +3552,10 @@ class NaturalLanguageAnswerEngine:
         # A curated published rate is its own value; re-differencing it would report
         # the change of the rate as the rate (실측: 「임금상승률 알려줘」 → +55.00%).
         if self._is_growth_question(query, route_payload) and not self._asks_curated_rate_itself(query, gate_param):
+            # The relative change of a published change rate is not what 「…%p」·「…증감」 asks
+            # (실측: 「소비자물가 상승률 %p」 → 변화율 +123.08%). No %p calculation exists here: refuse.
+            if gate_param is not None and gate_param.unit.strip() == "%" and is_change_measure(gate_param.measurement_name):
+                return _unsupported_quick_stat_response(query, gate_param, ["growth_rate"], region, "latest")
             period_count = self._growth_period_count(query)
             start_p, end_p = explicit_start_year, explicit_end_year
             if start_p and end_p:

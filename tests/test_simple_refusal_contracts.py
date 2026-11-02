@@ -184,6 +184,18 @@ def test_basis_or_change_words_block_the_published_rate_shortcut(question):
     assert not server.NaturalLanguageAnswerEngine._asks_curated_rate_itself(question, TIER_A_STATS["소비자물가상승률"])
 
 
+@pytest.mark.parametrize("question", ["소비자물가 상승률 %p", "임금상승률 얼마나 늘었어", "소비자물가 상승률 증가"])
+def test_change_of_a_published_rate_is_refused_not_re_differenced(monkeypatch, question):
+    # 실측(f79b0d8 이전 빌드): 「소비자물가 상승률 %p」 → tier_a_growth_rate 변화율 +123.08%.
+    async def fetch(*args, **kwargs):
+        raise AssertionError("a published rate must not be fetched for a relative-change calculation")
+
+    monkeypatch.setattr(server, "_fetch_series", fetch)
+    result = asyncio.run(server.answer_query(question, api_key="dummy"))
+    assert result.get("answer_type") != "tier_a_growth_rate"
+    assert result.get("status") != "executed"
+
+
 def test_change_of_a_rate_still_goes_to_calculation():
     param = TIER_A_STATS["소비자물가상승률"]
     assert server.NaturalLanguageAnswerEngine._asks_curated_rate_itself("소비자물가 상승률 알려줘", param)
