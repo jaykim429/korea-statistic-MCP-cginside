@@ -166,3 +166,27 @@ def test_country_axes_with_survey_annotations_preserve_explicit_country_intent()
     assert candidate["geographic_scope"]["kind"] == "country_comparison"
     _annotate_table_candidate_ranking([candidate], query="프랑스 여성 실업률", indicator="실업률")
     assert not any(p["type"] == "international_table_for_domestic_query" for p in candidate.get("ranking_penalties", []))
+
+
+def test_municipal_survey_ranks_after_national_table_for_unscoped_question():
+    """Measured S07: every 「노령화지수」 candidate tied at score 5 and 「이천시노인등록통계」 won."""
+    from kosis_mcp_server import _annotate_table_candidate_ranking, _table_candidate_sort_key
+    scorer = MetadataCompatibilityScorer([], "노령화지수")
+    local = scorer.evaluate(profile("지역별 노령화지수 및 노년부양비", [("노령화지수", "%")])).to_response()
+    local["survey_name"] = "「이천시노인등록통계」"
+    national = scorer.evaluate(profile("노령화지수(시도)", [("노령화지수", "%")])).to_response()
+    national["survey_name"] = "「주민등록인구통계」"
+    _annotate_table_candidate_ranking([local, national], query="노령화지수", indicator="노령화지수")
+    assert any(p["type"] == "local_table_for_unscoped_query" for p in local["ranking_penalties"])
+    assert not any(p["type"] == "local_table_for_unscoped_query" for p in national["ranking_penalties"])
+    assert _table_candidate_sort_key(national) < _table_candidate_sort_key(local)
+    # Asking for that city removes the penalty.
+    _annotate_table_candidate_ranking([local], query="이천시 노령화지수", indicator="노령화지수")
+    assert not any(p["type"] == "local_table_for_unscoped_query" for p in local["ranking_penalties"])
+
+
+def test_shared_metadata_scope_cases():
+    from kosis_analysis.rules import GEOGRAPHY_RULES, canonical_population_label, metadata_regional_scope
+    for case in GEOGRAPHY_RULES["metadataScopeCases"]:
+        got = metadata_regional_scope(case["name"])
+        assert got == case["scope"], case

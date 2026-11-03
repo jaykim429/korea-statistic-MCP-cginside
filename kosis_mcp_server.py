@@ -9084,6 +9084,16 @@ def _selection_context_adjustments(candidate: dict[str, Any], query: Any, indica
             "penalty": 3,
             "evidence": {"table_name": candidate.get("table_name"), "geographic_scope": scope},
         })
+    # A province's or a city's own survey cannot answer an unscoped (national)
+    # question. Measured: 「노령화지수」 ranked 「이천시노인등록통계」 first because
+    # every candidate tied at score 5. Ranking only — scope proof stays in the app gate.
+    local_scope = metadata_regional_scope(candidate.get("survey_name")) or metadata_regional_scope(candidate.get("table_name"))
+    if local_scope and canonical_population_label(local_scope) not in query_text and local_scope not in query_text:
+        penalties.append({
+            "type": "local_table_for_unscoped_query",
+            "penalty": 3,
+            "evidence": {"survey_name": candidate.get("survey_name"), "regional_scope": local_scope},
+        })
     if quality["query_terms"] and quality["coverage_ratio"] < 0.5:
         penalties.append({
             "type": "low_query_term_coverage",

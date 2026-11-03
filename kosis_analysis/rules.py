@@ -127,7 +127,14 @@ def metadata_regional_scope(name: Any) -> str | None:
     if not prefix:
         match = re.match(r'^[가-힣]+?(?:특별자치도|특별자치시|광역시|특별시)', text)
         prefix = match.group(0) if match else None
-    return canonical_population_label(prefix) if prefix else None
+    if prefix:
+        return canonical_population_label(prefix)
+    # A municipal survey (「이천시노인등록통계」) is as local as a provincial one.
+    # Names come from the KOSIS administrative axis, not a hand list (TS twin).
+    return next((name for name in _MUNICIPALITY_NAMES if text.startswith(name)), None)
+
+
+_MUNICIPALITY_NAMES = sorted(GEOGRAPHY_RULES['municipalityNames'], key=len, reverse=True)
 
 
 def survey_population(survey: str | None) -> str | None:
