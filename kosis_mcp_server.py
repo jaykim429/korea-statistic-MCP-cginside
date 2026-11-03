@@ -11598,7 +11598,9 @@ async def select_table_for_query(
     lexical_labels = {'industry': ('산업별', '업종별'), 'region': ('지역별',), 'age': ('연령별',), 'sex': ('성별',),
                       'scale': ('규모별',), 'size': ('규모별',)}
     breakdown_cues = [label for dim in lexical_dimensions for label in lexical_labels.get(dim, ())]
-    lexical_queries = list(dict.fromkeys(f'{label} {effective_indicator}' for label in breakdown_cues if effective_indicator))
+    # 정규화한 지표(「최종 에너지 소비량」)만 붙이면 원래 낱말로 된 표(「업종별 에너지소비량」)를 놓친다 — 둘 다 붙인다.
+    lexical_subjects = [term for term in dict.fromkeys([explicit_indicator, effective_indicator]) if term]
+    lexical_queries = list(dict.fromkeys(f'{label} {subject}' for label in breakdown_cues for subject in lexical_subjects))
     if lexical_queries:
         lexical_searches = await asyncio.gather(*[search_kosis(term, limit=limit, use_routing=False, api_key=key) for term in lexical_queries])
         search_queries += lexical_queries

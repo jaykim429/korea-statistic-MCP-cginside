@@ -70,3 +70,20 @@ def test_without_breakdown_request_title_cue_does_not_reorder(monkeypatch):
     _install(monkeypatch, routed, {}, inspected)
     asyncio.run(server.select_table_for_query("에너지소비량", indicator="에너지소비량", api_key="dummy"))
     assert "BY_INDUSTRY" not in inspected
+
+
+def test_breakdown_search_keeps_the_callers_words_when_meta_normalizes_the_indicator(monkeypatch):
+    # 실측: 「에너지소비량」 이 메타 정규화로 「최종 에너지 소비량」 이 되어 축 검색어가 「업종별 최종 에너지 소비량」 뿐이었다.
+    routed = [{"기관ID": "110", "통계표ID": f"CITY{i}", "통계표명": f"최종 에너지소비량 {i}"} for i in range(16)]
+    lexical = {"업종별 에너지소비량": [{"기관ID": "337", "통계표ID": "BY_INDUSTRY", "통계표명": "제조업부문 업종별 에너지소비량"}]}
+    inspected: set[str] = set()
+    _install(monkeypatch, routed, lexical, inspected)
+
+    async def normalize(raw, **kwargs):
+        return {"source": "kosis_meta_match", "normalized": "최종 에너지 소비량"}
+
+    monkeypatch.setattr(server, "_normalize_indicator_from_kosis_meta", normalize)
+    result = asyncio.run(server.select_table_for_query(
+        "에너지소비량", indicator="에너지소비량", required_dimensions=["industry"], required_breakdowns=["industry"], api_key="dummy"))
+    assert "BY_INDUSTRY" in inspected
+    assert result["selected"]["tbl_id"] == "BY_INDUSTRY"
