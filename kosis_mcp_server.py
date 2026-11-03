@@ -11594,9 +11594,11 @@ async def select_table_for_query(
     # Explicit breakdowns need lexical discovery outside a shortcut's fixed
     # candidate pool. These are bounded additional searches, not value aliases.
     lexical_dimensions = _normalize_required_dimensions(required_breakdowns or [])[:3]
-    lexical_labels = {'industry': '산업별', 'region': '지역별', 'age': '연령별', 'sex': '성별', 'scale': '규모별', 'size': '규모별'}
-    lexical_queries = list(dict.fromkeys(f'{lexical_labels[dim]} {effective_indicator}' for dim in lexical_dimensions
-                                        if dim in lexical_labels and effective_indicator))
+    # KOSIS 표명이 그 분해를 부르는 말. 산업 분해는 「업종별」 로 쓴 표가 많다(실측: 「제조업부문 업종별 에너지소비량」).
+    lexical_labels = {'industry': ('산업별', '업종별'), 'region': ('지역별',), 'age': ('연령별',), 'sex': ('성별',),
+                      'scale': ('규모별',), 'size': ('규모별',)}
+    breakdown_cues = [label for dim in lexical_dimensions for label in lexical_labels.get(dim, ())]
+    lexical_queries = list(dict.fromkeys(f'{label} {effective_indicator}' for label in breakdown_cues if effective_indicator))
     if lexical_queries:
         lexical_searches = await asyncio.gather(*[search_kosis(term, limit=limit, use_routing=False, api_key=key) for term in lexical_queries])
         search_queries += lexical_queries
@@ -11684,6 +11686,10 @@ async def select_table_for_query(
             # bounded metadata budget before title-only population hits crowd it out.
             # This does not bypass the scorer, ITEM/axis checks or query validation.
             -int(row.get("candidate_basis") == "verified_curation_table"),
+            # 분해를 **명시해 요청했을 때만**, 그 분해를 표명에 가진 표가 메타 확인 자리를 먼저 얻는다.
+            # 이름만 지표와 겹치는 표들이 상한을 채워 정답 표가 확인 전에 잘렸다(실측 「에너지 소비량을 업종별로」).
+            # 확인 자리 순서일 뿐이다 — 실제 축은 아래 메타 검증이 다시 본다.
+            -int(any(cue in str(row.get("통계표명") or "") for cue in breakdown_cues)),
             # Reserve inspection space for unrestricted sources rather than
             # spending it all on one province's duplicated publications.
             int(bool(metadata_regional_scope(row.get('통계표명')))
