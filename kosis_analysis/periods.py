@@ -162,6 +162,26 @@ def _parse_year_token(text: str) -> Optional[str]:
     return None
 
 
+def _implicit_default_period(selected_period: dict[str, Any], period_type: Optional[str]) -> str:
+    """Default period when the caller named none (or only "latest").
+
+    Observed tables use their last recorded period. An annual projection series whose last
+    period lies in the future uses this year instead: 101/DT_1YL12501E (1970~2052) answered
+    "노령화지수" with the 2052 projection 522.4 (2026-11-06). A future year is returned only
+    when the caller asks for it. A series that starts after this year keeps its first year.
+    """
+    end_period = str(selected_period.get("END_PRD_DE"))
+    if period_type != "Y" or not re.fullmatch(r"\d{4}", end_period):
+        return end_period
+    this_year = datetime.now().year
+    if int(end_period) <= this_year:
+        return end_period
+    start_period = str(selected_period.get("STRT_PRD_DE") or "")
+    if re.fullmatch(r"\d{4}", start_period) and int(start_period) > this_year:
+        return start_period
+    return str(this_year)
+
+
 def _is_latest_period_text(text: Any) -> bool:
     if text is None:
         return True
@@ -547,7 +567,7 @@ def _query_table_data_nature(
             "data_nature": "projection",
             "period_nature": "future_projection" if horizon is not None and horizon > 0 else "projection_series",
             "projection_horizon_years": horizon if horizon is not None and horizon > 0 else None,
-            "data_quality_note": "통계표명 또는 요청 시점 기준으로 추계/전망 성격의 데이터입니다. 실측값처럼 단정하지 말고 추계 기준임을 표시하세요.",
+            "data_quality_note": "추계·전망 성격의 자료입니다(통계표명 또는 요청 시점 기준). 관측 실적과 구분해 보세요.",
             "추계_안내": "이 데이터는 추계/전망 성격일 수 있습니다. 사용자 응답에 기준을 함께 표시하세요.",
         }
     return {

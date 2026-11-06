@@ -261,6 +261,17 @@ def _failure(payload: dict[str, Any], execution_status: str, observations: Optio
     return "unknown", False
 
 
+def _dimensionless_index(row: dict[str, Any]) -> bool:
+    """An ITEM named "...지수" is a dimensionless index; KOSIS often leaves its unit blank.
+
+    101/DT_1YL12501E "노령화지수" had no unit and its value was dropped as incomplete (2026-11-06).
+    Same rule as the app's utils/stat-evidence.ts dimensionlessIndex.
+    """
+    item = (row.get("dimensions") or {}).get("ITEM")
+    label = str(item.get("label") or "").strip() if isinstance(item, dict) else ""
+    return label.endswith("지수")
+
+
 def _missing_evidence_fields(
     execution_status: str,
     observations: list[dict[str, Any]],
@@ -274,7 +285,8 @@ def _missing_evidence_fields(
         missing.append("observations")
     else:
         for field in ("value", "unit", "period"):
-            if any(not _present(row.get(field)) and not (field == "value" and row.get("observation_state") == "suppressed") for row in observations):
+            if any(not _present(row.get(field)) and not (field == "value" and row.get("observation_state") == "suppressed")
+                   and not (field == "unit" and _dimensionless_index(row)) for row in observations):
                 missing.append(field)
         if not any(_present(row.get("value")) for row in observations) and "value" not in missing:
             missing.append("value")

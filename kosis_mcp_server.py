@@ -106,6 +106,7 @@ from kosis_analysis.periods import (
     _extract_open_start_year,
     _extract_year_range,
     _format_period_label,
+    _implicit_default_period,
     _is_latest_period_text,
     _is_yearly_period_type,
     _latest_period_policy,
@@ -12359,13 +12360,13 @@ async def _query_table_core(
         auto_default_period_range: Optional[list[str]] = None
         safe_latest_count = max(1, min(int(latest_count), 100)) if latest_count is not None else None
         if not effective_period_range and safe_latest_count is None and selected_period and selected_period.get("END_PRD_DE"):
-            end_period = str(selected_period.get("END_PRD_DE"))
+            end_period = _implicit_default_period(selected_period, period_type)
             effective_period_range = [end_period, end_period]
             auto_default_period_range = effective_period_range
         if effective_period_range and selected_period and selected_period.get("END_PRD_DE"):
             requested_bounds = [str(p).strip() for p in effective_period_range if str(p or "").strip()]
             if requested_bounds and all(_is_latest_period_text(bound) for bound in requested_bounds):
-                end_period = str(selected_period.get("END_PRD_DE"))
+                end_period = _implicit_default_period(selected_period, period_type)
                 effective_period_range = [end_period, end_period]
                 auto_default_period_range = effective_period_range
         period_format_error = _period_range_format_error(effective_period_range, selected_period)
@@ -12509,8 +12510,16 @@ async def _query_table_core(
                                 and isinstance(group, list)
                                 and not any(row.get("value") is not None for row in
                                             _normalize_query_table_rows(group, filter_set, axes, axis_order))):
+                            # A projection default clamped to this year must not recover the table's last
+                            # five (far-future) periods; look back from this year instead (DT_2KAA202, 5-year steps).
+                            clamped_default = (selected_period and auto_default_period_range[-1]
+                                               != str(selected_period.get("END_PRD_DE")))
                             recovery_params = {
-                                **_query_table_params(org_id, tbl_id, filter_set, axis_order, None, period_type, 5),
+                                **(_query_table_params(org_id, tbl_id, filter_set, axis_order,
+                                                       [str(int(auto_default_period_range[-1]) - 10), auto_default_period_range[-1]],
+                                                       period_type, None)
+                                   if clamped_default else
+                                   _query_table_params(org_id, tbl_id, filter_set, axis_order, None, period_type, 5)),
                                 "apiKey": key,
                             }
                             recovery_record = {"filters": filter_set, "lookback_count": 5,
