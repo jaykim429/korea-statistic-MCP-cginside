@@ -82,6 +82,7 @@ from kosis_analysis.metadata import (
     _validate_query_table_filters,
 )
 from kosis_analysis.rules import canonical_population_label, canonical_measure, is_change_measure, measure_of, measure_relation, measure_basis_compatible, measure_discovery_aliases, discovery_measure_of
+from kosis_analysis.local_catalog import load_default_catalog as _load_local_catalog
 from kosis_analysis.text_match import (
     _content_search_query,
     _curated_discovery_leads,
@@ -8745,6 +8746,27 @@ async def _search_kosis_keywords(
             "direct_kosis_search": {"query": query, "url": "https://kosis.kr/search/search.do"},
         }
 
+    # 로컬 표 목록 BM25(앱 사이클 8) — KOSIS 통합검색은 질문 낱말과 제목 낱말이 다른 표를 상위 40 밖으로 냈다. 원 질문으로
+    # 로컬 목록(제목 + 분류 경로)을 찾아 후보에 더하고, 같은 일치 품질 안에서 KOSIS 순위와 로컬 순위를 RRF 로 합쳐 앞뒤를 정한다.
+    # 최종 순위의 첫 기준은 지금처럼 원 질문과의 일치 품질이다 — 주제어를 잃은 표가 올라오지 않는다. 목록이 없으면 그대로.
+    local_catalog = _load_local_catalog()
+    # 순위·잡음 관문이 볼 질문 — 목록이 있으면 붙여 쓴 낱말·조사 붙은 낱말을 목록 낱말로 나눈다(앱 사이클 8 H6). 없으면 원문.
+    match_query = local_catalog.segment_query(query) if local_catalog is not None else query
+    fusion_ranks: Optional[dict[tuple[Any, Any], list[int]]] = None
+    if local_catalog is not None:
+        fusion_ranks = {}
+        api_rank = 0
+        for item in all_results:
+            identity = (item.get("ORG_ID"), item.get("TBL_ID"))
+            if identity[1] and identity not in fusion_ranks:
+                fusion_ranks[identity] = [api_rank]
+                api_rank += 1
+        for rank, (row, _score) in enumerate(local_catalog.search(query, _LOCAL_SEARCH_K)):
+            identity = (row["orgId"], row["tblId"])
+            fusion_ranks.setdefault(identity, []).append(rank)
+            all_results.append({"ORG_ID": row["orgId"], "TBL_ID": row["tblId"], "TBL_NM": row.get("title"),
+                                "STRT_PRD_DE": "", "END_PRD_DE": "", "_검색어": "local_catalog"})
+
     # 중복 제거
     seen = set()
     unique = []
@@ -8810,13 +8832,17 @@ async def _search_kosis_keywords(
             "URL": row.get("LINK_URL") or row.get("TBL_VIEW_URL"),
         }
         record["match_quality"] = _query_match_quality(
-            query,
+            match_query,
             str(record.get("통계표명") or ""),
         )
+        if fusion_ranks is not None:
+            record["_rrf"] = sum(1.0 / (_RRF_K + r) for r in fusion_ranks.get((record["기관ID"], record["통계표ID"]), []))
         result_rows.append(_catalog_candidate_with_query_status(record))
-    result_rows = _sort_search_candidates(query, result_rows)
+    result_rows = _sort_search_candidates(match_query, result_rows)
+    for row in result_rows:
+        row.pop("_rrf", None)
     # 내용어가 하나라도 걸린 표가 있으면, 하나도 안 걸린 표는 잡음이므로 뺀다. 같은 표명(연도별 변종)도 하나만 남긴다.
-    content_terms = _query_tokens_for_matching(query)
+    content_terms = _query_tokens_for_matching(match_query)
     if content_terms:
         matched_rows = [row for row in result_rows if (row.get("match_quality") or {}).get("matched_terms")]
         # 내용어가 하나도 안 걸린 표만 남았으면 KOSIS 검색이 느슨하게 맞춘 잡음이다 → 빈 결과로 돌려 "없다"고 말하게 한다
@@ -8886,6 +8912,9 @@ async def _search_kosis_keywords(
 _TABLE_META_CONCURRENCY = max(1, int(os.getenv("KOSIS_MCP_TABLE_META_CONCURRENCY", "6")))
 # 검색어 동시 호출 수. KOSIS 검색은 검색어마다 왕복이 있어 순차로 돌면 그대로 누적된다.
 _SEARCH_KEYWORD_CONCURRENCY = max(1, int(os.getenv("KOSIS_MCP_SEARCH_CONCURRENCY", "4")))
+# 로컬 표 목록 검색(앱 사이클 8) — 후보에 더할 상위 개수와 RRF 상수(관례값 60).
+_LOCAL_SEARCH_K = max(0, int(os.getenv("KOSIS_LOCAL_SEARCH_K", "20")))
+_RRF_K = 60.0
 
 
 
@@ -8926,6 +8955,8 @@ def _sort_search_candidates(query: Any, rows: list[dict[str, Any]]) -> list[dict
             -float((row.get("match_quality") or {}).get("coverage_ratio") or 0.0),
             -float((row.get("match_quality") or {}).get("title_focus_ratio") or 0.0),
             -_match_quality_rank(row.get("match_quality")),
+            # 순위 결합(앱 사이클 8) — 로컬 목록이 켜졌을 때만 있다. 없으면 0 이라 지금 순서 그대로.
+            -float(row.get("_rrf") or 0.0),
             str(row.get("source_system") or ""),
             str(row.get("table_name") or row.get("통계표명") or ""),
             str(row.get("table_id") or row.get("통계표ID") or ""),
