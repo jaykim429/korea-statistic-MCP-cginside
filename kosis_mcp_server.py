@@ -1077,6 +1077,8 @@ from kosis_curation import (
     lookup as _curation_lookup,
     route_query as _route_query,
     routing_hints as _routing_hints,
+    title_vocabulary_hints as _title_vocabulary_hints,
+    title_vocabulary_rewrites as _title_vocabulary_rewrites,
     requests_time_series,
     requested_period_cadence,
     requested_series_years,
@@ -8657,6 +8659,22 @@ async def indicator_dependency_map(indicator: str) -> dict:
 
 # ---- Utility ----
 
+def _best_query_match_quality(query: str, alt_queries: list[str], title: str) -> dict[str, Any]:
+    """원문과, 다리 열쇠를 표 제목 어휘로 바꾼 질문(앱 사이클 7) 가운데 더 잘 맞는 쪽의 일치 품질.
+
+    다리로 찾은 표(「축종별 시도별 농장수 및 마릿수」)는 원문 낱말(사육두수)과 맞지 않아 낮게 매겨지거나 「내용어 없음」 으로
+    빠졌다. 바꿔 쓴 질문이 없으면 원문 그대로다 — 다리 열쇠가 없는 질문의 순위는 바뀌지 않는다.
+    """
+    best = _query_match_quality(query, title)
+    for alt in alt_queries:
+        quality = _query_match_quality(alt, title)
+        if (float(quality.get("weighted_coverage_ratio") or 0.0), float(quality.get("coverage_ratio") or 0.0)) > (
+            float(best.get("weighted_coverage_ratio") or 0.0), float(best.get("coverage_ratio") or 0.0)
+        ):
+            best = quality
+    return best
+
+
 async def _search_kosis_keywords(
     query: str,
     keywords: list[str],
@@ -8664,6 +8682,7 @@ async def _search_kosis_keywords(
     api_key: Optional[str] = None,
     used_routing: bool = False,
     include_legacy_aliases: bool = False,
+    alt_queries: Optional[list[str]] = None,
 ) -> dict:
     try:
         key = _resolve_key(api_key)
@@ -8809,8 +8828,9 @@ async def _search_kosis_keywords(
             "검색어": row.get("_검색어"),
             "URL": row.get("LINK_URL") or row.get("TBL_VIEW_URL"),
         }
-        record["match_quality"] = _query_match_quality(
+        record["match_quality"] = _best_query_match_quality(
             query,
+            alt_queries or [],
             str(record.get("통계표명") or ""),
         )
         result_rows.append(_catalog_candidate_with_query_status(record))
@@ -10212,6 +10232,12 @@ async def search_kosis(
         if hints:
             keywords = [query, *hints[:3]]
             used_routing = True
+        # 표 제목 어휘 다리(앱 사이클 7) — 질문 낱말(사육두수·약국 수·신규 창업·화재 사망)과 표 제목 낱말(마릿수·요양기관·
+        # 신규 사업자·장소별 인명피해)이 달라 정답 표가 상위 40 밖이었다. Tier B 앞 3 개는 의도어가 먼저 채우므로 따로 2 개를 더한다.
+        bridge = _title_vocabulary_hints(query)[:2]
+        if bridge:
+            keywords = [*keywords, *bridge]
+            used_routing = True
     # 두 단어 이상의 내용어("청년 창업")는 KOSIS 검색이 구절 전체로만 느슨하게 걸려 정답 표("업종별·연령별 창업기업수")를
     # 놓친다(실측 A3: 결과 1건, 잡음). 내용어 구절과 내용어 하나씩도 함께 검색해 합치고, 뒤의 관련도 정렬·필터가 잡음을 걷어 낸다.
     # 표기 흔들림 교정본도 함께 검색한다("실업율" → "실업률")
@@ -10233,6 +10259,7 @@ async def search_kosis(
         api_key,
         used_routing=used_routing,
         include_legacy_aliases=include_legacy_aliases,
+        alt_queries=_title_vocabulary_rewrites(query)[:2] if use_routing else None,
     )
 
 
