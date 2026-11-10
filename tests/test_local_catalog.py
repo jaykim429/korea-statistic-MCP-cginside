@@ -114,3 +114,17 @@ def test_segment_query_splits_only_words_the_catalog_does_not_know():
 def test_glued_query_keeps_the_local_hit_past_the_noise_gate(monkeypatch):
     result = run(monkeypatch, "요양기관현황시도별", LocalCatalog(ROWS))
     assert "DT_MIRE01" in [row["통계표ID"] for row in result["결과"]]
+
+
+# --- 로컬 단독 후보의 근거 기준(사이클 8 G) ----------------------------------------------------------------------
+# 관문은 내용어가 하나만 맞아도 통과시킨다. KOSIS 에 없는 주제(「비트코인 거래량」)에서 로컬 목록이 측정어만 맞는 표
+# (「지역별 전력거래량」)를 잔뜩 더했다(실측: 1 건 → 10 건). 통합검색이 내지 않은 로컬 단독 후보는 질문 내용어의 절반 넘게를 덮어야 들인다.
+
+
+def test_local_only_candidate_needs_more_than_half_the_content_words(monkeypatch):
+    rows = ROWS + [{"orgId": "388", "tblId": "DT_POWER", "title": "지역별 전력거래량", "path": ["에너지"]}]
+    monkeypatch.setattr(server, "_LOCAL_MIN_COVERAGE", 0.5)
+    ids = [row["통계표ID"] for row in run(monkeypatch, "비트코인 거래량", LocalCatalog(rows))["결과"]]
+    assert "DT_POWER" not in ids
+    ids = [row["통계표ID"] for row in run(monkeypatch, "요양기관 현황 시도별", LocalCatalog(rows))["결과"]]
+    assert "DT_MIRE01" in ids

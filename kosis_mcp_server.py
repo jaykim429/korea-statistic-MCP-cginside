@@ -8763,6 +8763,11 @@ async def _search_kosis_keywords(
                 api_rank += 1
         for rank, (row, _score) in enumerate(local_catalog.search(query, _LOCAL_SEARCH_K)):
             identity = (row["orgId"], row["tblId"])
+            # 통합검색이 내지 않은 로컬 단독 후보는 질문 내용어의 _LOCAL_MIN_COVERAGE 넘게를 덮어야 들인다(사이클 8 G) —
+            # 측정어 하나만 맞는 표(「비트코인 거래량」 → 「전력거래량」)가 없는 주제의 후보를 채우지 않게.
+            if identity not in fusion_ranks and _LOCAL_MIN_COVERAGE > 0 and (
+                    _query_match_quality(match_query, row.get("title"))["coverage_ratio"] <= _LOCAL_MIN_COVERAGE):
+                continue
             fusion_ranks.setdefault(identity, []).append(rank)
             all_results.append({"ORG_ID": row["orgId"], "TBL_ID": row["tblId"], "TBL_NM": row.get("title"),
                                 "STRT_PRD_DE": "", "END_PRD_DE": "", "_검색어": "local_catalog"})
@@ -8915,6 +8920,7 @@ _SEARCH_KEYWORD_CONCURRENCY = max(1, int(os.getenv("KOSIS_MCP_SEARCH_CONCURRENCY
 # 로컬 표 목록 검색(앱 사이클 8) — 후보에 더할 상위 개수와 RRF 상수(관례값 60).
 _LOCAL_SEARCH_K = max(0, int(os.getenv("KOSIS_LOCAL_SEARCH_K", "20")))
 _RRF_K = 60.0
+_LOCAL_MIN_COVERAGE = float(os.getenv("KOSIS_LOCAL_MIN_COVERAGE", "0"))
 
 
 
